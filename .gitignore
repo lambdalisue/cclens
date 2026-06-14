@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+
+# Generated intermediate data (analysis output — never committed)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Harvested Claude Code session data MUST NOT be committed.
+# Test fixtures live under tests/ and are synthetic — see
+# .claude/rules/session-data-privacy.md. Anything captured from a real
+# ~/.claude/projects transcript belongs only in a local scratch dir.
+/scratch
+/.scratch
+*.jsonl
+!tests/**/*.jsonl
+
+# OS / editor noise
+.DS_Store

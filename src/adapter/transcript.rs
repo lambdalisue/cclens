@@ -25,6 +25,9 @@ struct Raw {
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
     message: Option<RawMessage>,
+    /// Top-level content (system `local_command` records carry it here rather
+    /// than under `message`).
+    content: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -96,10 +99,10 @@ fn assistant_records(ts: i64, message: Option<&RawMessage>) -> Vec<Record> {
     records
 }
 
-/// A user/system line is a slash invocation (when it carries a command name), a
-/// human turn (a real prompt), or nothing we track.
+/// A user/system line is a slash invocation (when its content *is* a command
+/// wrapper), a human turn (a real prompt), or nothing we track.
 fn prompt_or_invocation(ts: i64, raw: &Raw, line: &str) -> Vec<Record> {
-    if let Some(skill) = extract_command_name(line) {
+    if let Some(skill) = command_content(raw).and_then(extract_command_name) {
         return vec![Record {
             timestamp_ms: ts,
             kind: RecordKind::SkillInvocation {
@@ -122,6 +125,25 @@ fn prompt_or_invocation(ts: i64, raw: &Raw, line: &str) -> Vec<Record> {
     }
 }
 
+/// The record's content string *only when it is a command wrapper* — i.e. the
+/// content, trimmed, begins with a `<command-…>` tag (a real invocation leads
+/// with `<command-message>` or `<command-name>`). This is the structural guard
+/// that keeps a `<command-name>` quoted inside ordinary prose (a prompt that
+/// discusses commands) from being mis-read as an invocation. See
+/// `docs/specs/session-format.md`.
+fn command_content(raw: &Raw) -> Option<&str> {
+    let content = raw
+        .message
+        .as_ref()
+        .and_then(|message| message.content.as_ref())
+        .or(raw.content.as_ref())?
+        .as_str()?;
+    content
+        .trim_start()
+        .starts_with("<command-")
+        .then_some(content)
+}
+
 fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .ok()
@@ -140,12 +162,13 @@ fn skill_tool_invocation(content: &Value) -> Option<String> {
 }
 
 /// The skill name from a `<command-name>/NAME</command-name>` tag, leading slash
-/// stripped. Restricted to user/system lines by the caller — see
-/// `docs/specs/session-format.md` on structural (not substring) detection.
-fn extract_command_name(line: &str) -> Option<String> {
-    let start = line.find("<command-name>")? + "<command-name>".len();
-    let end = start + line[start..].find("</command-name>")?;
-    let name = line[start..end].trim().trim_start_matches('/').trim();
+/// stripped. The caller passes only a verified command-wrapper string
+/// (`command_content`), so this is structural, not a substring scan over
+/// arbitrary content — see `docs/specs/session-format.md`.
+fn extract_command_name(content: &str) -> Option<String> {
+    let start = content.find("<command-name>")? + "<command-name>".len();
+    let end = start + content[start..].find("</command-name>")?;
+    let name = content[start..end].trim().trim_start_matches('/').trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -192,6 +215,29 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "loop");
         assert_eq!(spans[0].source, Source::Tool);
+    }
+
+    #[test]
+    fn detects_a_command_wrapper_that_leads_with_command_message() {
+        // Real invocations lead with <command-message>, then <command-name>.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"<command-message>git-commit</command-message>\n<command-name>/git-commit</command-name>"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":"ok"}}"#,
+        );
+
+        let spans = extract_spans(&parse_session(jsonl));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].skill, "git-commit");
+    }
+
+    #[test]
+    fn does_not_treat_a_quoted_command_name_in_prose_as_an_invocation() {
+        // A real prompt that merely *discusses* the tag must not be mis-detected.
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"explain how <command-name>/git-commit</command-name> works"}}"#;
+
+        let spans = extract_spans(&parse_session(jsonl));
+        assert!(spans.is_empty());
     }
 
     #[test]

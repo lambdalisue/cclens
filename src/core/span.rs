@@ -57,13 +57,20 @@ pub struct Span {
 
 /// The index (exclusive) at which the span starting at `start` ends.
 ///
-/// Currently closes at the next human turn after `start`, else at the end of the
-/// session. The idle-gap and sibling-invocation rules (`docs/specs/events.md`)
-/// are added in later contracts.
+/// Closes at the next human turn or the next skill invocation after `start`,
+/// whichever comes first, else at the end of the session. The next-skill rule
+/// keeps a span from swallowing later, unrelated work. Meta-skill nesting (a
+/// child invocation should not close its parent) and the idle-gap rule
+/// (`docs/specs/events.md`) are added in later contracts.
 pub fn span_end(records: &[Record], start: usize) -> usize {
     records[start + 1..]
         .iter()
-        .position(|record| matches!(record.kind, RecordKind::HumanTurn))
+        .position(|record| {
+            matches!(
+                record.kind,
+                RecordKind::HumanTurn | RecordKind::SkillInvocation { .. }
+            )
+        })
         .map(|offset| start + 1 + offset)
         .unwrap_or(records.len())
 }
@@ -159,6 +166,17 @@ mod tests {
             at(0, skill("git-commit")),
             at(1, RecordKind::Other),
             at(2, RecordKind::HumanTurn),
+            at(3, RecordKind::Other),
+        ];
+        assert_eq!(span_end(&records, 0), 2);
+    }
+
+    #[test]
+    fn closes_at_the_next_skill_invocation() {
+        let records = [
+            at(0, skill("git-commit")),
+            at(1, RecordKind::Other),
+            at(2, skill("pr-create")), // a sibling invocation closes the first span
             at(3, RecordKind::Other),
         ];
         assert_eq!(span_end(&records, 0), 2);

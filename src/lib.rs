@@ -5,4 +5,5 @@
 //! persists them, and `report` renders. Modules are added as their contracts gain
 //! tests — nothing is scaffolded ahead of a failing test.
 
+pub mod adapter;
 pub mod core;

@@ -6,5 +6,6 @@
 //! tests — nothing is scaffolded ahead of a failing test.
 
 pub mod adapter;
+pub mod cli;
 pub mod core;
 pub mod store;

@@ -2,3 +2,4 @@
 //! This layer is the tool's primary test surface (see `.claude/rules/tdd.md`).
 
 pub mod metrics;
+pub mod span;

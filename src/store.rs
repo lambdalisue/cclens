@@ -4,13 +4,13 @@
 //!
 //! The schema is a subset of the spec's `events` table — the columns the
 //! current pipeline populates. Deferred columns (`parent_id`, `source_line`,
-//! `is_trailing`, `sub_*`, `attrs_json`) and the `surfaces` catalog are added
-//! as their features land.
+//! `is_trailing`, `sub_*`, `attrs_json`) are added as their features land.
 
 use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::core::span::{Source, Span};
+use crate::core::surface::Surface;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS events (
     model         TEXT
 );
 CREATE INDEX IF NOT EXISTS events_by_surface ON events(surface_kind, surface_id);
+CREATE TABLE IF NOT EXISTS surfaces (
+    kind          TEXT NOT NULL,
+    id            TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    config_path   TEXT,
+    static_tokens INTEGER,
+    load_mode     TEXT NOT NULL,
+    PRIMARY KEY (kind, id, scope)
+);
 ";
 
 /// Identity and provenance of one analyzed session.
@@ -56,6 +65,14 @@ pub struct SkillUsage {
     pub out_tokens: i64,
     pub ctx_growth: i64,
     pub duration_sec: f64,
+}
+
+/// One catalogued surface (effective scope already resolved).
+#[derive(Debug, PartialEq)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub static_tokens: Option<i64>,
+    pub load_mode: String,
 }
 
 pub struct Store {
@@ -157,6 +174,56 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Rebuild the surface catalog wholesale — it is a snapshot of current
+    /// config, not an accumulation (see `docs/specs/storage.md`).
+    pub fn replace_surfaces(&mut self, surfaces: &[Surface]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM surfaces", ())?;
+        for surface in surfaces {
+            tx.execute(
+                "INSERT OR REPLACE INTO surfaces
+                   (kind, id, scope, config_path, static_tokens, load_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    &surface.kind,
+                    &surface.id,
+                    surface.scope.label(),
+                    &surface.config_path,
+                    surface.static_tokens,
+                    surface.load_mode.label(),
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The catalogued skills, one row per `(kind, id)` with the **effective**
+    /// scope resolved — a project surface shadows a global one of the same id
+    /// (see `docs/specs/storage.md`).
+    pub fn skill_catalog(&self) -> Result<Vec<CatalogEntry>> {
+        // MAX(scope): 'project' > 'global' lexically, so the project row wins.
+        // SQLite gives the bare columns (static_tokens, load_mode) the values
+        // from the same row the MAX picked.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, static_tokens, load_mode, MAX(scope)
+             FROM surfaces
+             WHERE kind = 'skill'
+             GROUP BY id
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CatalogEntry {
+                    id: row.get(0)?,
+                    static_tokens: row.get(1)?,
+                    load_mode: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 fn source_label(source: Source) -> &'static str {
@@ -175,6 +242,7 @@ fn epoch_ms_to_rfc3339(epoch_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::surface::{LoadMode, Scope};
 
     fn span(skill: &str, out_tokens: u64, ctx_growth: u64, duration_sec: f64) -> Span {
         Span {
@@ -253,5 +321,49 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].invocations, 1);
         assert_eq!(usage[0].out_tokens, 999);
+    }
+
+    fn surface(id: &str, scope: Scope, static_tokens: u64) -> Surface {
+        Surface {
+            kind: "skill".to_string(),
+            id: id.to_string(),
+            scope,
+            config_path: format!("/cfg/{id}"),
+            static_tokens: Some(static_tokens),
+            load_mode: LoadMode::StartupDescription,
+        }
+    }
+
+    #[test]
+    fn surface_catalog_resolves_project_over_global() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[
+                surface("git-commit", Scope::Global, 100),
+                surface("git-commit", Scope::Project, 250), // shadows global
+                surface("pr-create", Scope::Global, 40),
+            ])
+            .unwrap();
+
+        let catalog = store.skill_catalog().unwrap();
+
+        assert_eq!(catalog.len(), 2);
+        let git = catalog.iter().find(|e| e.id == "git-commit").unwrap();
+        assert_eq!(git.static_tokens, Some(250)); // the project row won
+    }
+
+    #[test]
+    fn replace_surfaces_rebuilds_wholesale() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[surface("old", Scope::Global, 1)])
+            .unwrap();
+        store
+            .replace_surfaces(&[surface("new", Scope::Global, 1)])
+            .unwrap();
+
+        let catalog = store.skill_catalog().unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "new");
     }
 }

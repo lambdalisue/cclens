@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::adapter::transcript::parse_session;
-use crate::core::span::extract_spans;
+use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -56,7 +56,7 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     for transcript in main_transcripts(&projects)? {
         let text = fs::read_to_string(&transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
-        let spans = extract_spans(&parse_session(&text));
+        let spans = extract_spans(&parse_session(&text), DEFAULT_IDLE_GAP_MS);
         let meta = session_meta(&transcript);
         store.ingest_session(&meta, &spans)?;
         sessions += 1;

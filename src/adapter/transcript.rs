@@ -190,7 +190,10 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:05.000Z","message":{"content":"thanks"}}"#,
         );
 
-        let spans = extract_spans(&parse_session(jsonl));
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
 
         assert_eq!(spans.len(), 1);
         let span = &spans[0];
@@ -210,7 +213,10 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":"done"}}"#,
         );
 
-        let spans = extract_spans(&parse_session(jsonl));
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
 
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "loop");
@@ -226,7 +232,10 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":"ok"}}"#,
         );
 
-        let spans = extract_spans(&parse_session(jsonl));
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "git-commit");
     }
@@ -236,7 +245,10 @@ mod tests {
         // A real prompt that merely *discusses* the tag must not be mis-detected.
         let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"explain how <command-name>/git-commit</command-name> works"}}"#;
 
-        let spans = extract_spans(&parse_session(jsonl));
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
         assert!(spans.is_empty());
     }
 

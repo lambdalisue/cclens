@@ -45,12 +45,18 @@ enum Command {
         /// Bucket usage by time: year | month | week | day | hour (JST).
         #[arg(long)]
         by: Option<String>,
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
     /// Join the skill catalog against usage — installed skills, their cost, and
     /// what is unused.
     Surfaces {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
@@ -59,8 +65,10 @@ enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Analyze { projects, db } => analyze(projects, &db),
-        Command::Report { by, db } => report(by.as_deref(), &db),
-        Command::Surfaces { db } => surfaces(&db),
+        Command::Report { by, format, db } => {
+            report(by.as_deref(), parse_format(format.as_deref())?, &db)
+        }
+        Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
     }
 }
 
@@ -95,13 +103,13 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn report(by: Option<&str>, db: &Path) -> Result<()> {
+fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
             .with_context(|| format!("unknown --by value '{by}' (year|month|week|day|hour)"))?;
-        return report_by_time(&store, bucket);
+        return report_by_time(&store, bucket, format);
     }
 
     let usage = store.skill_usage()?;
@@ -110,27 +118,36 @@ fn report(by: Option<&str>, db: &Path) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<26}{:>7}{:>12}{:>12}{:>10}",
-        "skill", "count", "out_tok", "ctx_grow", "sec"
+    let rows: Vec<Vec<String>> = usage
+        .iter()
+        .map(|row| {
+            vec![
+                row.skill.clone(),
+                row.invocations.to_string(),
+                row.out_tokens.to_string(),
+                row.ctx_growth.to_string(),
+                format!("{:.0}", row.duration_sec),
+            ]
+        })
+        .collect();
+    render(
+        &["skill", "count", "out_tok", "ctx_grow", "sec"],
+        &[
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+        ],
+        &rows,
+        format,
     );
-    println!("{}", "-".repeat(67));
-    for row in usage {
-        println!(
-            "{:<26}{:>7}{:>12}{:>12}{:>10.0}",
-            truncate(&row.skill, 25),
-            row.invocations,
-            row.out_tokens,
-            row.ctx_growth,
-            row.duration_sec,
-        );
-    }
     Ok(())
 }
 
 /// Skill usage rolled up per time bucket (JST). A long span is assigned whole to
 /// its start bucket (`docs/specs/cli.md`).
-fn report_by_time(store: &Store, bucket: Bucket) -> Result<()> {
+fn report_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
     let events = store.skill_event_costs()?;
     if events.is_empty() {
         println!("no skill usage found — run `ccoptimizer analyze` first");
@@ -148,14 +165,30 @@ fn report_by_time(store: &Store, bucket: Bucket) -> Result<()> {
         row.3 += event.duration_sec;
     }
 
-    println!(
-        "{:<18}{:>7}{:>12}{:>12}{:>10}",
-        "bucket", "count", "out_tok", "ctx_grow", "sec"
+    let rows: Vec<Vec<String>> = totals
+        .into_iter()
+        .map(|(label, (count, out_tokens, ctx_growth, duration_sec))| {
+            vec![
+                label,
+                count.to_string(),
+                out_tokens.to_string(),
+                ctx_growth.to_string(),
+                format!("{duration_sec:.0}"),
+            ]
+        })
+        .collect();
+    render(
+        &["bucket", "count", "out_tok", "ctx_grow", "sec"],
+        &[
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+        ],
+        &rows,
+        format,
     );
-    println!("{}", "-".repeat(59));
-    for (label, (count, out_tokens, ctx_growth, duration_sec)) in totals {
-        println!("{label:<18}{count:>7}{out_tokens:>12}{ctx_growth:>12}{duration_sec:>10.0}");
-    }
     Ok(())
 }
 
@@ -180,7 +213,7 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn surfaces(db: &Path) -> Result<()> {
+fn surfaces(format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
     let catalog = store.catalog()?;
     let usage = store.usage_counts()?;
@@ -196,11 +229,7 @@ fn surfaces(db: &Path) -> Result<()> {
         .map(|(kind, id, count)| ((kind.as_str(), id.as_str()), *count))
         .collect();
 
-    println!(
-        "{:<12}{:<24}{:>9}{:>6}  {:<20}status",
-        "kind", "id", "static", "uses", "load"
-    );
-    println!("{}", "-".repeat(82));
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
         let uses = counts
@@ -217,12 +246,14 @@ fn surfaces(db: &Path) -> Result<()> {
         let static_tokens = entry
             .static_tokens
             .map_or_else(|| "?".to_string(), |tokens| tokens.to_string());
-        println!(
-            "{:<12}{:<24}{static_tokens:>9}{uses_cell:>6}  {:<20}{status}",
-            entry.kind,
-            truncate(&entry.id, 23),
-            entry.load_mode,
-        );
+        rows.push(vec![
+            entry.kind.clone(),
+            entry.id.clone(),
+            static_tokens,
+            uses_cell,
+            entry.load_mode.clone(),
+            status.to_string(),
+        ]);
     }
 
     let catalogued: std::collections::HashSet<(&str, &str)> = catalog
@@ -231,13 +262,30 @@ fn surfaces(db: &Path) -> Result<()> {
         .collect();
     for (kind, id, count) in &usage {
         if !catalogued.contains(&(kind.as_str(), id.as_str())) {
-            let id = truncate(id, 23);
-            println!(
-                "{kind:<12}{id:<24}{:>9}{count:>6}  {:<20}ORPHANED",
-                "-", "-"
-            );
+            rows.push(vec![
+                kind.clone(),
+                id.clone(),
+                "-".to_string(),
+                count.to_string(),
+                "-".to_string(),
+                "ORPHANED".to_string(),
+            ]);
         }
     }
+
+    render(
+        &["kind", "id", "static", "uses", "load", "status"],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+            Align::Left,
+        ],
+        &rows,
+        format,
+    );
     Ok(())
 }
 
@@ -300,10 +348,70 @@ fn claude_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude"))
 }
 
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        text.chars().take(max_chars).collect()
+/// Column alignment for the table renderer.
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// Output format for reports.
+#[derive(Clone, Copy)]
+enum Format {
+    Table,
+    Markdown,
+}
+
+fn parse_format(value: Option<&str>) -> Result<Format> {
+    match value.unwrap_or("table") {
+        "table" => Ok(Format::Table),
+        "markdown" | "md" => Ok(Format::Markdown),
+        other => anyhow::bail!("unknown --format '{other}' (table|markdown)"),
+    }
+}
+
+/// Render a table as aligned text or GitHub-flavored markdown. Auto-sizes
+/// columns; `aligns` controls per-column alignment in table mode.
+fn render(headers: &[&str], aligns: &[Align], rows: &[Vec<String>], format: Format) {
+    match format {
+        Format::Markdown => {
+            println!("| {} |", headers.join(" | "));
+            let sep: Vec<&str> = headers.iter().map(|_| "---").collect();
+            println!("| {} |", sep.join(" | "));
+            for row in rows {
+                println!("| {} |", row.join(" | "));
+            }
+        }
+        Format::Table => {
+            let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+            for row in rows {
+                for (col, cell) in row.iter().enumerate() {
+                    widths[col] = widths[col].max(cell.chars().count());
+                }
+            }
+            let format_row = |cells: &[String]| -> String {
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(col, cell)| pad(cell, widths[col], aligns[col]))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            };
+            let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+            println!("{}", format_row(&header_cells));
+            let total: usize = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+            println!("{}", "-".repeat(total));
+            for row in rows {
+                println!("{}", format_row(row));
+            }
+        }
+    }
+}
+
+fn pad(text: &str, width: usize, align: Align) -> String {
+    let fill = " ".repeat(width.saturating_sub(text.chars().count()));
+    match align {
+        Align::Left => format!("{text}{fill}"),
+        Align::Right => format!("{fill}{text}"),
     }
 }

@@ -16,7 +16,7 @@ use crate::adapter::transcript::parse_session;
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
-use crate::core::usage::extract_usage_events;
+use crate::core::usage::{extract_usage_events, output_tokens};
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -98,7 +98,8 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         let records = parse_session(&text);
         let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
         let usage = extract_usage_events(&records);
-        let meta = session_meta(&transcript);
+        let (sub_tokens, sub_agent_count) = subagent_totals(&transcript);
+        let meta = session_meta(&transcript, sub_tokens, sub_agent_count);
         store.ingest_session(&meta, &spans, &usage)?;
         sessions += 1;
         spans_total += spans.len();
@@ -110,11 +111,35 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
+    let (sub_tokens, sub_agents) = store.subagent_totals()?;
     println!(
-        "analyzed {sessions} session(s), {spans_total} skill invocation(s), {surface_count} surface(s) catalogued -> {}",
+        "analyzed {sessions} session(s), {spans_total} skill invocation(s), \
+         {surface_count} surface(s) catalogued, \
+         {sub_tokens} subagent tokens across {sub_agents} subagent(s) -> {}",
         db.display()
     );
     Ok(())
+}
+
+/// Sum the output tokens and count of a session's subagent transcripts, found at
+/// `<sessionId>/subagents/agent-*.jsonl` beside the main transcript.
+fn subagent_totals(transcript: &Path) -> (i64, i64) {
+    let subagents_dir = transcript.with_extension("").join("subagents");
+    let Ok(entries) = fs::read_dir(&subagents_dir) else {
+        return (0, 0);
+    };
+    let mut tokens = 0;
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "jsonl")
+            && let Ok(text) = fs::read_to_string(&path)
+        {
+            tokens += output_tokens(&parse_session(&text)) as i64;
+            count += 1;
+        }
+    }
+    (tokens, count)
 }
 
 fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
@@ -390,7 +415,7 @@ fn main_transcripts(projects: &Path) -> Result<Vec<PathBuf>> {
     Ok(transcripts)
 }
 
-fn session_meta(transcript: &Path) -> SessionMeta {
+fn session_meta(transcript: &Path, sub_tokens: i64, sub_agent_count: i64) -> SessionMeta {
     let id = transcript
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -407,6 +432,8 @@ fn session_meta(transcript: &Path) -> SessionMeta {
         slug,
         id,
         source_path: transcript.display().to_string(),
+        sub_tokens,
+        sub_agent_count,
     }
 }
 

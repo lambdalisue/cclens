@@ -15,11 +15,13 @@ use crate::core::usage::UsageEvent;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,
-    project     TEXT NOT NULL,
-    slug        TEXT NOT NULL,
-    source_path TEXT NOT NULL,
-    started_at  TEXT NOT NULL
+    id              TEXT PRIMARY KEY,
+    project         TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    source_path     TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    sub_tokens      INTEGER NOT NULL DEFAULT 0,
+    sub_agent_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY,
@@ -56,6 +58,10 @@ pub struct SessionMeta {
     pub project: String,
     pub slug: String,
     pub source_path: String,
+    /// Total output tokens across this session's subagent transcripts, and how
+    /// many subagents it spawned.
+    pub sub_tokens: i64,
+    pub sub_agent_count: i64,
 }
 
 /// One row of the per-skill usage rollup.
@@ -125,14 +131,17 @@ impl Store {
 
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO sessions (id, project, slug, source_path, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO sessions
+               (id, project, slug, source_path, started_at, sub_tokens, sub_agent_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 &session.id,
                 &session.project,
                 &session.slug,
                 &session.source_path,
                 &started_at,
+                session.sub_tokens,
+                session.sub_agent_count,
             ),
         )?;
         tx.execute(
@@ -214,6 +223,16 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Total subagent output tokens and subagent count across all sessions.
+    pub fn subagent_totals(&self) -> Result<(i64, i64)> {
+        let row = self.conn.query_row(
+            "SELECT COALESCE(SUM(sub_tokens), 0), COALESCE(SUM(sub_agent_count), 0) FROM sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(row)
     }
 
     /// Invocation counts per surface `(kind, id)` across all event kinds — the
@@ -340,6 +359,8 @@ mod tests {
             project: "demo".to_string(),
             slug: "demo".to_string(),
             source_path: format!("/tmp/{id}.jsonl"),
+            sub_tokens: 0,
+            sub_agent_count: 0,
         }
     }
 

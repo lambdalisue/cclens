@@ -14,6 +14,18 @@ pub struct UsageEvent {
     pub started_epoch_ms: i64,
 }
 
+/// Total assistant output tokens across a record stream — used to sum a
+/// subagent transcript's cost for attribution (`docs/specs/events.md`).
+pub fn output_tokens(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .map(|record| match &record.kind {
+            RecordKind::Assistant { out_tokens, .. } => *out_tokens,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Extract agent-spawn and MCP-tool usage events from the record stream.
 pub fn extract_usage_events(records: &[Record]) -> Vec<UsageEvent> {
     records
@@ -103,5 +115,29 @@ mod tests {
             },
         )];
         assert!(extract_usage_events(&records).is_empty());
+    }
+
+    #[test]
+    fn output_tokens_sums_assistant_records_only() {
+        let records = [
+            at(
+                1,
+                RecordKind::Assistant {
+                    prompt_size: 100,
+                    out_tokens: 30,
+                    model: "m".into(),
+                },
+            ),
+            at(2, RecordKind::HumanTurn),
+            at(
+                3,
+                RecordKind::Assistant {
+                    prompt_size: 200,
+                    out_tokens: 70,
+                    model: "m".into(),
+                },
+            ),
+        ];
+        assert_eq!(output_tokens(&records), 100);
     }
 }

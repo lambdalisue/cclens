@@ -13,6 +13,7 @@ use crate::adapter::config::{
     read_skill_surfaces,
 };
 use crate::adapter::transcript::parse_session;
+use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{Scope, Surface, is_usage_measurable};
 use crate::store::{SessionMeta, Store};
@@ -38,8 +39,11 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
-    /// Report per-skill usage from the store.
+    /// Report skill usage from the store — per skill, or per time bucket.
     Report {
+        /// Bucket usage by time: year | month | week | day | hour (JST).
+        #[arg(long)]
+        by: Option<String>,
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
@@ -54,7 +58,7 @@ enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Analyze { projects, db } => analyze(projects, &db),
-        Command::Report { db } => report(&db),
+        Command::Report { by, db } => report(by.as_deref(), &db),
         Command::Surfaces { db } => surfaces(&db),
     }
 }
@@ -88,10 +92,16 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn report(db: &Path) -> Result<()> {
+fn report(by: Option<&str>, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
-    let usage = store.skill_usage()?;
 
+    if let Some(by) = by {
+        let bucket = Bucket::parse(by)
+            .with_context(|| format!("unknown --by value '{by}' (year|month|week|day|hour)"))?;
+        return report_by_time(&store, bucket);
+    }
+
+    let usage = store.skill_usage()?;
     if usage.is_empty() {
         println!("no skill usage found — run `ccoptimizer analyze` first");
         return Ok(());
@@ -111,6 +121,37 @@ fn report(db: &Path) -> Result<()> {
             row.ctx_growth,
             row.duration_sec,
         );
+    }
+    Ok(())
+}
+
+/// Skill usage rolled up per time bucket (JST). A long span is assigned whole to
+/// its start bucket (`docs/specs/cli.md`).
+fn report_by_time(store: &Store, bucket: Bucket) -> Result<()> {
+    let events = store.skill_event_costs()?;
+    if events.is_empty() {
+        println!("no skill usage found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+
+    let mut totals: std::collections::BTreeMap<String, (i64, i64, i64, f64)> =
+        std::collections::BTreeMap::new();
+    for event in &events {
+        let label = bucket_label(event.started_epoch, bucket, JST_OFFSET_SECS);
+        let row = totals.entry(label).or_default();
+        row.0 += 1;
+        row.1 += event.out_tokens;
+        row.2 += event.ctx_growth;
+        row.3 += event.duration_sec;
+    }
+
+    println!(
+        "{:<18}{:>7}{:>12}{:>12}{:>10}",
+        "bucket", "count", "out_tok", "ctx_grow", "sec"
+    );
+    println!("{}", "-".repeat(59));
+    for (label, (count, out_tokens, ctx_growth, duration_sec)) in totals {
+        println!("{label:<18}{count:>7}{out_tokens:>12}{ctx_growth:>12}{duration_sec:>10.0}");
     }
     Ok(())
 }

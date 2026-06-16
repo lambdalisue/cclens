@@ -76,6 +76,15 @@ pub struct CatalogEntry {
     pub load_mode: String,
 }
 
+/// One skill event's cost, with its UTC start, for time bucketing.
+#[derive(Debug, PartialEq)]
+pub struct EventCost {
+    pub started_epoch: i64,
+    pub out_tokens: i64,
+    pub ctx_growth: i64,
+    pub duration_sec: f64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -170,6 +179,26 @@ impl Store {
                     out_tokens: row.get(2)?,
                     ctx_growth: row.get(3)?,
                     duration_sec: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Per-event costs for skill invocations, for time bucketing in the report.
+    pub fn skill_event_costs(&self) -> Result<Vec<EventCost>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT started_epoch, out_tokens, ctx_growth, duration_sec
+             FROM events
+             WHERE surface_kind = 'skill'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(EventCost {
+                    started_epoch: row.get(0)?,
+                    out_tokens: row.get(1)?,
+                    ctx_growth: row.get(2)?,
+                    duration_sec: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -17,37 +17,46 @@ cargo build
 ## Use
 
 ```sh
-# 1. Analyze your transcripts into a local SQLite store (default ~/.claude/projects)
+# 1. Analyze transcripts + config into a local SQLite store
 cargo run -- analyze --db ccoptimizer.db
 
-# 2. Report per-skill usage, most-invoked first
-cargo run -- report --db ccoptimizer.db
+# 2. See where to optimize — ranked opportunities with a suggested action
+cargo run -- wedges --db ccoptimizer.db
+
+# 3. Other views
+cargo run -- surfaces --db ccoptimizer.db          # every installed surface × its usage
+cargo run -- report   --db ccoptimizer.db          # per-skill usage, most-invoked first
+cargo run -- report --by month --db ccoptimizer.db # usage per time bucket (JST)
+
+# any view takes --format markdown to paste into a PR or note
+cargo run -- wedges --format markdown --db ccoptimizer.db
 ```
 
 ```
-skill                       count     out_tok    ctx_grow       sec
--------------------------------------------------------------------
-git-commit                     87     1356304     1129590    131324
-deal-review                    74     2410182     1327027     16026
-pr-review                      46      546725      238026      3568
+wedge            surface                        static  uses  suggestion
+------------------------------------------------------------------------
+ALWAYS-ON HEAVY  rule/git/safety                   922     0  slim, or make path-conditional / on-demand
+UNUSED           skill/code-review                1345     0  delete / disable
+UNUSED           skill/style-review              1055     0  delete / disable
 ...
 ```
 
-`analyze` is read-only over your transcripts and incremental (re-running
-re-ingests only changed sessions). Nothing is sent anywhere; the store is a local
-file.
+`analyze` reads your transcripts (`~/.claude/projects`) and live config
+(`~/.claude/{skills,rules,agents,mcp.json,CLAUDE.md}`) read-only and
+incrementally. Nothing is sent anywhere; the store is a local file.
 
-## Scope today
+## What it covers
 
-This is an early vertical slice. It covers **skill** usage from main-session
-transcripts. Not yet implemented (see [`docs/specs/`](docs/specs/) for the full
-design):
+- **Every configuration surface**: skills, rules, agents, MCP servers,
+  `CLAUDE.md` — each catalogued with its static token cost and load mode.
+- **The catalog × usage join**: what is installed vs. what is actually used,
+  flagging unused (delete), always-on heavy (slim), and costly+rare (trim).
+- **Time-bucketed usage** (`--by year|month|week|day|hour`, JST) and markdown
+  output.
 
-- Other configuration surfaces (rules, hooks, MCP servers, `CLAUDE.md`,
-  permissions) and the **catalog × usage** join that flags unused / costly
-  config.
-- Subagent cost attribution, meta-skill (`loop`) nesting, and the idle-gap span
-  rule — so a meta-skill's cost currently overlaps its children's.
-- Time-bucketed reports and the optimization "wedge" views.
+Not yet implemented (see [`docs/specs/`](docs/specs/) for the full design):
+subagent cost attribution (`sub_tokens`), meta-skill (`loop`) nesting, and
+permission-friction signals.
 
-Counts are usage signals for ranking, not a billing ledger.
+Counts are usage signals for ranking, not a billing ledger; static cost is a
+token estimate, not a measured runtime figure.

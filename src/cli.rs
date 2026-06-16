@@ -15,7 +15,7 @@ use crate::adapter::config::{
 use crate::adapter::transcript::parse_session;
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
-use crate::core::surface::{Scope, Surface, is_usage_measurable};
+use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
 use crate::core::usage::extract_usage_events;
 use crate::store::{SessionMeta, Store};
 
@@ -60,6 +60,15 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// List optimization opportunities (unused, always-on heavy, costly+rare),
+    /// ranked, with a suggested action.
+    Wedges {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -69,8 +78,13 @@ pub fn run() -> Result<()> {
             report(by.as_deref(), parse_format(format.as_deref())?, &db)
         }
         Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
+        Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
     }
 }
+
+/// Static-token threshold above which an always-on or rarely-used surface counts
+/// as "heavy" — a tuning knob, not a hard rule.
+const HEAVY_TOKENS: u64 = 800;
 
 fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
@@ -281,6 +295,72 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
             Align::Right,
             Align::Right,
             Align::Left,
+            Align::Left,
+        ],
+        &rows,
+        format,
+    );
+    Ok(())
+}
+
+/// List optimization wedges across all catalogued surfaces, ranked by priority
+/// then by static cost. This is the "where and how to optimize" view.
+fn wedges(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let catalog = store.catalog()?;
+    let counts: std::collections::HashMap<(String, String), i64> = store
+        .usage_counts()?
+        .into_iter()
+        .map(|(kind, id, count)| ((kind, id), count))
+        .collect();
+
+    let mut found: Vec<(Wedge, &str, &str, Option<i64>, i64)> = Vec::new();
+    for entry in &catalog {
+        let measurable = is_usage_measurable(&entry.kind);
+        let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
+        let uses = counts
+            .get(&(entry.kind.clone(), entry.id.clone()))
+            .copied()
+            .unwrap_or(0);
+        let static_tokens = entry.static_tokens.map(|tokens| tokens as u64);
+        if let Some(wedge) =
+            classify_wedge(measurable, load_mode, static_tokens, uses, HEAVY_TOKENS)
+        {
+            found.push((wedge, &entry.kind, &entry.id, entry.static_tokens, uses));
+        }
+    }
+
+    if found.is_empty() {
+        println!("no optimization wedges found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+
+    // Rank by wedge priority, then by static cost (heaviest first).
+    found.sort_by(|a, b| {
+        a.0.priority()
+            .cmp(&b.0.priority())
+            .then(b.3.unwrap_or(0).cmp(&a.3.unwrap_or(0)))
+    });
+
+    let rows: Vec<Vec<String>> = found
+        .iter()
+        .map(|(wedge, kind, id, static_tokens, uses)| {
+            vec![
+                wedge.label().to_string(),
+                format!("{kind}/{id}"),
+                static_tokens.map_or_else(|| "?".to_string(), |tokens| tokens.to_string()),
+                uses.to_string(),
+                wedge.suggestion().to_string(),
+            ]
+        })
+        .collect();
+    render(
+        &["wedge", "surface", "static", "uses", "suggestion"],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
             Align::Left,
         ],
         &rows,

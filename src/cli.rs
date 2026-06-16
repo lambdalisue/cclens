@@ -16,6 +16,7 @@ use crate::adapter::transcript::parse_session;
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{Scope, Surface, is_usage_measurable};
+use crate::core::usage::extract_usage_events;
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -72,9 +73,11 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     for transcript in main_transcripts(&projects)? {
         let text = fs::read_to_string(&transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
-        let spans = extract_spans(&parse_session(&text), DEFAULT_IDLE_GAP_MS);
+        let records = parse_session(&text);
+        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let usage = extract_usage_events(&records);
         let meta = session_meta(&transcript);
-        store.ingest_session(&meta, &spans)?;
+        store.ingest_session(&meta, &spans, &usage)?;
         sessions += 1;
         spans_total += spans.len();
     }
@@ -180,16 +183,17 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 fn surfaces(db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
     let catalog = store.catalog()?;
-    let usage = store.skill_usage()?;
+    let usage = store.usage_counts()?;
 
     if catalog.is_empty() && usage.is_empty() {
         println!("nothing catalogued — run `ccoptimizer analyze` first");
         return Ok(());
     }
 
-    let invocations: std::collections::HashMap<&str, i64> = usage
+    // Usage keyed by (kind, id) so every surface kind joins, not just skills.
+    let counts: std::collections::HashMap<(&str, &str), i64> = usage
         .iter()
-        .map(|row| (row.skill.as_str(), row.invocations))
+        .map(|(kind, id, count)| ((kind.as_str(), id.as_str()), *count))
         .collect();
 
     println!(
@@ -198,15 +202,15 @@ fn surfaces(db: &Path) -> Result<()> {
     );
     println!("{}", "-".repeat(82));
     for entry in &catalog {
-        // Usage is currently extracted only for skills. For other
-        // usage-measurable kinds (agents, MCP) we have no usage yet, so we say
-        // so rather than borrow a skill's count or claim a false UNUSED.
-        // Catalog-only kinds (rules, hooks, CLAUDE.md) can never have events.
-        let (uses_cell, status) = if entry.kind == "skill" {
-            let uses = invocations.get(entry.id.as_str()).copied().unwrap_or(0);
+        let measurable = is_usage_measurable(&entry.kind);
+        let uses = counts
+            .get(&(entry.kind.as_str(), entry.id.as_str()))
+            .copied()
+            .unwrap_or(0);
+        // "unused" is only meaningful for usage-measurable kinds; catalog-only
+        // kinds (rules, hooks, CLAUDE.md) emit no events, so 0 means nothing.
+        let (uses_cell, status) = if measurable {
             (uses.to_string(), if uses == 0 { "UNUSED" } else { "" })
-        } else if is_usage_measurable(&entry.kind) {
-            ("?".to_string(), "(usage n/a)")
         } else {
             ("-".to_string(), "(catalog-only)")
         };
@@ -221,18 +225,16 @@ fn surfaces(db: &Path) -> Result<()> {
         );
     }
 
-    let catalogued: std::collections::HashSet<&str> = catalog
+    let catalogued: std::collections::HashSet<(&str, &str)> = catalog
         .iter()
-        .filter(|e| e.kind == "skill")
-        .map(|e| e.id.as_str())
+        .map(|e| (e.kind.as_str(), e.id.as_str()))
         .collect();
-    for row in &usage {
-        if !catalogued.contains(row.skill.as_str()) {
-            let id = truncate(&row.skill, 23);
-            let uses = row.invocations;
+    for (kind, id, count) in &usage {
+        if !catalogued.contains(&(kind.as_str(), id.as_str())) {
+            let id = truncate(id, 23);
             println!(
-                "{:<12}{id:<24}{:>9}{uses:>6}  {:<20}ORPHANED",
-                "skill", "-", "-"
+                "{kind:<12}{id:<24}{:>9}{count:>6}  {:<20}ORPHANED",
+                "-", "-"
             );
         }
     }

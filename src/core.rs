@@ -5,3 +5,4 @@ pub mod bucket;
 pub mod metrics;
 pub mod span;
 pub mod surface;
+pub mod usage;

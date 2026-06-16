@@ -69,14 +69,19 @@ fn assistant_records(ts: i64, message: Option<&RawMessage>) -> Vec<Record> {
     };
     let mut records = Vec::new();
 
-    if let Some(skill) = message.content.as_ref().and_then(skill_tool_invocation) {
-        records.push(Record {
-            timestamp_ms: ts,
-            kind: RecordKind::SkillInvocation {
-                skill,
-                source: Source::Tool,
-            },
-        });
+    if let Some(blocks) = message
+        .content
+        .as_ref()
+        .and_then(|content| content.as_array())
+    {
+        for block in blocks {
+            if let Some(kind) = tool_use_kind(block) {
+                records.push(Record {
+                    timestamp_ms: ts,
+                    kind,
+                });
+            }
+        }
     }
 
     if let Some(usage) = &message.usage {
@@ -150,15 +155,35 @@ fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-/// The skill name from the first `tool_use` block invoking the Skill tool.
-fn skill_tool_invocation(content: &Value) -> Option<String> {
-    content.as_array()?.iter().find_map(|block| {
-        let is_skill_tool =
-            block.get("type")?.as_str()? == "tool_use" && block.get("name")?.as_str()? == "Skill";
-        is_skill_tool
-            .then(|| block.get("input")?.get("skill")?.as_str().map(String::from))
-            .flatten()
-    })
+/// Classify a `tool_use` content block into a domain record kind: the Skill tool
+/// is a tool-path skill invocation, the Agent tool is a subagent spawn, and any
+/// other named tool is a `ToolUse` (the core decides which are MCP). Returns
+/// `None` for non-`tool_use` blocks.
+fn tool_use_kind(block: &Value) -> Option<RecordKind> {
+    if block.get("type")?.as_str()? != "tool_use" {
+        return None;
+    }
+    let name = block.get("name")?.as_str()?;
+    match name {
+        "Skill" => {
+            let skill = block.get("input")?.get("skill")?.as_str()?.to_string();
+            Some(RecordKind::SkillInvocation {
+                skill,
+                source: Source::Tool,
+            })
+        }
+        "Agent" => {
+            let agent = block
+                .get("input")?
+                .get("subagent_type")?
+                .as_str()?
+                .to_string();
+            Some(RecordKind::AgentSpawn { agent })
+        }
+        tool => Some(RecordKind::ToolUse {
+            tool: tool.to_string(),
+        }),
+    }
 }
 
 /// The skill name from a `<command-name>/NAME</command-name>` tag, leading slash

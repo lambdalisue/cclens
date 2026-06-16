@@ -11,6 +11,7 @@ use rusqlite::Connection;
 
 use crate::core::span::{Source, Span};
 use crate::core::surface::Surface;
+use crate::core::usage::UsageEvent;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -106,8 +107,15 @@ impl Store {
     }
 
     /// Replace a session's events with a freshly-extracted set (idempotent
-    /// re-ingest keyed on `source_path`; see `docs/specs/storage.md`).
-    pub fn ingest_session(&mut self, session: &SessionMeta, spans: &[Span]) -> Result<()> {
+    /// re-ingest keyed on `source_path`; see `docs/specs/storage.md`). `spans`
+    /// are skill executions with cost; `usage` are point events (agent spawns,
+    /// MCP tool calls) counted for the catalog join.
+    pub fn ingest_session(
+        &mut self,
+        session: &SessionMeta,
+        spans: &[Span],
+        usage: &[UsageEvent],
+    ) -> Result<()> {
         let started_at = spans
             .iter()
             .map(|span| span.started_epoch_ms)
@@ -154,6 +162,29 @@ impl Store {
                 ),
             )?;
         }
+        for event in usage {
+            let kind = if event.surface_kind == "agent" {
+                "agent_spawn"
+            } else {
+                "tool_use"
+            };
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, surface_kind, surface_id, source,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, 0, 0, 0, 0, NULL)",
+                (
+                    &session.id,
+                    &session.source_path,
+                    kind,
+                    &event.surface_kind,
+                    &event.surface_id,
+                    epoch_ms_to_rfc3339(event.started_epoch_ms),
+                    event.started_epoch_ms / 1000,
+                ),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -181,6 +212,21 @@ impl Store {
                     duration_sec: row.get(4)?,
                 })
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Invocation counts per surface `(kind, id)` across all event kinds — the
+    /// usage side of the catalog join for every surface, not just skills.
+    pub fn usage_counts(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface_kind, surface_id, COUNT(*)
+             FROM events
+             WHERE surface_kind IS NOT NULL
+             GROUP BY surface_kind, surface_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -307,10 +353,11 @@ mod tests {
                     span("git-commit", 100, 50, 2.0),
                     span("git-commit", 200, 30, 1.0),
                 ],
+                &[],
             )
             .unwrap();
         store
-            .ingest_session(&session("s2"), &[span("pr-create", 10, 5, 0.5)])
+            .ingest_session(&session("s2"), &[span("pr-create", 10, 5, 0.5)], &[])
             .unwrap();
 
         let usage = store.skill_usage().unwrap();
@@ -340,11 +387,11 @@ mod tests {
     fn re_ingesting_a_session_replaces_its_events() {
         let mut store = Store::in_memory().unwrap();
         store
-            .ingest_session(&session("s1"), &[span("git-commit", 100, 50, 2.0)])
+            .ingest_session(&session("s1"), &[span("git-commit", 100, 50, 2.0)], &[])
             .unwrap();
         // Same source_path, different content — must supersede, not accumulate.
         store
-            .ingest_session(&session("s1"), &[span("git-commit", 999, 999, 9.0)])
+            .ingest_session(&session("s1"), &[span("git-commit", 999, 999, 9.0)], &[])
             .unwrap();
 
         let usage = store.skill_usage().unwrap();

@@ -30,6 +30,10 @@ pub enum RecordKind {
         /// The model, or the `<synthetic>` sentinel.
         model: String,
     },
+    /// A subagent spawn (the `Agent` tool) — usage of an `agent` surface.
+    AgentSpawn { agent: String },
+    /// A tool invocation by name — used to detect MCP tool usage.
+    ToolUse { tool: String },
     /// Any other record.
     Other,
 }

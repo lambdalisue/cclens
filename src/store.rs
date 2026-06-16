@@ -70,6 +70,7 @@ pub struct SkillUsage {
 /// One catalogued surface (effective scope already resolved).
 #[derive(Debug, PartialEq)]
 pub struct CatalogEntry {
+    pub kind: String,
     pub id: String,
     pub static_tokens: Option<i64>,
     pub load_mode: String,
@@ -199,26 +200,26 @@ impl Store {
         Ok(())
     }
 
-    /// The catalogued skills, one row per `(kind, id)` with the **effective**
-    /// scope resolved — a project surface shadows a global one of the same id
-    /// (see `docs/specs/storage.md`).
-    pub fn skill_catalog(&self) -> Result<Vec<CatalogEntry>> {
+    /// The whole catalog, one row per `(kind, id)` with the **effective** scope
+    /// resolved — a project surface shadows a global one of the same id (see
+    /// `docs/specs/storage.md`).
+    pub fn catalog(&self) -> Result<Vec<CatalogEntry>> {
         // MAX(scope): 'project' > 'global' lexically, so the project row wins.
         // SQLite gives the bare columns (static_tokens, load_mode) the values
         // from the same row the MAX picked.
         let mut stmt = self.conn.prepare(
-            "SELECT id, static_tokens, load_mode, MAX(scope)
+            "SELECT kind, id, static_tokens, load_mode, MAX(scope)
              FROM surfaces
-             WHERE kind = 'skill'
-             GROUP BY id
-             ORDER BY id",
+             GROUP BY kind, id
+             ORDER BY kind, id",
         )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(CatalogEntry {
-                    id: row.get(0)?,
-                    static_tokens: row.get(1)?,
-                    load_mode: row.get(2)?,
+                    kind: row.get(0)?,
+                    id: row.get(1)?,
+                    static_tokens: row.get(2)?,
+                    load_mode: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -345,7 +346,7 @@ mod tests {
             ])
             .unwrap();
 
-        let catalog = store.skill_catalog().unwrap();
+        let catalog = store.catalog().unwrap();
 
         assert_eq!(catalog.len(), 2);
         let git = catalog.iter().find(|e| e.id == "git-commit").unwrap();
@@ -362,7 +363,7 @@ mod tests {
             .replace_surfaces(&[surface("new", Scope::Global, 1)])
             .unwrap();
 
-        let catalog = store.skill_catalog().unwrap();
+        let catalog = store.catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "new");
     }

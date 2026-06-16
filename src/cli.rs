@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::adapter::config::read_skill_surfaces;
+use crate::adapter::config::{
+    read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_rule_surfaces,
+    read_skill_surfaces,
+};
 use crate::adapter::transcript::parse_session;
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
-use crate::core::surface::{Scope, is_usage_measurable};
+use crate::core::surface::{Scope, Surface, is_usage_measurable};
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -72,14 +75,14 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         spans_total += spans.len();
     }
 
-    // Catalog the installed skills (global scope) so usage can be joined against
-    // what is actually installed. Project-scoped skills are a later refinement.
-    let surfaces = read_skill_surfaces(&default_skills_dir()?, Scope::Global);
+    // Catalog the installed config (global scope) so usage can be joined against
+    // what is actually installed. Project-scoped config is a later refinement.
+    let surfaces = read_global_surfaces()?;
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
     println!(
-        "analyzed {sessions} session(s), {spans_total} skill invocation(s), {surface_count} skill(s) catalogued -> {}",
+        "analyzed {sessions} session(s), {spans_total} skill invocation(s), {surface_count} surface(s) catalogued -> {}",
         db.display()
     );
     Ok(())
@@ -112,12 +115,30 @@ fn report(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Join the catalogued skills against their usage: installed skills with their
-/// static cost and invocation count, unused ones flagged. Usage with no matching
-/// surface is shown as orphaned (the skill was likely deleted).
+/// Read all installed config (global scope) into one surface list.
+fn read_global_surfaces() -> Result<Vec<Surface>> {
+    let home = claude_home()?;
+    let mut surfaces = read_skill_surfaces(&home.join("skills"), Scope::Global);
+    surfaces.extend(read_rule_surfaces(&home.join("rules"), Scope::Global));
+    surfaces.extend(read_agent_surfaces(&home.join("agents"), Scope::Global));
+    surfaces.extend(read_mcp_server_surfaces(
+        &home.join("mcp.json"),
+        Scope::Global,
+    ));
+    if let Some(claude_md) =
+        read_claude_md_surface(&home.join("CLAUDE.md"), "global", Scope::Global)
+    {
+        surfaces.push(claude_md);
+    }
+    Ok(surfaces)
+}
+
+/// Join the catalogued surfaces against usage: each installed surface with its
+/// static cost and (for usage-measurable kinds) invocation count, unused ones
+/// flagged. Usage with no matching surface is shown as orphaned.
 fn surfaces(db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
-    let catalog = store.skill_catalog()?;
+    let catalog = store.catalog()?;
     let usage = store.skill_usage()?;
 
     if catalog.is_empty() && usage.is_empty() {
@@ -131,35 +152,47 @@ fn surfaces(db: &Path) -> Result<()> {
         .collect();
 
     println!(
-        "{:<24}{:>11}{:>7}  {:<20}status",
-        "skill", "static_tok", "uses", "load"
+        "{:<12}{:<24}{:>9}{:>6}  {:<20}status",
+        "kind", "id", "static", "uses", "load"
     );
-    println!("{}", "-".repeat(70));
+    println!("{}", "-".repeat(82));
     for entry in &catalog {
-        let uses = invocations.get(entry.id.as_str()).copied().unwrap_or(0);
-        // "unused" is only meaningful for usage-measurable kinds (skills are).
-        let status = if uses == 0 && is_usage_measurable("skill") {
-            "UNUSED"
+        // Usage is currently extracted only for skills. For other
+        // usage-measurable kinds (agents, MCP) we have no usage yet, so we say
+        // so rather than borrow a skill's count or claim a false UNUSED.
+        // Catalog-only kinds (rules, hooks, CLAUDE.md) can never have events.
+        let (uses_cell, status) = if entry.kind == "skill" {
+            let uses = invocations.get(entry.id.as_str()).copied().unwrap_or(0);
+            (uses.to_string(), if uses == 0 { "UNUSED" } else { "" })
+        } else if is_usage_measurable(&entry.kind) {
+            ("?".to_string(), "(usage n/a)")
         } else {
-            ""
+            ("-".to_string(), "(catalog-only)")
         };
+        let static_tokens = entry
+            .static_tokens
+            .map_or_else(|| "?".to_string(), |tokens| tokens.to_string());
         println!(
-            "{:<24}{:>11}{:>7}  {:<20}{status}",
+            "{:<12}{:<24}{static_tokens:>9}{uses_cell:>6}  {:<20}{status}",
+            entry.kind,
             truncate(&entry.id, 23),
-            entry.static_tokens.unwrap_or(0),
-            uses,
             entry.load_mode,
         );
     }
 
-    let catalogued: std::collections::HashSet<&str> =
-        catalog.iter().map(|e| e.id.as_str()).collect();
-    let dash = "-";
+    let catalogued: std::collections::HashSet<&str> = catalog
+        .iter()
+        .filter(|e| e.kind == "skill")
+        .map(|e| e.id.as_str())
+        .collect();
     for row in &usage {
         if !catalogued.contains(row.skill.as_str()) {
             let id = truncate(&row.skill, 23);
             let uses = row.invocations;
-            println!("{id:<24}{dash:>11}{uses:>7}  {dash:<20}ORPHANED");
+            println!(
+                "{:<12}{id:<24}{:>9}{uses:>6}  {:<20}ORPHANED",
+                "skill", "-", "-"
+            );
         }
     }
     Ok(())
@@ -217,10 +250,6 @@ fn normalize_project(slug: &str) -> String {
 
 fn default_projects_dir() -> Result<PathBuf> {
     Ok(claude_home()?.join("projects"))
-}
-
-fn default_skills_dir() -> Result<PathBuf> {
-    Ok(claude_home()?.join("skills"))
 }
 
 fn claude_home() -> Result<PathBuf> {

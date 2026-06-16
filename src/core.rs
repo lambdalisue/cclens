@@ -3,3 +3,4 @@
 
 pub mod metrics;
 pub mod span;
+pub mod surface;

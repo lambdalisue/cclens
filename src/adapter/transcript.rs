@@ -12,9 +12,16 @@ use crate::core::span::{Record, RecordKind, Source};
 
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
-/// Parse one transcript's text into domain records, in file order.
+/// Parse one transcript's text into domain records, in file order. The current
+/// turn's prompt id is threaded forward and stamped onto agent spawns, whose own
+/// record does not carry it — that id is the join key to the subagent transcript.
 pub fn parse_session(jsonl: &str) -> Vec<Record> {
-    jsonl.lines().flat_map(parse_line).collect()
+    let mut current_prompt_id: Option<String> = None;
+    let mut records = Vec::new();
+    for line in jsonl.lines() {
+        parse_line(line, &mut current_prompt_id, &mut records);
+    }
+    records
 }
 
 #[derive(Deserialize)]
@@ -24,6 +31,8 @@ struct Raw {
     timestamp: Option<String>,
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
+    #[serde(rename = "promptId")]
+    prompt_id: Option<String>,
     message: Option<RawMessage>,
     /// Top-level content (system `local_command` records carry it here rather
     /// than under `message`).
@@ -45,19 +54,28 @@ struct RawUsage {
     output_tokens: Option<u64>,
 }
 
-fn parse_line(line: &str) -> Vec<Record> {
+fn parse_line(line: &str, current_prompt_id: &mut Option<String>, out: &mut Vec<Record>) {
     let Ok(raw) = serde_json::from_str::<Raw>(line) else {
-        return Vec::new();
+        return;
     };
+    if raw.prompt_id.is_some() {
+        current_prompt_id.clone_from(&raw.prompt_id);
+    }
     let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
-        return Vec::new();
+        return;
     };
 
-    match raw.kind.as_deref() {
+    let mut records = match raw.kind.as_deref() {
         Some("assistant") => assistant_records(ts, raw.message.as_ref()),
         Some("user") | Some("system") => prompt_or_invocation(ts, &raw, line),
         _ => Vec::new(),
+    };
+    for record in &mut records {
+        if let RecordKind::AgentSpawn { prompt_id, .. } = &mut record.kind {
+            prompt_id.clone_from(current_prompt_id);
+        }
     }
+    out.extend(records);
 }
 
 /// An assistant line yields its accumulated cost, plus a tool-path skill
@@ -149,6 +167,16 @@ fn command_content(raw: &Raw) -> Option<&str> {
         .then_some(content)
 }
 
+/// The `promptId` a subagent transcript was spawned under — the join key back to
+/// the spawning span. Read from the first record that carries one.
+pub fn subagent_prompt_id(jsonl: &str) -> Option<String> {
+    jsonl.lines().find_map(|line| {
+        serde_json::from_str::<Raw>(line)
+            .ok()
+            .and_then(|raw| raw.prompt_id)
+    })
+}
+
 fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .ok()
@@ -178,7 +206,12 @@ fn tool_use_kind(block: &Value) -> Option<RecordKind> {
                 .get("subagent_type")?
                 .as_str()?
                 .to_string();
-            Some(RecordKind::AgentSpawn { agent })
+            // The spawning turn's prompt id is threaded in by parse_session; the
+            // Agent record itself does not carry it.
+            Some(RecordKind::AgentSpawn {
+                agent,
+                prompt_id: None,
+            })
         }
         tool => Some(RecordKind::ToolUse {
             tool: tool.to_string(),

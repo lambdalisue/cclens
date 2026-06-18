@@ -71,8 +71,9 @@ caveats in `events.md` / `surfaces.md`):
 - "Unused" always carries the window it was evaluated over, so it is not mistaken
   for "never installed".
 
-Parent-inclusive vs parent-exclusive figures are always labelled for meta-skills
-(`events.md`), so nested cost is never silently double-counted.
+Meta-skills are not nested (`events.md`): a driver and the skills it ran are
+each their own span, so a child's cost lands on the child and no figure is
+silently double-counted.
 
 When **several caveats apply to one row** — e.g. a long `loop` span that is
 trailing, holds equally-split subagent tokens, and is bucketed whole into one

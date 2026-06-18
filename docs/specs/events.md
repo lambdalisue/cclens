@@ -73,29 +73,29 @@ wall-clock.
 `IDLE_GAP` is a tuning constant injected into the core (not hard-wired), so
 tests pin it.
 
-## Meta-skills and nesting
+## Meta-skills and nesting — intentionally flat
 
 Some skills drive other skills (`loop` repeatedly invokes `git-commit`,
-`code-review`, …). If the sibling rule (boundary rule 2) fired on those inner
-calls, the `loop` span would close at its first child and report ~zero cost
-while the children absorbed everything — inverting reality, since `loop` is the
-driver.
+`code-review`, …). It is tempting to treat those inner calls as **children** of
+the driver and nest them under a `parent_id`. We deliberately do **not**, because
+the transcript gives no signal to do it correctly.
 
-So an invocation that occurs **inside** an open span is that span's **child**,
-not a sibling: it does not close the parent. Each span records `parent_id` (NULL
-at top level). A child is an invocation that begins while an ancestor span is
-still open — nesting depth in the run, not just a shared `promptId`.
+Empirically, a meta-skill's "children" are recorded exactly like sequential
+top-level commands: each appears as its own `slash` invocation with its **own
+distinct `promptId`** — not the driver's, not a tool-path call, not a sidechain.
+There is no structural marker (`source`, `promptId`, nesting depth) that
+distinguishes "a skill `loop` ran" from "a skill the user ran next". Inferring
+nesting would require a fragile time-window or a hard-coded list of meta-skills.
 
-```mermaid
-flowchart TD
-    L["loop (parent span)"] --> G1["git-commit (child)"]
-    L --> C["code-review (child)"]
-    L --> G2["git-commit (child)"]
-```
+So the model stays flat: each invocation is its own span, and the boundary rules
+(next human turn / next skill / idle gap) apply uniformly. This is not a loss of
+accuracy — a child's cost is correctly attributed to the child (`git-commit`'s
+tokens land on `git-commit`); the driver's own small span reflects that it is an
+orchestrator, not the place the work happened. Reports therefore never
+double-count, and need no parent-inclusive/exclusive distinction.
 
-Because a parent's totals overlap its children's, every report must state whether
-a figure is **parent-inclusive** or **parent-exclusive** — otherwise meta-skill
-cost is silently double-counted.
+The one thing that *is* attributable across the boundary is subagent cost, which
+carries a real join key — see below.
 
 ## Metrics
 
@@ -135,9 +135,14 @@ turn can contain more than one span that spawned subagents, the join is not
 always one-to-one.
 
 - A subagent is attributed to the span containing the `Agent` spawn for its
-  `promptId`.
+  `promptId`. The spawning assistant record does not carry the `promptId`
+  itself, so the adapter threads the current turn's id forward and stamps it on
+  the spawn — that stamped id is what matches the subagent transcript.
 - When more than one span in the same `promptId` competes for the same
   subagents, their tokens are **split equally** across the competing spans.
+- A subagent whose `promptId` matches no span (e.g. spawned outside any skill)
+  is not attributed per-span; it still counts in the session-level subagent
+  total, which is exact and needs no such join.
 - Any span whose `sub_tokens` includes an equally-split (not cleanly
   attributable) subagent is marked `sub_tokens_estimated`. Equal-split is a
   deliberate approximation — this tool ranks, it does not bill

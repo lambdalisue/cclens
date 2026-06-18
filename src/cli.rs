@@ -12,11 +12,11 @@ use crate::adapter::config::{
     read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_rule_surfaces,
     read_skill_surfaces,
 };
-use crate::adapter::transcript::parse_session;
+use crate::adapter::transcript::{parse_session, subagent_prompt_id};
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
-use crate::core::usage::{extract_usage_events, output_tokens};
+use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
 use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
@@ -96,10 +96,12 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         let text = fs::read_to_string(&transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
         let records = parse_session(&text);
-        let spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
+        let mut spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
         let usage = extract_usage_events(&records);
-        let (sub_tokens, sub_agent_count) = subagent_totals(&transcript);
-        let meta = session_meta(&transcript, sub_tokens, sub_agent_count);
+        let subagents = subagent_costs(&transcript);
+        attribute_subagents(&mut spans, &subagents);
+        let sub_tokens: i64 = subagents.iter().map(|(_, tokens)| *tokens as i64).sum();
+        let meta = session_meta(&transcript, sub_tokens, subagents.len() as i64);
         store.ingest_session(&meta, &spans, &usage)?;
         sessions += 1;
         spans_total += spans.len();
@@ -121,25 +123,27 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sum the output tokens and count of a session's subagent transcripts, found at
-/// `<sessionId>/subagents/agent-*.jsonl` beside the main transcript.
-fn subagent_totals(transcript: &Path) -> (i64, i64) {
+/// The `(prompt_id, output_tokens)` of each of a session's subagent transcripts,
+/// found at `<sessionId>/subagents/agent-*.jsonl` beside the main transcript. A
+/// subagent missing a prompt id gets an empty key (it matches no span and stays
+/// in the session total only).
+fn subagent_costs(transcript: &Path) -> Vec<(String, u64)> {
     let subagents_dir = transcript.with_extension("").join("subagents");
     let Ok(entries) = fs::read_dir(&subagents_dir) else {
-        return (0, 0);
+        return Vec::new();
     };
-    let mut tokens = 0;
-    let mut count = 0;
+    let mut costs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "jsonl")
             && let Ok(text) = fs::read_to_string(&path)
         {
-            tokens += output_tokens(&parse_session(&text)) as i64;
-            count += 1;
+            let prompt_id = subagent_prompt_id(&text).unwrap_or_default();
+            let tokens = output_tokens(&parse_session(&text));
+            costs.push((prompt_id, tokens));
         }
     }
-    (tokens, count)
+    costs
 }
 
 fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
@@ -165,14 +169,16 @@ fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
                 row.invocations.to_string(),
                 row.out_tokens.to_string(),
                 row.ctx_growth.to_string(),
+                row.sub_tokens.to_string(),
                 format!("{:.0}", row.duration_sec),
             ]
         })
         .collect();
     render(
-        &["skill", "count", "out_tok", "ctx_grow", "sec"],
+        &["skill", "count", "out_tok", "ctx_grow", "sub_tok", "sec"],
         &[
             Align::Left,
+            Align::Right,
             Align::Right,
             Align::Right,
             Align::Right,

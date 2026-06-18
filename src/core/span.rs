@@ -30,8 +30,13 @@ pub enum RecordKind {
         /// The model, or the `<synthetic>` sentinel.
         model: String,
     },
-    /// A subagent spawn (the `Agent` tool) — usage of an `agent` surface.
-    AgentSpawn { agent: String },
+    /// A subagent spawn (the `Agent` tool) — usage of an `agent` surface. The
+    /// `prompt_id` is the spawning turn's id, the join key to the subagent's
+    /// transcript for cost attribution (`docs/specs/events.md`).
+    AgentSpawn {
+        agent: String,
+        prompt_id: Option<String>,
+    },
     /// A tool invocation by name — used to detect MCP tool usage.
     ToolUse { tool: String },
     /// Any other record.
@@ -57,6 +62,15 @@ pub struct Span {
     pub ctx_start: u64,
     pub ctx_peak: u64,
     pub model: Option<String>,
+    /// Prompt ids of the subagents this span spawned — the join key for
+    /// attribution; not persisted.
+    pub agent_prompt_ids: Vec<String>,
+    /// Subagent cost attributed to this span (filled by `attribute_subagents`).
+    pub sub_tokens: u64,
+    pub sub_agent_count: u32,
+    /// True when any attributed subagent was equally split across competing
+    /// spans, so `sub_tokens` is an estimate (`docs/specs/events.md`).
+    pub sub_tokens_estimated: bool,
 }
 
 /// The index (exclusive) at which the span starting at `start` ends.
@@ -122,16 +136,23 @@ fn roll_up(
     let mut prompt_sizes = Vec::new();
     let mut out_tokens = 0;
     let mut models = Vec::new();
+    let mut agent_prompt_ids = Vec::new();
     for record in window {
-        if let RecordKind::Assistant {
-            prompt_size,
-            out_tokens: out,
-            model,
-        } = &record.kind
-        {
-            prompt_sizes.push(*prompt_size);
-            out_tokens += out;
-            models.push(model.as_str());
+        match &record.kind {
+            RecordKind::Assistant {
+                prompt_size,
+                out_tokens: out,
+                model,
+            } => {
+                prompt_sizes.push(*prompt_size);
+                out_tokens += out;
+                models.push(model.as_str());
+            }
+            RecordKind::AgentSpawn {
+                prompt_id: Some(prompt_id),
+                ..
+            } => agent_prompt_ids.push(prompt_id.clone()),
+            _ => {}
         }
     }
 
@@ -145,6 +166,10 @@ fn roll_up(
         ctx_start: prompt_sizes.first().copied().unwrap_or(0),
         ctx_peak: prompt_sizes.iter().copied().max().unwrap_or(0),
         model: representative_model(&models).map(String::from),
+        agent_prompt_ids,
+        sub_tokens: 0,
+        sub_agent_count: 0,
+        sub_tokens_estimated: false,
     }
 }
 

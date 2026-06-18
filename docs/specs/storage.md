@@ -42,7 +42,6 @@ CREATE TABLE events (
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
     surface_id           TEXT,
     source               TEXT,            -- slash | tool (skill invocation path); NULL otherwise
-    parent_id            INTEGER REFERENCES events(id),  -- meta-skill nesting
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
     duration_sec         REAL NOT NULL,

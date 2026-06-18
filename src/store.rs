@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS events (
     ctx_growth    INTEGER NOT NULL,
     ctx_start     INTEGER NOT NULL,
     ctx_peak      INTEGER NOT NULL,
-    model         TEXT
+    model         TEXT,
+    sub_tokens           INTEGER NOT NULL DEFAULT 0,
+    sub_agent_count      INTEGER NOT NULL DEFAULT 0,
+    sub_tokens_estimated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_by_surface ON events(surface_kind, surface_id);
 CREATE TABLE IF NOT EXISTS surfaces (
@@ -72,6 +75,7 @@ pub struct SkillUsage {
     pub out_tokens: i64,
     pub ctx_growth: i64,
     pub duration_sec: f64,
+    pub sub_tokens: i64,
 }
 
 /// One catalogued surface (effective scope already resolved).
@@ -153,8 +157,9 @@ impl Store {
                 "INSERT INTO events
                    (session_id, source_path, kind, surface_kind, surface_id, source,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
-                    ctx_start, ctx_peak, model)
-                 VALUES (?1, ?2, 'skill_invocation', 'skill', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    ctx_start, ctx_peak, model,
+                    sub_tokens, sub_agent_count, sub_tokens_estimated)
+                 VALUES (?1, ?2, 'skill_invocation', 'skill', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 (
                     &session.id,
                     &session.source_path,
@@ -168,6 +173,9 @@ impl Store {
                     span.ctx_start,
                     span.ctx_peak,
                     &span.model,
+                    span.sub_tokens,
+                    span.sub_agent_count,
+                    span.sub_tokens_estimated as i64,
                 ),
             )?;
         }
@@ -205,7 +213,8 @@ impl Store {
                     COUNT(*),
                     SUM(out_tokens),
                     SUM(ctx_growth),
-                    SUM(duration_sec)
+                    SUM(duration_sec),
+                    SUM(sub_tokens)
              FROM events
              WHERE surface_kind = 'skill'
              GROUP BY surface_id
@@ -219,6 +228,7 @@ impl Store {
                     out_tokens: row.get(2)?,
                     ctx_growth: row.get(3)?,
                     duration_sec: row.get(4)?,
+                    sub_tokens: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -350,6 +360,10 @@ mod tests {
             ctx_start: 0,
             ctx_peak: ctx_growth,
             model: Some("claude-opus-4-7".to_string()),
+            agent_prompt_ids: Vec::new(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            sub_tokens_estimated: false,
         }
     }
 
@@ -392,6 +406,7 @@ mod tests {
                     out_tokens: 300,
                     ctx_growth: 80,
                     duration_sec: 3.0,
+                    sub_tokens: 0,
                 },
                 SkillUsage {
                     skill: "pr-create".to_string(),
@@ -399,6 +414,7 @@ mod tests {
                     out_tokens: 10,
                     ctx_growth: 5,
                     duration_sec: 0.5,
+                    sub_tokens: 0,
                 },
             ]
         );

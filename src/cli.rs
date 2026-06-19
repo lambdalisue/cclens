@@ -17,7 +17,10 @@ use crate::adapter::transcript::{
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
-use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
+use crate::core::surface::{
+    LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
+    startup_savings,
+};
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
 use crate::store::{SessionMeta, Store};
 
@@ -71,6 +74,16 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Reconcile the measured always-on context against your readable config —
+    /// what every session actually loads, and how much is MCP/system you cannot
+    /// read from files.
+    Baseline {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -81,7 +94,46 @@ pub fn run() -> Result<()> {
         }
         Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
         Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
+        Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
     }
+}
+
+/// Reconcile the empirical always-on floor against readable config. The floor is
+/// what every session actually starts with; subtracting the config we can read
+/// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
+/// catalog cannot weigh. The per-project floors let you infer an MCP server's
+/// real cost by comparing a project that enables it against one that does not.
+fn baseline(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let floor = store.baseline_floor()?;
+    if floor == 0 {
+        println!("no data — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+    let config = store.always_on_config_tokens()?;
+    let residual = (floor - config).max(0);
+
+    println!("Observed always-on floor (leanest session-start context): {floor} tokens");
+    println!("  readable config (CLAUDE.md + always-on rules):          {config} tokens");
+    println!("  residual (system prompt + built-in tools + MCP schemas): {residual} tokens");
+    println!("  -> the residual is what you cannot read from files; compare projects below");
+    println!(
+        "     to see an MCP server's marginal cost (a project that enables it starts higher)."
+    );
+    println!();
+
+    let rows: Vec<Vec<String>> = store
+        .baseline_floor_per_project()?
+        .into_iter()
+        .map(|(project, floor)| vec![project, floor.to_string()])
+        .collect();
+    render(
+        &["project", "floor_tokens"],
+        &[Align::Left, Align::Right],
+        &rows,
+        format,
+    );
+    Ok(())
 }
 
 /// Static-token threshold above which an always-on or rarely-used surface counts
@@ -167,6 +219,15 @@ fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
         println!("no skill usage found — run `ccoptimizer analyze` first");
         return Ok(());
     }
+
+    // Where the tokens actually go: main-thread skill output vs subagents. The
+    // subagent figure is usually the larger by far — worth seeing before reading
+    // the per-skill table.
+    let main_out: i64 = usage.iter().map(|row| row.out_tokens).sum();
+    let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    println!(
+        "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)\n"
+    );
 
     let rows: Vec<Vec<String>> = usage
         .iter()
@@ -339,8 +400,10 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// List optimization wedges across all catalogued surfaces, ranked by priority
-/// then by static cost. This is the "where and how to optimize" view.
+/// List optimization wedges, ranked by what removing each surface actually saves
+/// at session start — real always-on tokens first, then MCP schemas, then
+/// declutter-only (skills/agents, whose body is on-demand). This is the "where
+/// and how to optimize" view, honest about which removals save context.
 fn wedges(format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
     let catalog = store.catalog()?;
@@ -350,7 +413,15 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
         .map(|(kind, id, count)| ((kind, id), count))
         .collect();
 
-    let mut found: Vec<(Wedge, &str, &str, Option<i64>, i64)> = Vec::new();
+    struct Row<'a> {
+        wedge: Wedge,
+        kind: &'a str,
+        id: &'a str,
+        uses: i64,
+        savings: StartupSavings,
+    }
+
+    let mut found: Vec<Row> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
@@ -362,7 +433,13 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
         if let Some(wedge) =
             classify_wedge(measurable, load_mode, static_tokens, uses, HEAVY_TOKENS)
         {
-            found.push((wedge, &entry.kind, &entry.id, entry.static_tokens, uses));
+            found.push(Row {
+                wedge,
+                kind: &entry.kind,
+                id: &entry.id,
+                uses,
+                savings: startup_savings(load_mode, static_tokens),
+            });
         }
     }
 
@@ -371,34 +448,29 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Rank by wedge priority, then by static cost (heaviest first).
-    found.sort_by(|a, b| {
-        a.0.priority()
-            .cmp(&b.0.priority())
-            .then(b.3.unwrap_or(0).cmp(&a.3.unwrap_or(0)))
-    });
+    // Rank by real startup savings: measured tokens (desc), then unmeasured MCP
+    // schemas, then declutter-only.
+    found.sort_by_key(|row| savings_rank(row.savings));
 
     let rows: Vec<Vec<String>> = found
         .iter()
-        .map(|(wedge, kind, id, static_tokens, uses)| {
-            // Catalog-only kinds (rules, CLAUDE.md) have no usage — show "-",
-            // not a misleading 0.
-            let uses_cell = if is_usage_measurable(kind) {
-                uses.to_string()
+        .map(|row| {
+            let uses_cell = if is_usage_measurable(row.kind) {
+                row.uses.to_string()
             } else {
                 "-".to_string()
             };
             vec![
-                wedge.label().to_string(),
-                format!("{kind}/{id}"),
-                static_tokens.map_or_else(|| "?".to_string(), |tokens| tokens.to_string()),
+                row.wedge.label().to_string(),
+                format!("{}/{}", row.kind, row.id),
+                savings_cell(row.savings),
                 uses_cell,
-                wedge.suggestion().to_string(),
+                savings_suggestion(row.wedge, row.savings),
             ]
         })
         .collect();
     render(
-        &["wedge", "surface", "static", "uses", "suggestion"],
+        &["wedge", "surface", "saves@start", "uses", "suggestion"],
         &[
             Align::Left,
             Align::Left,
@@ -410,6 +482,38 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
         format,
     );
     Ok(())
+}
+
+/// Sort key: real measured savings first (largest first), then unmeasured MCP
+/// schemas, then declutter-only.
+fn savings_rank(savings: StartupSavings) -> (u8, std::cmp::Reverse<u64>) {
+    match savings {
+        StartupSavings::Tokens(n) => (0, std::cmp::Reverse(n)),
+        StartupSavings::UnknownSchema => (1, std::cmp::Reverse(0)),
+        StartupSavings::Declutter => (2, std::cmp::Reverse(0)),
+    }
+}
+
+fn savings_cell(savings: StartupSavings) -> String {
+    match savings {
+        StartupSavings::Tokens(n) => format!("{n}/sess"),
+        StartupSavings::UnknownSchema => "schema?".to_string(),
+        StartupSavings::Declutter => "~0".to_string(),
+    }
+}
+
+/// A suggestion honest about whether removal saves context or only declutters.
+fn savings_suggestion(wedge: Wedge, savings: StartupSavings) -> String {
+    match savings {
+        StartupSavings::Tokens(n) => format!("removing saves ~{n} tokens every session"),
+        StartupSavings::UnknownSchema => {
+            "disable: drops its tool schema from every session (real, unmeasured)".to_string()
+        }
+        StartupSavings::Declutter => match wedge {
+            Wedge::Unused => "declutter only: body is on-demand, ~no startup saving".to_string(),
+            _ => "heavy only when invoked; rarely used".to_string(),
+        },
+    }
 }
 
 /// Main session transcripts: the `<sessionId>.jsonl` files directly under each

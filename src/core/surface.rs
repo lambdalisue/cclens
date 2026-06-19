@@ -128,6 +128,33 @@ impl Wedge {
     }
 }
 
+/// What removing a surface actually saves from the context loaded at session
+/// start. The distinction matters because skills and agents load only their
+/// description at startup (their body is on-demand), so deleting an unused one
+/// is decluttering — not a token win — whereas always-on config and tool schemas
+/// are paid every session. See `docs/specs/surfaces.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupSavings {
+    /// Real, measured: removing it saves this many tokens every session.
+    Tokens(u64),
+    /// Real but unmeasured: an MCP tool schema loaded every session, weight unknown.
+    UnknownSchema,
+    /// ~No startup cost (on-demand / path-conditional body) — removal is
+    /// decluttering only.
+    Declutter,
+}
+
+/// The startup token saving from removing a surface, by load mode.
+pub fn startup_savings(load_mode: LoadMode, static_tokens: Option<u64>) -> StartupSavings {
+    match load_mode {
+        LoadMode::StartupFull => StartupSavings::Tokens(static_tokens.unwrap_or(0)),
+        LoadMode::ToolSchema => StartupSavings::UnknownSchema,
+        LoadMode::StartupDescription | LoadMode::PathConditional | LoadMode::OnDemand => {
+            StartupSavings::Declutter
+        }
+    }
+}
+
 /// Classify a surface into its optimization wedge, if any. `uses` is the
 /// invocation count (meaningful only for `measurable` kinds); `heavy_tokens`
 /// is the injected threshold for "large" static cost. The "unused" verdict is
@@ -208,5 +235,24 @@ mod tests {
     fn a_well_used_surface_has_no_wedge() {
         let wedge = classify_wedge(true, LoadMode::StartupDescription, Some(2000), 50, 1000);
         assert_eq!(wedge, None);
+    }
+
+    #[test]
+    fn startup_savings_reflects_what_is_actually_paid_at_startup() {
+        // An always-on rule: removing it saves real tokens every session.
+        assert_eq!(
+            startup_savings(LoadMode::StartupFull, Some(900)),
+            StartupSavings::Tokens(900)
+        );
+        // An MCP server: real but unmeasured.
+        assert_eq!(
+            startup_savings(LoadMode::ToolSchema, None),
+            StartupSavings::UnknownSchema
+        );
+        // A skill: body is on-demand, so removal is decluttering, not a token win.
+        assert_eq!(
+            startup_savings(LoadMode::StartupDescription, Some(2000)),
+            StartupSavings::Declutter
+        );
     }
 }

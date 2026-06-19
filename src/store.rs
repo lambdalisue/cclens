@@ -264,6 +264,47 @@ impl Store {
         Ok(rows)
     }
 
+    /// Total tokens of always-on (startup_full) config read from files — what a
+    /// session pays unconditionally from CLAUDE.md and non-conditional rules.
+    pub fn always_on_config_tokens(&self) -> Result<i64> {
+        let total = self.conn.query_row(
+            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces WHERE load_mode = 'startup_full'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
+    /// Empirical always-on context floor per project: the smallest non-trivial
+    /// prompt size any skill started with. The leanest such moment is closest to
+    /// a fresh session's baseline (system prompt + tool/MCP schemas + always-on
+    /// config), so it is a lower bound on what every session in that project
+    /// actually loads — including the MCP schema cost the catalog cannot read.
+    pub fn baseline_floor_per_project(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, MIN(e.ctx_start)
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.ctx_start > 0
+             GROUP BY s.project
+             ORDER BY MIN(e.ctx_start) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The global empirical always-on floor — the smallest non-trivial prompt
+    /// size observed anywhere.
+    pub fn baseline_floor(&self) -> Result<i64> {
+        let floor = self.conn.query_row(
+            "SELECT COALESCE(MIN(ctx_start), 0) FROM events WHERE ctx_start > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(floor)
+    }
+
     /// Total subagent output tokens and subagent count across all sessions.
     pub fn subagent_totals(&self) -> Result<(i64, i64)> {
         let row = self.conn.query_row(
@@ -492,6 +533,83 @@ mod tests {
         assert_eq!(catalog.len(), 2);
         let git = catalog.iter().find(|e| e.id == "git-commit").unwrap();
         assert_eq!(git.static_tokens, Some(250)); // the project row won
+    }
+
+    fn span_at_ctx(skill: &str, ctx_start: u64) -> Span {
+        Span {
+            skill: skill.to_string(),
+            source: Source::Slash,
+            started_epoch_ms: 1_700_000_000_000,
+            duration_sec: 1.0,
+            out_tokens: 10,
+            ctx_growth: 5,
+            ctx_start,
+            ctx_peak: ctx_start,
+            model: None,
+            is_trailing: false,
+            agent_prompt_ids: Vec::new(),
+            sub_tokens: 0,
+            sub_agent_count: 0,
+            sub_tokens_estimated: false,
+        }
+    }
+
+    #[test]
+    fn baseline_floor_is_the_smallest_nonzero_ctx_start_per_project() {
+        let mut store = Store::in_memory().unwrap();
+        // Project "alpha": floor 12000; project "beta": floor 40000.
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store
+            .ingest_session(
+                &alpha,
+                &[
+                    span_at_ctx("git-commit", 30000),
+                    span_at_ctx("pr-create", 12000),
+                ],
+                &[],
+            )
+            .unwrap();
+        let mut beta = session("b1");
+        beta.project = "beta".to_string();
+        store
+            .ingest_session(&beta, &[span_at_ctx("git-commit", 40000)], &[])
+            .unwrap();
+
+        assert_eq!(store.baseline_floor().unwrap(), 12000);
+        assert_eq!(
+            store.baseline_floor_per_project().unwrap(),
+            vec![("beta".to_string(), 40000), ("alpha".to_string(), 12000)]
+        );
+    }
+
+    #[test]
+    fn always_on_config_sums_only_startup_full_surfaces() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[
+                Surface {
+                    kind: "claude_md".to_string(),
+                    id: "global".to_string(),
+                    scope: Scope::Global,
+                    config_path: "/c/CLAUDE.md".to_string(),
+                    static_tokens: Some(600),
+                    load_mode: LoadMode::StartupFull,
+                },
+                Surface {
+                    kind: "rule".to_string(),
+                    id: "git/safety".to_string(),
+                    scope: Scope::Global,
+                    config_path: "/c/safety.md".to_string(),
+                    static_tokens: Some(900),
+                    load_mode: LoadMode::StartupFull,
+                },
+                // A skill is startup_description — must NOT count.
+                surface("git-commit", Scope::Global, 1000),
+            ])
+            .unwrap();
+
+        assert_eq!(store.always_on_config_tokens().unwrap(), 1500);
     }
 
     #[test]

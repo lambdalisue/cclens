@@ -35,8 +35,9 @@ tool's core questions:
 | View | Answers |
 | --- | --- |
 | `surfaces` (default) | The catalog×usage join per surface: static cost, load mode, usage, cost — the optimization wedges (`surfaces.md`), ranked. |
-| `usage` | Event rollups: per surface and/or per time bucket — frequency, tokens, `ctx_growth`, duration. |
+| `usage` | Event rollups: per surface and/or per time bucket — frequency, tokens, `ctx_growth`, duration. The default per-skill view leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
 | `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence. |
+| `baseline` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
 
 Filters (`--kind`, `--project`, `--since/--until`) narrow any view. Output is a
 terminal **table** by default or **Markdown** for pasting into notes/PRs.

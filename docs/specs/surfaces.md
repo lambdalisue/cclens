@@ -80,6 +80,27 @@ its evidence; acting (or the future AI layer proposing) is downstream.
 | **Recurring friction** | repeated permission denials for the same operation | `permission_prompt` (heuristic) | add an allow rule |
 | **Orphaned usage** | events with no matching surface | any usage event | re-add config, or ignore if intentional |
 
+### Ranking by what removal actually saves
+
+A wedge is only useful if it says how much *removing the surface saves at
+session start* — and that is not its static token count. Skills and agents load
+only their **description** at startup (their body is on-demand), so deleting an
+unused one is **decluttering**, not a token win, even if its body tokenizes
+large. The `wedges` view therefore ranks by `startup_savings` (see
+`core::surface`):
+
+- **measured tokens** — always-on config (`startup_full`): removing it saves that
+  many tokens every session. Ranked first, largest first.
+- **unknown schema** — an MCP server (`tool_schema`): a real every-session cost
+  the catalog cannot weigh; flagged, ranked next.
+- **declutter** — on-demand / path-conditional bodies (skills, agents,
+  conditional rules): ~no startup cost, so an unused one is namespace hygiene,
+  not savings. Ranked last and labelled as such.
+
+This stops the view from headlining an unused skill's body size as if deleting
+it freed that context, and lifts the genuinely paid items (heavy always-on
+rules, unused MCP servers) to the top.
+
 The "Requires" column makes the coverage explicit: **Unused** and **Costly +
 rare** apply only to usage-measurable kinds — never to `rule` / `hook` /
 `claude_md`. A few wedges depend on signals the tool does not yet fully have:
@@ -104,13 +125,24 @@ always-on wedge is confirmed empirically, not asserted:
 `static_tokens` is a config-side estimate, never a measured runtime component
 (`config-format.md`). To claim "your always-on config costs ~X every session"
 honestly, reconcile it against observed context: the **floor of `ctx_start`
-across a project's sessions** is an empirical lower bound on the always-on
-context every session starts with. Comparing `sum(static_tokens WHERE
-load_mode = startup_full)` against that observed floor is the only evidence-backed
-form of the always-on claim. The report shows both numbers — the config-side
-estimate and the observed floor — rather than presenting the estimate as if it
-were the measured tax. When they diverge badly, that divergence is itself a
-signal (a stale load-mode assumption, or untracked context).
+across sessions** is an empirical lower bound on the always-on context every
+session starts with. Comparing `sum(static_tokens WHERE load_mode = startup_full)`
+against that observed floor is the only evidence-backed form of the always-on
+claim.
+
+This is implemented as the `baseline` command (`cli.md`): it reports the observed
+floor, the readable config that accounts for part of it, and the **residual** —
+the floor minus the config — which is everything not in the user's files: the
+system prompt, built-in tools, and **MCP tool schemas** the catalog cannot weigh
+(`config-format.md` marks `mcp_tool` static cost unknown). The residual is how
+the tool gives an empirical handle on MCP cost despite not reading the schema:
+observed against a real tree, the readable config was a small fraction (~6%) of a
+much larger always-on floor, redirecting "what to slim" from rules toward the
+tool/MCP surface. Per-project floors are also shown, but they are confounded by
+how early in a session a skill was first invoked (a project whose skills only ran
+deep in long sessions shows an inflated floor), so the **global** floor is the
+trustworthy baseline; the per-project view is suggestive, not a clean per-server
+measurement.
 
 ## Time and trend
 

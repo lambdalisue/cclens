@@ -3,8 +3,8 @@
 //! `docs/specs/storage.md`.
 //!
 //! The schema is a subset of the spec's `events` table — the columns the
-//! current pipeline populates. Deferred columns (`parent_id`, `source_line`,
-//! `is_trailing`, `sub_*`, `attrs_json`) are added as their features land.
+//! current pipeline populates. Deferred columns (`source_line`, `attrs_json`)
+//! are added as their features land.
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS events (
     model         TEXT,
     sub_tokens           INTEGER NOT NULL DEFAULT 0,
     sub_agent_count      INTEGER NOT NULL DEFAULT 0,
-    sub_tokens_estimated INTEGER NOT NULL DEFAULT 0
+    sub_tokens_estimated INTEGER NOT NULL DEFAULT 0,
+    is_trailing          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_by_surface ON events(surface_kind, surface_id);
 CREATE TABLE IF NOT EXISTS surfaces (
@@ -158,8 +159,8 @@ impl Store {
                    (session_id, source_path, kind, surface_kind, surface_id, source,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak, model,
-                    sub_tokens, sub_agent_count, sub_tokens_estimated)
-                 VALUES (?1, ?2, 'skill_invocation', 'skill', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    sub_tokens, sub_agent_count, sub_tokens_estimated, is_trailing)
+                 VALUES (?1, ?2, 'skill_invocation', 'skill', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 (
                     &session.id,
                     &session.source_path,
@@ -176,6 +177,7 @@ impl Store {
                     span.sub_tokens,
                     span.sub_agent_count,
                     span.sub_tokens_estimated as i64,
+                    span.is_trailing as i64,
                 ),
             )?;
         }
@@ -360,6 +362,7 @@ mod tests {
             ctx_start: 0,
             ctx_peak: ctx_growth,
             model: Some("claude-opus-4-7".to_string()),
+            is_trailing: false,
             agent_prompt_ids: Vec::new(),
             sub_tokens: 0,
             sub_agent_count: 0,

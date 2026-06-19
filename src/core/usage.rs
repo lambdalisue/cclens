@@ -157,6 +157,7 @@ mod tests {
             ctx_start: 0,
             ctx_peak: 0,
             model: None,
+            is_trailing: false,
             agent_prompt_ids: agent_prompt_ids.iter().map(|s| s.to_string()).collect(),
             sub_tokens: 0,
             sub_agent_count: 0,

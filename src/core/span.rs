@@ -62,6 +62,10 @@ pub struct Span {
     pub ctx_start: u64,
     pub ctx_peak: u64,
     pub model: Option<String>,
+    /// True when the span closed only at the end of the session (no human turn,
+    /// sibling skill, or idle gap followed) — its `duration_sec` is a lower
+    /// bound (`docs/specs/events.md`).
+    pub is_trailing: bool,
     /// Prompt ids of the subagents this span spawned — the join key for
     /// attribution; not persisted.
     pub agent_prompt_ids: Vec<String>,
@@ -129,7 +133,10 @@ fn roll_up(
     source: Source,
     idle_gap_ms: i64,
 ) -> Span {
-    let window = &records[start..span_end(records, start, idle_gap_ms)];
+    let end = span_end(records, start, idle_gap_ms);
+    // Nothing closed it but the session ending — its duration is a lower bound.
+    let is_trailing = end == records.len();
+    let window = &records[start..end];
 
     let timestamps: Vec<i64> = window.iter().map(|record| record.timestamp_ms).collect();
 
@@ -166,6 +173,7 @@ fn roll_up(
         ctx_start: prompt_sizes.first().copied().unwrap_or(0),
         ctx_peak: prompt_sizes.iter().copied().max().unwrap_or(0),
         model: representative_model(&models).map(String::from),
+        is_trailing,
         agent_prompt_ids,
         sub_tokens: 0,
         sub_agent_count: 0,
@@ -260,6 +268,24 @@ mod tests {
             at(1_000 + 60 * 1000, RecordKind::Other), // 1 min later
         ];
         assert_eq!(span_end(&records, 0, five_min), 3);
+    }
+
+    #[test]
+    fn a_span_with_no_closer_is_trailing() {
+        let records = [at(0, skill("loop")), at(1, assistant(10, 5, "m"))];
+        let span = &extract_spans(&records, DEFAULT_IDLE_GAP_MS)[0];
+        assert!(span.is_trailing);
+    }
+
+    #[test]
+    fn a_span_closed_by_a_human_turn_is_not_trailing() {
+        let records = [
+            at(0, skill("git-commit")),
+            at(1, assistant(10, 5, "m")),
+            at(2, RecordKind::HumanTurn),
+        ];
+        let span = &extract_spans(&records, DEFAULT_IDLE_GAP_MS)[0];
+        assert!(!span.is_trailing);
     }
 
     #[test]

@@ -2,9 +2,8 @@
 //! layer knows SQL but nothing about raw Claude Code formats. See
 //! `docs/specs/storage.md`.
 //!
-//! The schema is a subset of the spec's `events` table — the columns the
-//! current pipeline populates. Deferred columns (`source_line`, `attrs_json`)
-//! are added as their features land.
+//! The schema tracks the spec's `events` table; `attrs_json` is the one column
+//! deferred until a report needs it.
 
 use anyhow::Result;
 use rusqlite::Connection;

@@ -12,7 +12,9 @@ use crate::adapter::config::{
     read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_rule_surfaces,
     read_skill_surfaces,
 };
-use crate::adapter::transcript::{extract_prompt_pointers, parse_session, subagent_prompt_id};
+use crate::adapter::transcript::{
+    count_permission_denials, extract_prompt_pointers, parse_session, subagent_prompt_id,
+};
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
@@ -92,9 +94,11 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
 
     let mut sessions = 0;
     let mut spans_total = 0;
+    let mut denials = 0;
     for transcript in main_transcripts(&projects)? {
         let text = fs::read_to_string(&transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
+        denials += count_permission_denials(&text);
         let records = parse_session(&text);
         let mut spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
         let usage = extract_usage_events(&records);
@@ -119,7 +123,8 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
     println!(
         "analyzed {sessions} session(s), {spans_total} skill invocation(s), \
          {surface_count} surface(s) catalogued, \
-         {sub_tokens} subagent tokens across {sub_agents} subagent(s) -> {}",
+         {sub_tokens} subagent tokens across {sub_agents} subagent(s), \
+         {denials} permission denial(s) -> {}",
         db.display()
     );
     Ok(())

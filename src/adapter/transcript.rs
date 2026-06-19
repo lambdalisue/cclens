@@ -187,6 +187,18 @@ pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64)> {
         .collect()
 }
 
+/// Count permission denials in a transcript — a friction signal. There is no
+/// structured record for these (`docs/specs/session-format.md`); they appear as
+/// denial text inside a tool-result, so this is a lower-confidence heuristic:
+/// the marker phrase within a `tool_result` line.
+pub fn count_permission_denials(jsonl: &str) -> usize {
+    const MARKER: &str = "Permission for this action was denied";
+    jsonl
+        .lines()
+        .filter(|line| line.contains("tool_result") && line.contains(MARKER))
+        .count()
+}
+
 /// The `promptId` a subagent transcript was spawned under — the join key back to
 /// the spawning span. Read from the first record that carries one.
 pub fn subagent_prompt_id(jsonl: &str) -> Option<String> {
@@ -316,6 +328,19 @@ mod tests {
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "git-commit");
+    }
+
+    #[test]
+    fn counts_permission_denials_in_tool_results_only() {
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","content":"Permission for this action was denied by the user"}]}}"#,
+            "\n",
+            // The same phrase quoted in a prompt is not a denial.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":"why does Permission for this action was denied appear?"}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+        );
+        assert_eq!(count_permission_denials(jsonl), 1);
     }
 
     #[test]

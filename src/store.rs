@@ -68,7 +68,11 @@ pub struct SessionMeta {
     pub sub_agent_count: i64,
 }
 
-/// One row of the per-skill usage rollup.
+/// One row of the per-skill usage rollup. Subagent cost is deliberately not
+/// rolled up per skill: under the flat-span model a skill's window can absorb
+/// subagents spawned by later same-window work, so a per-skill figure
+/// over-counts for skills that do not themselves spawn agents. The exact figure
+/// is the session-level total (`subagent_totals`). See `docs/specs/events.md`.
 #[derive(Debug, PartialEq)]
 pub struct SkillUsage {
     pub skill: String,
@@ -76,7 +80,6 @@ pub struct SkillUsage {
     pub out_tokens: i64,
     pub ctx_growth: i64,
     pub duration_sec: f64,
-    pub sub_tokens: i64,
 }
 
 /// One catalogued surface (effective scope already resolved).
@@ -241,8 +244,7 @@ impl Store {
                     COUNT(*),
                     SUM(out_tokens),
                     SUM(ctx_growth),
-                    SUM(duration_sec),
-                    SUM(sub_tokens)
+                    SUM(duration_sec)
              FROM events
              WHERE surface_kind = 'skill'
              GROUP BY surface_id
@@ -256,7 +258,6 @@ impl Store {
                     out_tokens: row.get(2)?,
                     ctx_growth: row.get(3)?,
                     duration_sec: row.get(4)?,
-                    sub_tokens: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -435,7 +436,6 @@ mod tests {
                     out_tokens: 300,
                     ctx_growth: 80,
                     duration_sec: 3.0,
-                    sub_tokens: 0,
                 },
                 SkillUsage {
                     skill: "pr-create".to_string(),
@@ -443,7 +443,6 @@ mod tests {
                     out_tokens: 10,
                     ctx_growth: 5,
                     duration_sec: 0.5,
-                    sub_tokens: 0,
                 },
             ]
         );

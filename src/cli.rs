@@ -176,16 +176,14 @@ fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
                 row.invocations.to_string(),
                 row.out_tokens.to_string(),
                 row.ctx_growth.to_string(),
-                row.sub_tokens.to_string(),
                 format!("{:.0}", row.duration_sec),
             ]
         })
         .collect();
     render(
-        &["skill", "count", "out_tok", "ctx_grow", "sub_tok", "sec"],
+        &["skill", "count", "out_tok", "ctx_grow", "sec"],
         &[
             Align::Left,
-            Align::Right,
             Align::Right,
             Align::Right,
             Align::Right,
@@ -383,11 +381,18 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
     let rows: Vec<Vec<String>> = found
         .iter()
         .map(|(wedge, kind, id, static_tokens, uses)| {
+            // Catalog-only kinds (rules, CLAUDE.md) have no usage — show "-",
+            // not a misleading 0.
+            let uses_cell = if is_usage_measurable(kind) {
+                uses.to_string()
+            } else {
+                "-".to_string()
+            };
             vec![
                 wedge.label().to_string(),
                 format!("{kind}/{id}"),
                 static_tokens.map_or_else(|| "?".to_string(), |tokens| tokens.to_string()),
-                uses.to_string(),
+                uses_cell,
                 wedge.suggestion().to_string(),
             ]
         })

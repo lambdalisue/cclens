@@ -152,6 +152,22 @@ always one-to-one.
 The worst-case error of equal-split is bounded by the spread of the competing
 subagents' sizes; the flag, not false precision, is the mitigation.
 
+### Per-span attribution is window-bounded, not authoritative
+
+Attribution joins a subagent to the span whose window contains its `Agent`
+spawn. Under the flat-span model a span's window can stretch past the skill's
+own work (until the next human turn / skill / idle gap), so it can absorb
+subagents spawned by *later, same-window* activity. Observed in real data: a
+`git-commit` span — `git-commit` spawns no agents — picked up several agents
+that ran after the commit in the same turn. There is no transcript marker for
+"the skill returned", so this cannot be tightened structurally.
+
+Therefore `events.sub_tokens` is recorded per span (queryable, and exact for
+skills that genuinely spawn their own agents) but is **not rolled up into the
+per-skill report**, where it would over-count. The authoritative subagent figure
+is the **session-level total** (`sessions.sub_tokens`), which is exact — every
+subagent transcript counted once, no window guess involved.
+
 ## Determinism
 
 The core takes the session's records plus tuning constants (`IDLE_GAP`) and

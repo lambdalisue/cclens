@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY,
     session_id    TEXT NOT NULL,
     source_path   TEXT NOT NULL,
+    source_line   INTEGER,
     kind          TEXT NOT NULL,
     surface_kind  TEXT,
     surface_id    TEXT,
@@ -202,6 +203,32 @@ impl Store {
                     epoch_ms_to_rfc3339(event.started_epoch_ms),
                     event.started_epoch_ms / 1000,
                 ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert prompt-pointer events for a session: `(source_line, epoch_ms)`
+    /// per user prompt. The text is not stored — only the pointer
+    /// (`source_path` with `source_line`) so it can be re-read later
+    /// (`docs/specs/storage.md`). Call after `ingest_session`, whose
+    /// delete-by-`source_path` already cleared any prior prompt rows for this file.
+    pub fn ingest_prompts(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        prompts: &[(usize, i64)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (line_no, epoch_ms) in prompts {
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, source_line, kind,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak)
+                 VALUES (?1, ?2, ?3, 'prompt', '', ?4, 0, 0, 0, 0, 0)",
+                (session_id, source_path, *line_no as i64, epoch_ms / 1000),
             )?;
         }
         tx.commit()?;

@@ -12,7 +12,7 @@ use crate::adapter::config::{
     read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_rule_surfaces,
     read_skill_surfaces,
 };
-use crate::adapter::transcript::{parse_session, subagent_prompt_id};
+use crate::adapter::transcript::{extract_prompt_pointers, parse_session, subagent_prompt_id};
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{LoadMode, Scope, Surface, Wedge, classify_wedge, is_usage_measurable};
@@ -103,6 +103,8 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         let sub_tokens: i64 = subagents.iter().map(|(_, tokens)| *tokens as i64).sum();
         let meta = session_meta(&transcript, sub_tokens, subagents.len() as i64);
         store.ingest_session(&meta, &spans, &usage)?;
+        let prompts = extract_prompt_pointers(&text);
+        store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
         sessions += 1;
         spans_total += spans.len();
     }

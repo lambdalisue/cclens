@@ -167,6 +167,26 @@ fn command_content(raw: &Raw) -> Option<&str> {
         .then_some(content)
 }
 
+/// Pointers `(source_line, epoch_ms)` to each user prompt in a transcript. The
+/// prompt *text* is never stored — only where to find it — so prompt clustering
+/// (goal 3) stays possible after transcripts rotate without copying personal
+/// text into the store. See `docs/specs/storage.md`, `events.md`.
+pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64)> {
+    jsonl
+        .lines()
+        .enumerate()
+        .filter_map(|(line_no, line)| {
+            let raw: Raw = serde_json::from_str(line).ok()?;
+            let ts = raw.timestamp.as_deref().and_then(parse_timestamp_ms)?;
+            let is_prompt = raw.kind.as_deref() == Some("user")
+                && raw.is_meta != Some(true)
+                && command_content(&raw).is_none()
+                && !line.contains("tool_result");
+            is_prompt.then_some((line_no, ts))
+        })
+        .collect()
+}
+
 /// The `promptId` a subagent transcript was spawned under — the join key back to
 /// the spawning span. Read from the first record that carries one.
 pub fn subagent_prompt_id(jsonl: &str) -> Option<String> {
@@ -296,6 +316,26 @@ mod tests {
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "git-commit");
+    }
+
+    #[test]
+    fn prompt_pointers_point_at_user_prompts_only() {
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"do the thing"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"usage":{"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_result","content":"x"}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":"and another"}}"#,
+        );
+
+        let pointers = extract_prompt_pointers(jsonl);
+        // Lines 0 and 3 are prompts; line 1 is assistant, line 2 a tool result.
+        assert_eq!(
+            pointers,
+            vec![(0, 1_767_225_600_000), (3, 1_767_225_603_000)]
+        );
     }
 
     #[test]

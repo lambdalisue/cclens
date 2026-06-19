@@ -177,11 +177,30 @@ pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: Scope) -> Vec<Surface> {
         .keys()
         .map(|name| Surface {
             kind: "mcp_server".to_string(),
-            id: name.clone(),
+            // The catalog id must match the usage id, which is extracted from a
+            // tool name (`mcp__<server>__…`) where Claude Code has already
+            // sanitized the server name. Apply the same sanitization here so a
+            // server like `grafana:prod` joins its `grafana_prod` usage instead
+            // of showing up as both UNUSED (catalog) and ORPHANED (usage).
+            id: sanitize_mcp_server_id(name),
             scope,
             config_path: mcp_json.display().to_string(),
             static_tokens: None,
             load_mode: LoadMode::ToolSchema,
+        })
+        .collect()
+}
+
+/// Sanitize an MCP server name to the id form Claude Code uses in tool names:
+/// characters outside `[A-Za-z0-9_-]` (notably `:`) become `_`.
+fn sanitize_mcp_server_id(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
         })
         .collect()
 }
@@ -253,6 +272,19 @@ mod tests {
     fn a_rule_with_no_frontmatter_is_always_on() {
         let surface = rule_surface("plain", "/cfg/plain.md", "# Just a heading", Scope::Global);
         assert_eq!(surface.load_mode, LoadMode::StartupFull);
+    }
+
+    #[test]
+    fn mcp_server_id_is_sanitized_to_match_tool_name_usage() {
+        // A `grafana:prod` config key must become `grafana_prod` so it joins the
+        // usage extracted from `mcp__grafana_prod__...` tool names.
+        assert_eq!(sanitize_mcp_server_id("grafana:prod"), "grafana_prod");
+        assert_eq!(
+            sanitize_mcp_server_id("grafana:unofficial-economy-production"),
+            "grafana_unofficial-economy-production"
+        );
+        // Already-clean names are unchanged.
+        assert_eq!(sanitize_mcp_server_id("playwright"), "playwright");
     }
 
     #[test]

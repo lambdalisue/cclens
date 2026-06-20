@@ -241,6 +241,62 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<(i64, ErrorCategory)> {
     errors
 }
 
+/// Extract work events `(epoch_ms, kind, id)` from a transcript: the leading
+/// word of each Bash command (`kind = "bash_cmd"`) and the basename of each
+/// Edit/Write target (`kind = "file_edit"`). These drive the command-mix and
+/// file-hotspot views — where effort (and churn) concentrates.
+pub fn extract_work_events(jsonl: &str) -> Vec<(i64, &'static str, String)> {
+    let mut events = Vec::new();
+    for line in jsonl.lines() {
+        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
+            continue;
+        };
+        if raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+            continue;
+        };
+        let Some(blocks) = raw
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .and_then(|content| content.as_array())
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input = block.get("input");
+            match name {
+                "Bash" => {
+                    if let Some(cmd) = input
+                        .and_then(|i| i.get("command"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|c| c.split_whitespace().next())
+                    {
+                        events.push((ts, "bash_cmd", cmd.to_string()));
+                    }
+                }
+                "Edit" | "Write" | "NotebookEdit" => {
+                    if let Some(path) = input
+                        .and_then(|i| i.get("file_path"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let base = path.rsplit('/').next().unwrap_or(path).to_string();
+                        events.push((ts, "file_edit", base));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events
+}
+
 /// Count permission denials in a transcript — a friction signal. There is no
 /// structured record for these (`docs/specs/session-format.md`); they appear as
 /// denial text inside a tool-result, so this is a lower-confidence heuristic:
@@ -382,6 +438,20 @@ mod tests {
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].skill, "git-commit");
+    }
+
+    #[test]
+    fn work_events_capture_bash_leading_word_and_edit_basename() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /x && cargo test"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/cli.rs"}}]}}"#,
+        );
+        let events = extract_work_events(jsonl);
+        assert_eq!(events[0].1, "bash_cmd");
+        assert_eq!(events[0].2, "cd"); // leading word only
+        assert_eq!(events[1].1, "file_edit");
+        assert_eq!(events[1].2, "cli.rs"); // basename
     }
 
     #[test]

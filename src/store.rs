@@ -270,6 +270,42 @@ impl Store {
         Ok(())
     }
 
+    /// Insert work events `(epoch_ms, kind, id)` — Bash leading words and edited
+    /// file basenames — kept out of the catalog join (`surface_kind` NULL).
+    pub fn ingest_work_events(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        events: &[(i64, &str, String)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (epoch_ms, kind, id) in events {
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, surface_id,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak)
+                 VALUES (?1, ?2, ?3, ?4, '', ?5, 0, 0, 0, 0, 0)",
+                (session_id, source_path, *kind, id, epoch_ms / 1000),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Counts of a work-event kind by id (e.g. Bash leading word, edited file),
+    /// most frequent first.
+    pub fn work_counts(&self, kind: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface_id, COUNT(*) FROM events WHERE kind = ?1
+             GROUP BY surface_id ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Counts of tool failures by category, most frequent first.
     pub fn error_counts(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(

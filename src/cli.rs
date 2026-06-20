@@ -13,8 +13,8 @@ use crate::adapter::config::{
     read_skill_surfaces,
 };
 use crate::adapter::transcript::{
-    count_permission_denials, extract_prompt_pointers, extract_tool_errors, parse_session,
-    subagent_prompt_id,
+    count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
+    parse_session, subagent_prompt_id,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
@@ -104,6 +104,22 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Files Claude edits most — where effort and churn concentrate.
+    Hotspots {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
+    /// The Bash command mix — what Claude runs most, and the `cd` overhead.
+    Commands {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -117,7 +133,71 @@ pub fn run() -> Result<()> {
         Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
         Command::Prompts { format, db } => prompts(parse_format(format.as_deref())?, &db),
         Command::Friction { format, db } => friction(parse_format(format.as_deref())?, &db),
+        Command::Hotspots { format, db } => hotspots(parse_format(format.as_deref())?, &db),
+        Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
     }
+}
+
+/// Files Claude edits most. A high edit count is where effort concentrates — and
+/// can flag churn (re-editing the same file many times = struggling).
+fn hotspots(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let counts = store.work_counts("file_edit")?;
+    if counts.is_empty() {
+        println!("no edits found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = counts
+        .iter()
+        .take(25)
+        .map(|(file, n)| vec![file.clone(), n.to_string()])
+        .collect();
+    render(
+        &["file", "edits"],
+        &[Align::Left, Align::Right],
+        &rows,
+        format,
+    );
+    Ok(())
+}
+
+/// The Bash command mix, and how much of it is `cd` overhead.
+fn commands(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let counts = store.work_counts("bash_cmd")?;
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        println!("no Bash commands found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = counts
+        .iter()
+        .take(20)
+        .map(|(cmd, n)| {
+            let pct = (*n as f64 * 100.0 / total as f64).round() as i64;
+            vec![cmd.clone(), n.to_string(), format!("{pct}%")]
+        })
+        .collect();
+    render(
+        &["command", "count", "share"],
+        &[Align::Left, Align::Right, Align::Right],
+        &rows,
+        format,
+    );
+
+    let cd = counts
+        .iter()
+        .find(|(c, _)| c == "cd")
+        .map_or(0, |(_, n)| *n);
+    let cd_pct = (cd as f64 * 100.0 / total as f64).round() as i64;
+    println!("\n{total} Bash commands");
+    if cd_pct >= 25 {
+        println!(
+            "  - {cd_pct}% are `cd` ({cd}): a lot of directory churn — absolute paths or a \
+             working-dir convention (noted in CLAUDE.md) would cut it."
+        );
+    }
+    Ok(())
 }
 
 /// Where the work stumbles: recurring tool failures by category, ranked, each
@@ -281,6 +361,8 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
             .map(|(ts, category)| (ts, category.label()))
             .collect();
         store.ingest_tool_errors(&meta.id, &meta.source_path, &errors)?;
+        let work = extract_work_events(&text);
+        store.ingest_work_events(&meta.id, &meta.source_path, &work)?;
         sessions += 1;
         spans_total += spans.len();
     }

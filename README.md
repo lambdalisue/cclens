@@ -9,12 +9,28 @@ behind it all.
 The design intent lives in [`docs/specs/`](docs/specs/); this README is how to
 run it.
 
-## Build
+## Install / build
+
+With Nix (no toolchain to set up):
 
 ```sh
-cargo build --release
-# binary at target/release/cclens
+nix run github:lambdalisue/cclens -- summary   # run without installing
+nix profile install github:lambdalisue/cclens  # install `cclens` onto PATH
 ```
+
+From source — dev tools are pinned by the Nix flake, tasks run via `just`:
+
+```sh
+nix develop          # enter the dev shell (pinned rust, just, sqlite, …)
+just                 # list tasks
+just check           # rustfmt --check + clippy (the CI gate)
+just test            # cargo test
+just build           # release binary at target/release/cclens
+```
+
+Plain Cargo also works (`cargo build --release`) if you have a recent stable
+Rust; the flake just pins it. CI runs `nix develop -c just check` / `just test`,
+and tagged releases (`vX.Y.Z`) build native binaries for Linux/macOS/Windows.
 
 ## Quick start
 

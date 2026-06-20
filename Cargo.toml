@@ -7,6 +7,9 @@ edition = "2024"
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
+# Pinned to 0.32: newer rusqlite pulls libsqlite3-sys >= 0.38, whose build
+# script uses the still-unstable `cfg_select` feature and so fails on stable
+# Rust (confirmed on 1.93). Revisit once libsqlite3-sys drops it / it stabilizes.
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

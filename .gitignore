@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Nix build symlink
+/result
+
 # Generated intermediate data (analysis output — never committed)
 *.db
 *.db-shm

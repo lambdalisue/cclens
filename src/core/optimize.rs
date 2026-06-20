@@ -40,13 +40,25 @@ pub struct Findings {
 #[derive(Debug, Clone)]
 pub struct ProjectFriction {
     pub project: String,
-    pub categories: Vec<(String, i64)>,
+    pub categories: Vec<FrictionCat>,
 }
 
 impl ProjectFriction {
     pub fn total(&self) -> i64 {
-        self.categories.iter().map(|(_, n)| n).sum()
+        self.categories.iter().map(|c| c.count).sum()
     }
+}
+
+/// One failure category within a project: its count, the split across the tools
+/// that produced it (so file friction is told apart from, say, a Playwright
+/// locator miss), and a few concrete example excerpts (the actual failing
+/// paths/files) — enough that the fix is obvious from the briefing alone.
+#[derive(Debug, Clone)]
+pub struct FrictionCat {
+    pub label: String,
+    pub count: i64,
+    pub by_tool: Vec<(String, i64)>,
+    pub examples: Vec<String>,
 }
 
 /// A configuration surface referenced in the config sections.
@@ -90,9 +102,9 @@ where the real cost is — far more than the size of the config.
 Investigate autonomously — this is your work, not the user's:
 - Do NOT ask the user which area to start with, and do NOT ask them to run commands or \
 gather data. Drive the investigation yourself, end to end.
-- The briefing below is the COMPLETE ccoptimizer analysis — every project's friction \
+- The briefing is the COMPLETE ccoptimizer analysis — every project's friction \
 breakdown, the full workflow and config detail, all of it. You do NOT need to re-run \
-`ccoptimizer`; its numbers are already here. Read the briefing, not the tool.
+`ccoptimizer`; its numbers are already provided. Read the briefing, not the tool.
 - Go straight to the evidence the tool cannot see: open the relevant CLAUDE.md, rules, \
 hooks, skills, and settings, and inspect the failing transcripts under ~/.claude/projects, \
 to pin down the concrete root cause of each top finding. Keep going until you can name the \
@@ -148,9 +160,24 @@ pub fn render_briefing(f: &Findings) -> String {
         );
         for pf in &f.friction_by_project {
             out.push_str(&format!("\n### {} — {} failures\n", pf.project, pf.total()));
-            for (label, count) in &pf.categories {
-                let suggestion = ErrorCategory::from_label(label).suggestion();
-                out.push_str(&format!("- {count} × {label} — {suggestion}\n"));
+            for cat in &pf.categories {
+                let suggestion = ErrorCategory::from_label(&cat.label).suggestion();
+                out.push_str(&format!(
+                    "- {} × {} — {}\n",
+                    cat.count, cat.label, suggestion
+                ));
+                if !cat.by_tool.is_empty() {
+                    let split = cat
+                        .by_tool
+                        .iter()
+                        .map(|(tool, n)| format!("{tool} {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("    by tool: {split}\n"));
+                }
+                for example in &cat.examples {
+                    out.push_str(&format!("    e.g. {example}\n"));
+                }
             }
         }
     }
@@ -227,10 +254,22 @@ fn render_surface(s: &SurfaceRef) -> String {
     }
 }
 
-/// The full prompt that seeds the `claude` session: the prescribed instructions
-/// followed by the rendered briefing.
+/// The full prompt with the briefing inline — used for `--print` (so the reader
+/// sees everything in one stream) and for tests.
 pub fn compose_prompt(f: &Findings) -> String {
     format!("{INSTRUCTIONS}\n\n{}", render_briefing(f))
+}
+
+/// The argv prompt for launching `claude`: the prescribed instructions plus a
+/// pointer to the briefing file. The briefing — which carries concrete paths and
+/// error excerpts that may be sensitive — is written to that file rather than
+/// passed on argv (where `ps` would expose it); only this generic, data-free
+/// prompt reaches the process table.
+pub fn launch_prompt(briefing_path: &str) -> String {
+    format!(
+        "{INSTRUCTIONS}\n\nThe briefing — the complete analysis — is in the file \
+         `{briefing_path}`. Read that file in full before doing anything else, then proceed."
+    )
 }
 
 #[cfg(test)]
@@ -247,8 +286,18 @@ mod tests {
             friction_by_project: vec![ProjectFriction {
                 project: "alpha".to_string(),
                 categories: vec![
-                    ("path-not-found".to_string(), 92),
-                    ("timeout".to_string(), 12),
+                    FrictionCat {
+                        label: "path-not-found".to_string(),
+                        count: 92,
+                        by_tool: vec![("Read".to_string(), 60), ("Bash".to_string(), 32)],
+                        examples: vec!["File does not exist: src/components/Foo.tsx".to_string()],
+                    },
+                    FrictionCat {
+                        label: "timeout".to_string(),
+                        count: 12,
+                        by_tool: vec![],
+                        examples: vec![],
+                    },
                 ],
             }],
             cd_pct: Some(53),
@@ -293,6 +342,33 @@ mod tests {
         assert!(brief.contains("### alpha — 104 failures"));
         assert!(brief.contains("92 × path-not-found"));
         assert!(brief.contains("12 × timeout"));
+    }
+
+    #[test]
+    fn launch_prompt_points_at_the_file_and_carries_no_briefing_data() {
+        let prompt = launch_prompt("/tmp/ccoptimizer-briefing-123.md");
+        // The instructions and the file pointer must be present...
+        assert!(prompt.contains("Claude Code optimization advisor"));
+        assert!(prompt.contains("/tmp/ccoptimizer-briefing-123.md"));
+        assert!(prompt.contains("Read that file in full"));
+        // ...but none of the analysis (which goes to the file) leaks onto argv.
+        assert!(!prompt.contains("# ccoptimizer analysis"));
+    }
+
+    #[test]
+    fn briefing_shows_concrete_error_examples_under_a_category() {
+        let brief = render_briefing(&findings());
+        // The actual failing path must appear, so the fix is obvious without
+        // re-mining the transcripts.
+        assert!(brief.contains("e.g. File does not exist: src/components/Foo.tsx"));
+    }
+
+    #[test]
+    fn briefing_splits_a_category_by_originating_tool() {
+        let brief = render_briefing(&findings());
+        // The per-tool attribution the agent otherwise re-derives from the raw
+        // transcripts must be present.
+        assert!(brief.contains("by tool: Read 60, Bash 32"));
     }
 
     #[test]

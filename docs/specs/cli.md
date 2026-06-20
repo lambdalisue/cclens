@@ -111,15 +111,28 @@ plan, gate only on applying it" shape is the design; if it changes, update
 
 Crucially the briefing is the **complete** analysis, not a headline — every
 project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
-unused / always-on-heavy surface lists with token costs. The session works from
-the briefing and does not re-run `ccoptimizer`; it spends its effort on the
-evidence the store cannot hold (the real CLAUDE.md, rules, hooks, and failing
-transcripts). Embedding the whole report rather than headline numbers is what
-stops the seeded session from re-deriving what `analyze` already computed.
+unused / always-on-heavy surface lists with token costs. Each friction category
+also carries its **split across the originating tools** (`path-not-found` →
+`Bash 33, Read 29, Edit 9, playwright 7`) and a few **concrete example excerpts**
+— the actual failing paths/files behind the count (`events.md`: `tool_error`
+keeps the tool name and a short error-text excerpt) — so the fix is obvious from
+the briefing and the session need not re-mine the transcripts to attribute or
+locate the failures. The tool split also separates true file friction from a
+browser-automation miss that merely reads as "not found". The session works from the briefing and does not re-run
+`ccoptimizer`; it spends its effort on the evidence the store cannot hold (the
+real CLAUDE.md, rules, hooks). Embedding the whole report rather than headline
+numbers is what stops the seeded session from re-deriving what `analyze` already
+computed.
+
+**The briefing is never passed on argv.** It holds concrete paths and error
+excerpts that may be sensitive, and a process argument is world-visible (`ps`).
+So the launch writes the briefing to a private (`0600`) temp file and passes
+`claude` only a data-free pointer prompt (the prescribed instructions plus "read
+this file"); the file is removed the instant the session ends, whatever the
+outcome. `--print` is the exception — it writes the full prompt (briefing inline)
+to stdout for piping / inspection, where the user has opted into seeing it.
 
 The split mirrors the rest of the tool: prompt composition is a pure transform
-(`core::optimize` — the prescribed instructions plus a Markdown briefing of the
-findings, each empty section omitted; long lists capped where a tail adds nothing
-for ranking), and only the process launch is I/O. `--print` writes the composed
-prompt to stdout instead of launching `claude`, for piping into another tool or
-inspecting what would be sent.
+(`core::optimize` — `render_briefing` for the Markdown report with empty sections
+omitted and long lists capped, `INSTRUCTIONS` for the role, `launch_prompt` for
+the argv pointer), and only the temp-file write and process launch are I/O.

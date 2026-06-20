@@ -244,26 +244,36 @@ impl Store {
         Ok(())
     }
 
-    /// Insert tool-failure events for a session: `(epoch_ms, category)`. The
-    /// category rides in `surface_id`. Call after `ingest_session`, whose
+    /// Insert tool-failure events for a session: `(epoch_ms, category, excerpt,
+    /// tool)`. For a `tool_error` row the otherwise-unused detail columns carry
+    /// the friction signal: `surface_id` = category, `source` = a short excerpt
+    /// of the error text, `model` = the originating tool. `surface_kind` stays
+    /// NULL so these never enter the surface-catalog join. Storing the excerpt
+    /// and tool lets a report show concrete instances and which tool produced
+    /// them without re-reading the transcript. Call after `ingest_session`, whose
     /// delete-by-`source_path` already cleared prior rows for this file.
     pub fn ingest_tool_errors(
         &mut self,
         session_id: &str,
         source_path: &str,
-        errors: &[(i64, &str)],
+        errors: &[(i64, &str, &str, &str)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (epoch_ms, category) in errors {
-            // surface_kind stays NULL so these do not enter the surface catalog
-            // join; the category rides in surface_id for error_counts only.
+        for (epoch_ms, category, excerpt, tool) in errors {
             tx.execute(
                 "INSERT INTO events
-                   (session_id, source_path, kind, surface_id,
+                   (session_id, source_path, kind, surface_id, source, model,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, 'tool_error', ?3, '', ?4, 0, 0, 0, 0, 0)",
-                (session_id, source_path, *category, epoch_ms / 1000),
+                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, '', ?6, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    *category,
+                    *excerpt,
+                    *tool,
+                    epoch_ms / 1000,
+                ),
             )?;
         }
         tx.commit()?;
@@ -345,6 +355,54 @@ impl Store {
         )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Up to `per_group` example error excerpts for each `(project, category)`,
+    /// as `(project, category, excerpt)`. Gives a report the concrete instances
+    /// behind a friction count — the actual failing paths/files — so the reader
+    /// (or a seeded agent) need not re-mine the transcripts. Earliest examples
+    /// first within a group; empty excerpts are skipped.
+    pub fn error_examples(&self, per_group: u32) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project, category, excerpt FROM (
+                 SELECT s.project AS project, e.surface_id AS category, e.source AS excerpt,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY s.project, e.surface_id ORDER BY e.id
+                        ) AS rn
+                 FROM events e JOIN sessions s ON e.session_id = s.id
+                 WHERE e.kind = 'tool_error' AND e.source IS NOT NULL AND e.source <> ''
+             )
+             WHERE rn <= ?1
+             ORDER BY project, category, rn",
+        )?;
+        let rows = stmt
+            .query_map([per_group], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Tool-failure counts split by project, category, and originating tool, as
+    /// `(project, category, tool, count)`, densest first. Answers "which tool
+    /// produced these failures" — e.g. path-not-found split across Read / Bash /
+    /// Edit / a Playwright locator — so a report separates file friction from a
+    /// browser miss that merely reads as "not found", and the seeded agent need
+    /// not re-derive the attribution from the transcripts.
+    pub fn error_tool_breakdown(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, e.surface_id, COALESCE(e.model, 'unknown'), COUNT(*)
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.kind = 'tool_error'
+             GROUP BY s.project, e.surface_id, e.model
+             ORDER BY COUNT(*) DESC, s.project, e.surface_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -766,11 +824,18 @@ mod tests {
             .ingest_tool_errors(
                 "a1",
                 &alpha.source_path,
-                &[(100, "edit-precondition"), (200, "edit-precondition")],
+                &[
+                    (100, "edit-precondition", "x", "Edit"),
+                    (200, "edit-precondition", "y", "Edit"),
+                ],
             )
             .unwrap();
         store
-            .ingest_tool_errors("b1", &beta.source_path, &[(300, "edit-precondition")])
+            .ingest_tool_errors(
+                "b1",
+                &beta.source_path,
+                &[(300, "edit-precondition", "z", "Write")],
+            )
             .unwrap();
 
         let rows = store.error_counts_by_project().unwrap();
@@ -781,6 +846,82 @@ mod tests {
             vec![
                 ("alpha".to_string(), "edit-precondition".to_string(), 2),
                 ("beta".to_string(), "edit-precondition".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_examples_are_capped_per_project_and_category() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                &alpha.source_path,
+                &[
+                    (100, "path-not-found", "missing /a", "Read"),
+                    (200, "path-not-found", "missing /b", "Read"),
+                    (300, "path-not-found", "missing /c", "Bash"),
+                ],
+            )
+            .unwrap();
+
+        // Two examples per group, earliest first — the third is dropped.
+        let examples = store.error_examples(2).unwrap();
+        assert_eq!(
+            examples,
+            vec![
+                (
+                    "alpha".to_string(),
+                    "path-not-found".to_string(),
+                    "missing /a".to_string()
+                ),
+                (
+                    "alpha".to_string(),
+                    "path-not-found".to_string(),
+                    "missing /b".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_tool_breakdown_splits_a_category_across_tools() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                &alpha.source_path,
+                &[
+                    (100, "path-not-found", "missing /a", "Read"),
+                    (200, "path-not-found", "missing /b", "Read"),
+                    (300, "path-not-found", "missing /c", "Bash"),
+                ],
+            )
+            .unwrap();
+
+        // path-not-found splits Read 2 / Bash 1, densest tool first.
+        let rows = store.error_tool_breakdown().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "alpha".to_string(),
+                    "path-not-found".to_string(),
+                    "Read".to_string(),
+                    2
+                ),
+                (
+                    "alpha".to_string(),
+                    "path-not-found".to_string(),
+                    "Bash".to_string(),
+                    1
+                ),
             ]
         );
     }

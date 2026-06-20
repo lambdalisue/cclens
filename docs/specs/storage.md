@@ -38,10 +38,10 @@ CREATE TABLE events (
     session_id           TEXT NOT NULL REFERENCES sessions(id),
     source_path          TEXT NOT NULL,   -- file this event came from (ingest delete key)
     source_line          INTEGER,         -- 0-based line index in source_path; recovers the raw record (prompt text for goal-3 clustering) without storing it
-    kind                 TEXT NOT NULL,   -- skill_invocation | tool_use | agent_spawn | prompt | compaction | permission_prompt | …
+    kind                 TEXT NOT NULL,   -- skill_invocation | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
-    surface_id           TEXT,
-    source               TEXT,            -- slash | tool (skill invocation path); NULL otherwise
+    surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL)
+    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); NULL otherwise
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
     duration_sec         REAL NOT NULL,
@@ -53,7 +53,7 @@ CREATE TABLE events (
     sub_tokens           INTEGER NOT NULL,
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
-    model                TEXT,
+    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error)
     attrs_json           TEXT
 );
 

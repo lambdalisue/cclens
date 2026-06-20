@@ -199,46 +199,115 @@ pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64, PromptBehavior)>
         .collect()
 }
 
-/// Extract failed tool results from a transcript as `(epoch_ms, category)` — the
-/// raw material for friction analysis. A tool result is a failure when it is
-/// flagged `is_error` or carries a `tool_use_error` wrapper; its text is
-/// classified into a recurring category (`core::friction`).
-pub fn extract_tool_errors(jsonl: &str) -> Vec<(i64, ErrorCategory)> {
+/// One failed tool result: when it happened, its friction category, a readable
+/// excerpt of the error text, and the tool that produced it.
+pub struct ToolError {
+    pub epoch_ms: i64,
+    pub category: ErrorCategory,
+    pub excerpt: String,
+    pub tool: String,
+}
+
+/// Extract failed tool results from a transcript — the raw material for friction
+/// analysis. A tool result is a failure when it is flagged `is_error` or carries
+/// a `tool_use_error` wrapper; its text is classified into a recurring category
+/// (`core::friction`). Two details ride along so a report is actionable without
+/// re-reading the transcript: a cleaned, truncated **excerpt** (the actual
+/// failing path/file), and the originating **tool** — recovered by threading the
+/// `tool_use` → `tool_result` link (the result's `tool_use_id` matches the
+/// assistant `tool_use` block's `id`), so file-edit failures are told apart from,
+/// say, a Playwright locator miss that merely reads as "not found".
+pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
+    // tool_use id -> tool name, filled as assistant records stream past (a
+    // tool_use always precedes its result, so one forward pass suffices).
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut errors = Vec::new();
     for line in jsonl.lines() {
         let Ok(raw) = serde_json::from_str::<Raw>(line) else {
             continue;
         };
-        if raw.kind.as_deref() != Some("user") {
-            continue;
-        }
-        let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
-            continue;
-        };
-        let Some(blocks) = raw
-            .message
-            .as_ref()
-            .and_then(|message| message.content.as_ref())
-            .and_then(|content| content.as_array())
-        else {
-            continue;
-        };
-        for block in blocks {
-            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
-                continue;
+        match raw.kind.as_deref() {
+            Some("assistant") => {
+                let Some(blocks) = raw
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.content.as_ref())
+                    .and_then(|content| content.as_array())
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(|v| v.as_str()),
+                        block.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        tool_names.insert(id.to_string(), name.to_string());
+                    }
+                }
             }
-            let content = block
-                .get("content")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            let is_error = block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
-                || content.contains("tool_use_error");
-            if is_error {
-                errors.push((ts, classify_error(&content)));
+            Some("user") => {
+                let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+                    continue;
+                };
+                let Some(blocks) = raw
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.content.as_ref())
+                    .and_then(|content| content.as_array())
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    let content_value = block.get("content");
+                    // Classify on the JSON form (substring heuristics); excerpt
+                    // from the human-readable text.
+                    let content = content_value.map(|v| v.to_string()).unwrap_or_default();
+                    let is_error = block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+                        || content.contains("tool_use_error");
+                    if is_error {
+                        let tool = block
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|id| tool_names.get(id))
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        errors.push(ToolError {
+                            epoch_ms: ts,
+                            category: classify_error(&content),
+                            excerpt: content_value.map(error_excerpt).unwrap_or_default(),
+                            tool,
+                        });
+                    }
+                }
             }
+            _ => {}
         }
     }
     errors
+}
+
+/// Distil a tool-result `content` value into a short, readable excerpt: the text
+/// payload (a bare string, or the joined `text` blocks), whitespace-collapsed and
+/// truncated by Unicode scalar so multi-byte text is never split mid-character.
+fn error_excerpt(content: &Value) -> String {
+    let raw = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    };
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(200).collect()
 }
 
 /// Extract work events `(epoch_ms, kind, id)` from a transcript: the leading
@@ -509,5 +578,53 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","content":"x"}]}}"#,
         );
         assert!(parse_session(jsonl).is_empty());
+    }
+
+    #[test]
+    fn tool_errors_keep_a_readable_excerpt_with_the_failing_path() {
+        // A string-content failure: the excerpt must carry the actual path so a
+        // report can show which path was missed, not just the category.
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"File does not exist: /tmp/example/foo.rs"}]}}"#;
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::PathNotFound);
+        assert!(errors[0].excerpt.contains("/tmp/example/foo.rs"));
+    }
+
+    #[test]
+    fn tool_errors_are_attributed_to_the_tool_that_produced_them() {
+        // The assistant's tool_use names the tool; the failing tool_result links
+        // back to it via tool_use_id.
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"File has not been read yet."}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::EditPrecondition);
+        assert_eq!(errors[0].tool, "Edit");
+    }
+
+    #[test]
+    fn an_error_with_no_matching_tool_use_is_attributed_to_unknown() {
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_x","is_error":true,"content":"boom"}]}}"#;
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].tool, "unknown");
+    }
+
+    #[test]
+    fn tool_error_excerpt_joins_text_blocks_and_collapses_whitespace() {
+        // Array content (text blocks) with noisy whitespace — the excerpt is the
+        // joined, single-spaced text.
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","is_error":true,"content":[{"type":"text","text":"String to replace not found\n   in   /tmp/example/bar.rs"}]}]}}"#;
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::EditPrecondition);
+        assert_eq!(
+            errors[0].excerpt,
+            "String to replace not found in /tmp/example/bar.rs"
+        );
     }
 }

@@ -21,6 +21,7 @@ identifying the configuration surface it exercises (the join key into
 | `agent_spawn` | `agent` | the subagent's lifetime (cost attributed via `promptId`) |
 | `tool_use` | `mcp_tool` / `mcp_server` / built-in tool | point event |
 | `prompt` | — (user input; raw material for skill extraction) | point event; text referenced, not stored |
+| `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model` |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — heuristic source |
 
@@ -40,6 +41,13 @@ Two kinds carry caveats that downstream reports must honour:
   (`session-format.md`). It is therefore lower-confidence than the structurally
   detected kinds, and the friction wedge built on it (`surfaces.md`) is labelled
   as such.
+- **`tool_error`** keeps a short, bounded **excerpt** of the error text — unlike
+  `prompt`, which stores only a pointer. The asymmetry is deliberate: prompt text
+  is large and wholesale-sensitive and is needed in full only by a later layer,
+  so a pointer defers the cost; an error excerpt is small and its *value is the
+  concrete instance* (the actual failing path), which a report shows directly.
+  It lives only in the local store (gitignored, never committed), so the privacy
+  rule — no real data in the repo — still holds.
 
 Surfaces that emit no event at all — `rule`, `hook`, `claude_md` — never produce
 rows here. That is expected, not missing data; `surfaces.md` classifies them as

@@ -191,30 +191,60 @@ pub fn run() -> Result<()> {
 /// Analyze, compose the advisor prompt from the findings, and hand it to an
 /// interactive `claude` session — the AI-proposal layer's entry point. The pure
 /// composition lives in `core::optimize`; this shell does the I/O: run the
-/// analysis, read the store into `Findings`, then launch `claude` seeded with
-/// the prompt (or print it with `--print` for piping / inspection).
+/// analysis, read the store into `Findings`, then launch `claude`.
+///
+/// The briefing carries concrete paths and error excerpts that may be sensitive,
+/// so it is written to a private (`0600`) temp file and only a pointer is passed
+/// on argv — never the data, which `ps` would otherwise expose. The file is
+/// removed as soon as the session ends. `--print` instead writes the full prompt
+/// (briefing inline) to stdout for piping / inspection.
 fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: bool) -> Result<()> {
     if !skip_analyze {
         analyze(projects, db)?;
     }
     let store = Store::open(db).context("open store")?;
-    let prompt = optimize_mod::compose_prompt(&collect_findings(&store)?);
+    let findings = collect_findings(&store)?;
 
     if print {
-        println!("{prompt}");
+        println!("{}", optimize_mod::compose_prompt(&findings));
         return Ok(());
     }
 
-    // Hand over the terminal: `claude <prompt>` starts an interactive session
-    // seeded with the briefing, inheriting our stdio so the user takes over.
-    let status = std::process::Command::new("claude")
-        .arg(&prompt)
-        .status()
-        .context("launch `claude` — is Claude Code installed and on PATH?")?;
+    // Sensitive briefing → private temp file; only a data-free pointer on argv.
+    let briefing = optimize_mod::render_briefing(&findings);
+    let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
+    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy());
+
+    // Hand over the terminal: `claude <prompt>` starts an interactive session,
+    // inheriting our stdio so the user takes over. Clean up the briefing file
+    // the moment the session ends, whatever the outcome.
+    let result = std::process::Command::new("claude").arg(&prompt).status();
+    let _ = fs::remove_file(&briefing_path);
+
+    let status = result.context("launch `claude` — is Claude Code installed and on PATH?")?;
     if !status.success() {
         anyhow::bail!("claude exited with {status}");
     }
     Ok(())
+}
+
+/// Write `contents` to a uniquely-named file in the temp dir, readable only by
+/// the current user (`0600`). Used for the optimization briefing, which may hold
+/// sensitive paths/excerpts and must not sit on argv or be world-readable.
+fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("ccoptimizer-briefing-{}.md", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(path)
 }
 
 /// Gather the COMPLETE analysis the optimization briefing carries — every view's
@@ -223,6 +253,29 @@ fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: boo
 /// adds nothing for ranking.
 fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
     let floor = store.baseline_floor()?;
+
+    // A few concrete examples per (project, category) — the actual failing
+    // paths/files behind each count, so the fix is obvious from the briefing.
+    const EXAMPLES_PER_CATEGORY: u32 = 3;
+    let mut examples: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for (project, category, excerpt) in store.error_examples(EXAMPLES_PER_CATEGORY)? {
+        examples
+            .entry((project, category))
+            .or_default()
+            .push(excerpt);
+    }
+
+    // The split of each (project, category) across the tools that produced it —
+    // so the briefing carries the attribution the agent otherwise re-derives.
+    let mut by_tool: std::collections::HashMap<(String, String), Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (project, category, tool, n) in store.error_tool_breakdown()? {
+        by_tool
+            .entry((project, category))
+            .or_default()
+            .push((tool, n));
+    }
 
     // Actionable friction grouped by project, busiest project first — the
     // session fixes each in that project's own config.
@@ -237,6 +290,21 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         .into_iter()
         .map(|(project, mut categories)| {
             categories.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let categories = categories
+                .into_iter()
+                .map(|(label, count)| optimize_mod::FrictionCat {
+                    by_tool: by_tool
+                        .get(&(project.clone(), label.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                    examples: examples
+                        .get(&(project.clone(), label.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                    label,
+                    count,
+                })
+                .collect();
             optimize_mod::ProjectFriction {
                 project,
                 categories,
@@ -723,11 +791,20 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
             .map(|(line, ts, behavior)| (line, ts, behavior.label()))
             .collect();
         store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
-        let errors: Vec<(i64, &str)> = extract_tool_errors(&text)
-            .into_iter()
-            .map(|(ts, category)| (ts, category.label()))
+        // `raw_errors` owns the strings; `error_rows` borrows them.
+        let raw_errors = extract_tool_errors(&text);
+        let error_rows: Vec<(i64, &str, &str, &str)> = raw_errors
+            .iter()
+            .map(|e| {
+                (
+                    e.epoch_ms,
+                    e.category.label(),
+                    e.excerpt.as_str(),
+                    e.tool.as_str(),
+                )
+            })
             .collect();
-        store.ingest_tool_errors(&meta.id, &meta.source_path, &errors)?;
+        store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         let work = extract_work_events(&text);
         store.ingest_work_events(&meta.id, &meta.source_path, &work)?;
         sessions += 1;

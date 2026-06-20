@@ -97,15 +97,29 @@ ccoptimizer optimize [--projects <dir>] [--db <path>] [--skip-analyze] [--print]
 
 The AI-proposal consumer (`architecture.md`): rather than emit static
 "recommendations" the tool cannot safely act on, `optimize` analyzes (unless
-`--skip-analyze`), composes the headline findings with a prescribed advisor
-prompt, and launches `claude` seeded with it — so the user optimizes
-*interactively*, with an agent that can read their config and apply edits on
-agreement. The prompt instructs the session to prioritise work friction over
-config size, verify before recommending removal (an "unused" skill may be
-invoked by subagents), and change nothing without the user's say-so.
+`--skip-analyze`), composes the findings with a prescribed advisor prompt, and
+launches `claude` seeded with it — so the user optimizes *interactively*, with an
+agent that can read their config and apply edits on agreement. The prompt makes
+the session **investigate autonomously to a conclusion**: it pins down each root
+cause and proposes a concrete fix, rather than handing the analysis back with a
+"which area do you want to start with?". It prioritises work friction over config
+size, verifies before recommending removal (an "unused" skill may be invoked by
+subagents) by inspecting rather than asking, and pauses for exactly one thing —
+approval of the concrete fix-plan before any file is edited. This "drive to a
+plan, gate only on applying it" shape is the design; if it changes, update
+`INSTRUCTIONS` in `core::optimize` and this paragraph together.
+
+Crucially the briefing is the **complete** analysis, not a headline — every
+project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
+unused / always-on-heavy surface lists with token costs. The session works from
+the briefing and does not re-run `ccoptimizer`; it spends its effort on the
+evidence the store cannot hold (the real CLAUDE.md, rules, hooks, and failing
+transcripts). Embedding the whole report rather than headline numbers is what
+stops the seeded session from re-deriving what `analyze` already computed.
 
 The split mirrors the rest of the tool: prompt composition is a pure transform
 (`core::optimize` — the prescribed instructions plus a Markdown briefing of the
-findings, each empty section omitted), and only the process launch is I/O.
-`--print` writes the composed prompt to stdout instead of launching `claude`,
-for piping into another tool or inspecting what would be sent.
+findings, each empty section omitted; long lists capped where a tail adds nothing
+for ranking), and only the process launch is I/O. `--print` writes the composed
+prompt to stdout instead of launching `claude`, for piping into another tool or
+inspecting what would be sent.

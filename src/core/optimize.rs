@@ -6,8 +6,9 @@
 
 use crate::core::friction::ErrorCategory;
 
-/// The findings the briefing renders — the same headline signals the `summary`
-/// view shows, as owned data so the renderer stays pure and testable.
+/// The complete analysis the briefing renders — every view's detail as owned
+/// data, so the seeded session has the full picture in hand and need not re-run
+/// the tool. The renderer stays pure and testable over this struct.
 #[derive(Debug, Clone, Default)]
 pub struct Findings {
     pub main_out: i64,
@@ -16,27 +17,47 @@ pub struct Findings {
     /// Empirical always-on floor; 0 means unknown (section omitted).
     pub floor: i64,
     pub config_tokens: i64,
-    pub friction: Vec<FrictionLine>,
+    /// Actionable friction grouped by project, busiest project first.
+    pub friction_by_project: Vec<ProjectFriction>,
     /// `cd` as a percentage of Bash calls, if any Bash calls were seen.
     pub cd_pct: Option<i64>,
-    pub worst_thrash: Option<ThrashLine>,
-    pub unused_count: i64,
-    pub always_on_heavy: i64,
+    /// Top Bash leading words by frequency.
+    pub top_commands: Vec<(String, i64)>,
+    /// Most-edited files (hotspots) by edit count.
+    pub hotspots: Vec<(String, i64)>,
+    /// Thrash bursts, densest first.
+    pub thrash: Vec<ThrashLine>,
+    /// Surfaces installed but never used in the window.
+    pub unused: Vec<SurfaceRef>,
+    /// Always-on surfaces heavy enough to be worth slimming.
+    pub always_on_heavy: Vec<SurfaceRef>,
     /// Prompt-mix shares, if any prompts were classified.
     pub steer_pct: Option<i64>,
     pub correct_pct: Option<i64>,
 }
 
-/// One recurring-failure category, with the project it concentrates in when one
-/// owns the clear majority (so the fix lands in the right config).
+/// One project's actionable friction — its failure categories, busiest first.
 #[derive(Debug, Clone)]
-pub struct FrictionLine {
-    pub label: String,
-    pub count: i64,
-    pub dominant_project: Option<String>,
+pub struct ProjectFriction {
+    pub project: String,
+    pub categories: Vec<(String, i64)>,
 }
 
-/// The worst thrash burst — a file re-edited many times in a short window.
+impl ProjectFriction {
+    pub fn total(&self) -> i64 {
+        self.categories.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// A configuration surface referenced in the config sections.
+#[derive(Debug, Clone)]
+pub struct SurfaceRef {
+    pub kind: String,
+    pub id: String,
+    pub static_tokens: Option<i64>,
+}
+
+/// A thrash burst — a file re-edited many times in a short window.
 #[derive(Debug, Clone)]
 pub struct ThrashLine {
     pub file: String,
@@ -46,13 +67,15 @@ pub struct ThrashLine {
 
 /// The prescribed instructions prepended to every briefing. This is the role
 /// and method the seeded `claude` session adopts: an optimization advisor that
-/// prioritises work friction over config size, verifies before recommending
-/// removal, and changes nothing without the user's agreement.
+/// investigates the findings to a conclusion *on its own* — drilling in with the
+/// tool and reading the actual config — rather than handing the analysis back to
+/// the user, and pauses only to get the concrete fix-plan approved before editing.
 pub const INSTRUCTIONS: &str = "\
 You are acting as a Claude Code optimization advisor. The user ran `ccoptimizer`, \
 a tool that analyzed their Claude Code session transcripts and configuration to find \
-where time, tokens, and effort are wasted. Its headline findings are below. Work with \
-the user interactively to act on them.
+where time, tokens, and effort are wasted. Its headline findings are below. Your job is \
+to investigate them to a conclusion and propose concrete fixes — not to hand the analysis \
+back to the user.
 
 Reading the data — caveats:
 - Counts are usage signals for ranking, not a billing ledger. Token figures are \
@@ -64,31 +87,38 @@ where the real cost is — far more than the size of the config.
 (the system prompt, built-in tools, MCP schemas) cannot be trimmed from files; only the \
 \"your config\" portion is yours to slim.
 
-You can run the tool yourself for detail (it is on PATH as `ccoptimizer`):
-- `ccoptimizer wedges` — the ranked list of unused / always-on-heavy / costly-but-rare \
-surfaces, each with a suggested action.
-- `ccoptimizer friction --project=<slug>` — one project's failures, so you fix the right config.
-- `ccoptimizer thrash`, `ccoptimizer hotspots`, `ccoptimizer commands`, `ccoptimizer prompts` \
-— drill into workflow, churn, and prompting.
+Investigate autonomously — this is your work, not the user's:
+- Do NOT ask the user which area to start with, and do NOT ask them to run commands or \
+gather data. Drive the investigation yourself, end to end.
+- The briefing below is the COMPLETE ccoptimizer analysis — every project's friction \
+breakdown, the full workflow and config detail, all of it. You do NOT need to re-run \
+`ccoptimizer`; its numbers are already here. Read the briefing, not the tool.
+- Go straight to the evidence the tool cannot see: open the relevant CLAUDE.md, rules, \
+hooks, skills, and settings, and inspect the failing transcripts under ~/.claude/projects, \
+to pin down the concrete root cause of each top finding. Keep going until you can name the \
+cause and the fix — never stop at \"this category is high.\"
 
-How to help:
-1. Lead with the 2-3 highest-impact opportunities, in plain language, and ask the user \
-which to tackle first.
-2. Prioritize fixing work friction over shrinking config — stopping a recurring failure \
+Reach concrete conclusions:
+1. Prioritize fixing work friction over shrinking config — stopping a recurring failure \
 (e.g. adding a file map to a project's CLAUDE.md to end path-not-found errors) saves more \
 than deleting an unused skill.
-3. When friction concentrates in one project, make the fix in that project's config, not globally.
-4. Before recommending you delete or disable anything, verify it: an \"unused\" skill may still \
-be invoked by subagents, or be a deliberate safety net. Inspect the config or ask first.
-5. Propose concrete, minimal edits — which file, what change, and why — and apply them only \
-after the user agrees.
-6. Be honest about what the data cannot tell you; do not invent a cause for a number.
+2. When friction concentrates in one project, fix it in that project's config, not globally.
+3. Before proposing to delete or disable anything, verify it by inspecting — an \"unused\" \
+skill may still be invoked by subagents, or be a deliberate safety net. Confirm it yourself; \
+do not punt the check to the user.
+4. For each top opportunity, conclude with a specific fix: which file, what change, and the \
+effect you expect.
+5. Be honest about what the data cannot tell you. If a step is genuinely blocked on a \
+judgement only the user can make (a preference, a secret, an external fact), name that one \
+decision specifically and keep going on everything else — do not hand the whole analysis back.
 
-Do not change anything yet. Begin by summarizing what stands out and asking the user where \
-they want to start.";
+Deliver a concrete, prioritized action plan with the specific edits you propose, having done \
+the investigation yourself. Apply file changes only after the user approves the plan — that \
+approval is the one and only thing you pause for, never direction on what to investigate.";
 
-/// Render the findings as a Markdown briefing, omitting any section with no
-/// data so the prompt never carries empty headings.
+/// Render the findings as a complete Markdown briefing: every view's detail, so
+/// the session works from this rather than re-running the tool. Any section with
+/// no data is omitted so the prompt never carries an empty heading.
 pub fn render_briefing(f: &Findings) -> String {
     let mut out = String::from("# ccoptimizer analysis\n");
 
@@ -109,42 +139,78 @@ pub fn render_briefing(f: &Findings) -> String {
         ));
     }
 
-    if !f.friction.is_empty() {
-        out.push_str("\n## Top fixable friction\n");
-        for line in &f.friction {
-            let suggestion = ErrorCategory::from_label(&line.label).suggestion();
-            let where_ = match &line.dominant_project {
-                Some(proj) => format!(" (mostly in `{proj}`)"),
-                None => String::new(),
-            };
-            out.push_str(&format!(
-                "- {} × {} — {}{}\n",
-                line.count, line.label, suggestion, where_
-            ));
+    if !f.friction_by_project.is_empty() {
+        out.push_str(
+            "\n## Fixable friction by project\n\
+             Recurring tool failures the user can act on, grouped by project — fix each \
+             in that project's own config. Counts exclude non-actionable noise (user stops, \
+             infra blips).\n",
+        );
+        for pf in &f.friction_by_project {
+            out.push_str(&format!("\n### {} — {} failures\n", pf.project, pf.total()));
+            for (label, count) in &pf.categories {
+                let suggestion = ErrorCategory::from_label(label).suggestion();
+                out.push_str(&format!("- {count} × {label} — {suggestion}\n"));
+            }
         }
     }
 
-    if f.cd_pct.is_some() || f.worst_thrash.is_some() {
+    let has_workflow = f.cd_pct.is_some()
+        || !f.top_commands.is_empty()
+        || !f.hotspots.is_empty()
+        || !f.thrash.is_empty();
+    if has_workflow {
         out.push_str("\n## Workflow\n");
         if let Some(pct) = f.cd_pct {
             out.push_str(&format!("- cd is {pct}% of Bash calls\n"));
         }
-        if let Some(t) = &f.worst_thrash {
-            out.push_str(&format!(
-                "- Worst thrash: {} edited {}x within {}m{}s\n",
-                t.file,
-                t.edits,
-                t.span_secs / 60,
-                t.span_secs % 60
-            ));
+        if !f.top_commands.is_empty() {
+            out.push_str("\n### Bash command mix (top)\n");
+            for (cmd, n) in &f.top_commands {
+                out.push_str(&format!("- {cmd}: {n}\n"));
+            }
+        }
+        if !f.hotspots.is_empty() {
+            out.push_str("\n### Most-edited files\n");
+            for (file, n) in &f.hotspots {
+                out.push_str(&format!("- {file}: {n}\n"));
+            }
+        }
+        if !f.thrash.is_empty() {
+            out.push_str("\n### Thrash episodes (rapid re-edits to one file)\n");
+            for t in &f.thrash {
+                out.push_str(&format!(
+                    "- {} edited {}x within {}m{}s\n",
+                    t.file,
+                    t.edits,
+                    t.span_secs / 60,
+                    t.span_secs % 60
+                ));
+            }
         }
     }
 
-    out.push_str("\n## Config\n");
-    out.push_str(&format!(
-        "- {} unused surface(s), {} always-on heavy (run `ccoptimizer wedges` for the list)\n",
-        f.unused_count, f.always_on_heavy
-    ));
+    if !f.unused.is_empty() || !f.always_on_heavy.is_empty() {
+        out.push_str("\n## Config to trim\n");
+        if !f.unused.is_empty() {
+            out.push_str(&format!(
+                "\n### Unused surfaces ({}) — installed but never used in the window\n",
+                f.unused.len()
+            ));
+            for s in &f.unused {
+                out.push_str(&format!("- {}\n", render_surface(s)));
+            }
+        }
+        if !f.always_on_heavy.is_empty() {
+            out.push_str(&format!(
+                "\n### Always-on heavy ({}) — loaded every session; slim or make on-demand\n",
+                f.always_on_heavy.len()
+            ));
+            for s in &f.always_on_heavy {
+                out.push_str(&format!("- {}\n", render_surface(s)));
+            }
+        }
+    }
 
     if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct) {
         out.push_str("\n## Prompting\n");
@@ -152,6 +218,13 @@ pub fn render_briefing(f: &Findings) -> String {
     }
 
     out
+}
+
+fn render_surface(s: &SurfaceRef) -> String {
+    match s.static_tokens {
+        Some(t) => format!("{}/{} ({} tok)", s.kind, s.id, t),
+        None => format!("{}/{} (unknown tok)", s.kind, s.id),
+    }
 }
 
 /// The full prompt that seeds the `claude` session: the prescribed instructions
@@ -171,19 +244,31 @@ mod tests {
             sub_agents: 300,
             floor: 35_000,
             config_tokens: 2_000,
-            friction: vec![FrictionLine {
-                label: "path-not-found".to_string(),
-                count: 92,
-                dominant_project: Some("alpha".to_string()),
+            friction_by_project: vec![ProjectFriction {
+                project: "alpha".to_string(),
+                categories: vec![
+                    ("path-not-found".to_string(), 92),
+                    ("timeout".to_string(), 12),
+                ],
             }],
             cd_pct: Some(53),
-            worst_thrash: Some(ThrashLine {
+            top_commands: vec![("cd".to_string(), 200), ("cargo".to_string(), 80)],
+            hotspots: vec![("lib.rs".to_string(), 40)],
+            thrash: vec![ThrashLine {
                 file: "SKILL.md".to_string(),
                 edits: 25,
                 span_secs: 460,
-            }),
-            unused_count: 20,
-            always_on_heavy: 1,
+            }],
+            unused: vec![SurfaceRef {
+                kind: "skill".to_string(),
+                id: "code-review".to_string(),
+                static_tokens: Some(1345),
+            }],
+            always_on_heavy: vec![SurfaceRef {
+                kind: "rule".to_string(),
+                id: "git/safety".to_string(),
+                static_tokens: Some(922),
+            }],
             steer_pct: Some(13),
             correct_pct: Some(6),
         }
@@ -192,26 +277,37 @@ mod tests {
     #[test]
     fn compose_prepends_instructions_to_the_briefing() {
         let prompt = compose_prompt(&findings());
-        // The advisor role and its safest rule must both reach the session.
+        // The advisor role, the autonomy mandate (investigate without handing
+        // the analysis back), and the briefing must all reach the session.
         assert!(prompt.contains("Claude Code optimization advisor"));
-        assert!(prompt.contains("Do not change anything yet"));
+        assert!(prompt.contains("Do NOT ask the user which area"));
+        assert!(prompt.contains("Apply file changes only after the user approves"));
         assert!(prompt.contains("# ccoptimizer analysis"));
     }
 
     #[test]
-    fn friction_line_names_the_dominant_project_when_present() {
+    fn briefing_carries_the_full_per_project_friction_breakdown() {
         let brief = render_briefing(&findings());
+        // Per-project heading with total, and each category with its suggestion —
+        // enough that the session need not re-run the friction view.
+        assert!(brief.contains("### alpha — 104 failures"));
         assert!(brief.contains("92 × path-not-found"));
-        assert!(brief.contains("(mostly in `alpha`)"));
+        assert!(brief.contains("12 × timeout"));
     }
 
     #[test]
-    fn friction_line_omits_project_when_not_concentrated() {
-        let mut f = findings();
-        f.friction[0].dominant_project = None;
-        let brief = render_briefing(&f);
-        assert!(brief.contains("92 × path-not-found"));
-        assert!(!brief.contains("mostly in"));
+    fn briefing_lists_concrete_config_surfaces_not_just_counts() {
+        let brief = render_briefing(&findings());
+        assert!(brief.contains("skill/code-review (1345 tok)"));
+        assert!(brief.contains("rule/git/safety (922 tok)"));
+    }
+
+    #[test]
+    fn briefing_includes_command_mix_and_thrash_detail() {
+        let brief = render_briefing(&findings());
+        assert!(brief.contains("cd is 53% of Bash calls"));
+        assert!(brief.contains("cargo: 80"));
+        assert!(brief.contains("SKILL.md edited 25x within 7m40s"));
     }
 
     #[test]
@@ -226,7 +322,9 @@ mod tests {
     fn no_workflow_signals_omits_the_workflow_section() {
         let mut f = findings();
         f.cd_pct = None;
-        f.worst_thrash = None;
+        f.top_commands.clear();
+        f.hotspots.clear();
+        f.thrash.clear();
         let brief = render_briefing(&f);
         assert!(!brief.contains("## Workflow"));
     }

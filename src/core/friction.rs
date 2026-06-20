@@ -76,6 +76,21 @@ impl ErrorCategory {
         }
     }
 
+    /// Whether recurring instances point to something the user can fix. The
+    /// non-actionable rest is noise: user stops (`Cancelled`), infra blips
+    /// (`Transient`), and the unclassified buckets (`CommandFailed`, `Other`)
+    /// whose cause the heuristics could not pin down. Reports filter on this so
+    /// "top friction" stays a list of leverage, not a tally of everything.
+    pub fn is_actionable(self) -> bool {
+        !matches!(
+            self,
+            ErrorCategory::Cancelled
+                | ErrorCategory::Transient
+                | ErrorCategory::CommandFailed
+                | ErrorCategory::Other
+        )
+    }
+
     /// What recurring instances of this category suggest fixing.
     pub fn suggestion(self) -> &'static str {
         match self {
@@ -275,5 +290,17 @@ mod tests {
             classify_error("something weird happened"),
             ErrorCategory::Other
         );
+    }
+
+    #[test]
+    fn noise_categories_are_not_actionable() {
+        // Fixable friction the user can act on.
+        assert!(ErrorCategory::EditPrecondition.is_actionable());
+        assert!(ErrorCategory::PathNotFound.is_actionable());
+        // Noise: stops, infra, and the unclassified buckets.
+        assert!(!ErrorCategory::Cancelled.is_actionable());
+        assert!(!ErrorCategory::Transient.is_actionable());
+        assert!(!ErrorCategory::CommandFailed.is_actionable());
+        assert!(!ErrorCategory::Other.is_actionable());
     }
 }

@@ -217,55 +217,63 @@ fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: boo
     Ok(())
 }
 
-/// Gather the headline findings the optimization briefing needs from the store —
-/// the same signals `summary` reports, as owned data for `core::optimize`.
+/// Gather the COMPLETE analysis the optimization briefing carries — every view's
+/// detail as owned data for `core::optimize`, so the seeded session works from
+/// the briefing and need not re-run the tool. Lists are capped where a long tail
+/// adds nothing for ranking.
 fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
     let floor = store.baseline_floor()?;
 
-    // Per-category project breakdown, so a friction line can name the project
-    // that owns it when one holds the clear majority.
-    let mut by_cat: std::collections::HashMap<String, Vec<(String, i64)>> =
+    // Actionable friction grouped by project, busiest project first — the
+    // session fixes each in that project's own config.
+    let mut by_project: std::collections::HashMap<String, Vec<(String, i64)>> =
         std::collections::HashMap::new();
     for (proj, label, n) in store.error_counts_by_project()? {
-        by_cat.entry(label).or_default().push((proj, n));
+        if ErrorCategory::from_label(&label).is_actionable() {
+            by_project.entry(proj).or_default().push((label, n));
+        }
     }
-    let dominant = |label: &str, total: i64| -> Option<String> {
-        let (proj, n) = by_cat.get(label)?.iter().max_by_key(|(_, n)| *n)?;
-        (*n * 2 > total).then(|| proj.clone())
-    };
-    let noise = ["cancelled", "transient", "other", "command-failed"];
-    let friction: Vec<optimize_mod::FrictionLine> = store
-        .error_counts()?
+    let mut friction_by_project: Vec<optimize_mod::ProjectFriction> = by_project
         .into_iter()
-        .filter(|(label, _)| !noise.contains(&label.as_str()))
-        .take(5)
-        .map(|(label, count)| {
-            let dominant_project = dominant(&label, count);
-            optimize_mod::FrictionLine {
-                label,
-                count,
-                dominant_project,
+        .map(|(project, mut categories)| {
+            categories.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            optimize_mod::ProjectFriction {
+                project,
+                categories,
             }
         })
         .collect();
+    friction_by_project.sort_by(|a, b| {
+        b.total()
+            .cmp(&a.total())
+            .then_with(|| a.project.cmp(&b.project))
+    });
 
+    // Workflow: Bash mix + cd share, most-edited files, thrash bursts.
     let bash = store.work_counts("bash_cmd")?;
     let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
     let cd_pct = (bash_total > 0).then(|| {
         let cd = bash.iter().find(|(c, _)| c == "cd").map_or(0, |(_, n)| *n);
         (cd as f64 * 100.0 / bash_total as f64).round() as i64
     });
-
+    let top_commands: Vec<(String, i64)> = bash.into_iter().take(15).collect();
+    let hotspots: Vec<(String, i64)> = store
+        .work_counts("file_edit")?
+        .into_iter()
+        .take(15)
+        .collect();
     let edits = store.work_event_rows("file_edit")?;
-    let worst_thrash = detect_thrash(&edits, 5 * 60, 4)
-        .first()
+    let thrash: Vec<optimize_mod::ThrashLine> = detect_thrash(&edits, 5 * 60, 4)
+        .into_iter()
+        .take(10)
         .map(|w| optimize_mod::ThrashLine {
-            file: w.file.clone(),
-            edits: w.edits,
             span_secs: w.span_secs(),
-        });
+            file: w.file,
+            edits: w.edits,
+        })
+        .collect();
 
-    let (unused_count, always_on_heavy) = config_wedge_counts(store)?;
+    let (unused, always_on_heavy) = config_wedges(store)?;
 
     let pcounts = store.prompt_behavior_counts()?;
     let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
@@ -293,26 +301,35 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         } else {
             0
         },
-        friction,
+        friction_by_project,
         cd_pct,
-        worst_thrash,
-        unused_count,
+        top_commands,
+        hotspots,
+        thrash,
+        unused,
         always_on_heavy,
         steer_pct,
         correct_pct,
     })
 }
 
-/// Count the surfaces `wedges` would flag: unused-but-measurable and always-on
-/// heavy. Shared shape with the `summary` config line.
-fn config_wedge_counts(store: &Store) -> Result<(i64, i64)> {
+/// The surfaces `wedges` would flag: unused-but-measurable and always-on heavy,
+/// as concrete lists. `summary` reads their lengths; `optimize` embeds the items.
+fn config_wedges(
+    store: &Store,
+) -> Result<(Vec<optimize_mod::SurfaceRef>, Vec<optimize_mod::SurfaceRef>)> {
     let counts: std::collections::HashMap<(String, String), i64> = store
         .usage_counts()?
         .into_iter()
         .map(|(k, i, c)| ((k, i), c))
         .collect();
-    let mut unused_measurable = 0;
-    let mut always_on_heavy = 0;
+    let surface_ref = |e: &crate::store::CatalogEntry| optimize_mod::SurfaceRef {
+        kind: e.kind.clone(),
+        id: e.id.clone(),
+        static_tokens: e.static_tokens,
+    };
+    let mut unused = Vec::new();
+    let mut always_on_heavy = Vec::new();
     for entry in store.catalog()? {
         let uses = counts
             .get(&(entry.kind.clone(), entry.id.clone()))
@@ -321,13 +338,13 @@ fn config_wedge_counts(store: &Store) -> Result<(i64, i64)> {
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|t| t as u64);
         if is_usage_measurable(&entry.kind) && uses == 0 {
-            unused_measurable += 1;
+            unused.push(surface_ref(&entry));
         }
         if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
-            always_on_heavy += 1;
+            always_on_heavy.push(surface_ref(&entry));
         }
     }
-    Ok((unused_measurable, always_on_heavy))
+    Ok((unused, always_on_heavy))
 }
 
 /// One-screen health check: pull the few most actionable findings from every
@@ -355,11 +372,10 @@ fn summary(db: &Path) -> Result<()> {
     }
 
     // Top fixable friction (exclude non-actionable noise).
-    let noise = ["cancelled", "transient", "other", "command-failed"];
     let friction: Vec<_> = store
         .error_counts()?
         .into_iter()
-        .filter(|(label, _)| !noise.contains(&label.as_str()))
+        .filter(|(label, _)| ErrorCategory::from_label(label).is_actionable())
         .collect();
     if !friction.is_empty() {
         // Per-category project breakdown, so each line can name the project that
@@ -406,7 +422,8 @@ fn summary(db: &Path) -> Result<()> {
     }
 
     // Config worth cutting: count what `wedges` would flag with real savings.
-    let (unused_measurable, always_on_heavy) = config_wedge_counts(&store)?;
+    let (unused, always_on_heavy_list) = config_wedges(&store)?;
+    let (unused_measurable, always_on_heavy) = (unused.len(), always_on_heavy_list.len());
     println!("\n== config ==");
     println!(
         "  {unused_measurable} unused surface(s), {always_on_heavy} always-on heavy — see `wedges`"

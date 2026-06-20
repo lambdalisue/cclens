@@ -293,6 +293,18 @@ impl Store {
         Ok(())
     }
 
+    /// Raw work events of a kind as `(id, started_epoch)`, time-ordered — for
+    /// burst/thrash detection where individual timestamps matter.
+    pub fn work_event_rows(&self, kind: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface_id, started_epoch FROM events WHERE kind = ?1 ORDER BY started_epoch",
+        )?;
+        let rows = stmt
+            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Counts of a work-event kind by id (e.g. Bash leading word, edited file),
     /// most frequent first.
     pub fn work_counts(&self, kind: &str) -> Result<Vec<(String, i64)>> {

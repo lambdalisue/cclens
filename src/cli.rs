@@ -23,6 +23,7 @@ use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     startup_savings,
 };
+use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
 use crate::store::{SessionMeta, Store};
 
@@ -120,6 +121,15 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Thrash episodes — bursts of rapid re-edits to one file, where Claude got
+    /// stuck (distinct from a healthy hotspot's spread-out edits).
+    Thrash {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -135,7 +145,45 @@ pub fn run() -> Result<()> {
         Command::Friction { format, db } => friction(parse_format(format.as_deref())?, &db),
         Command::Hotspots { format, db } => hotspots(parse_format(format.as_deref())?, &db),
         Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
+        Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
     }
+}
+
+/// Thrash bursts: a file edited many times in a short window — where Claude got
+/// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
+fn thrash(format: Format, db: &Path) -> Result<()> {
+    const GAP_SECS: i64 = 5 * 60;
+    const MIN_EDITS: u32 = 4;
+    let store = Store::open(db).context("open store")?;
+    let edits = store.work_event_rows("file_edit")?;
+    let episodes = detect_thrash(&edits, GAP_SECS, MIN_EDITS);
+    if episodes.is_empty() {
+        println!("no thrash episodes (>= {MIN_EDITS} rapid re-edits) — run analyze first");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = episodes
+        .iter()
+        .take(20)
+        .map(|e| {
+            let span = e.span_secs();
+            vec![
+                e.file.clone(),
+                e.edits.to_string(),
+                format!("{}m{}s", span / 60, span % 60),
+            ]
+        })
+        .collect();
+    render(
+        &["file", "edits", "within"],
+        &[Align::Left, Align::Right, Align::Right],
+        &rows,
+        format,
+    );
+    println!(
+        "\nbursts of >= {MIN_EDITS} edits to one file within {}m — likely where Claude got stuck.",
+        GAP_SECS / 60
+    );
+    Ok(())
 }
 
 /// Files Claude edits most. A high edit count is where effort concentrates — and

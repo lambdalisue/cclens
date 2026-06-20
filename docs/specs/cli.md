@@ -42,6 +42,7 @@ tool's core questions:
 | `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing. This analyses the *work*, not the config — where the real cost is. Recurring failures are fixable friction (e.g. many path-not-found → a file map in CLAUDE.md). The classifier separates fixable friction from non-actionable noise (cancelled, transient). Lexical heuristics. |
 | `hotspots` | Files Claude edits most (from `Edit`/`Write` targets) — where effort and churn concentrate; a very high count can flag a file it keeps struggling with. |
 | `commands` | The Bash command mix and the `cd` overhead. Observed: ~half of all Bash calls were `cd` — a working-dir convention would cut that churn. |
+| `thrash` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. Unlike a flat hotspot count, this isolates *where Claude got stuck and kept retrying* from healthy spread-out editing. Observed: a file edited 25× in under 8 minutes. |
 
 Filters (`--kind`, `--project`, `--since/--until`) narrow any view. Output is a
 terminal **table** by default or **Markdown** for pasting into notes/PRs.

@@ -89,6 +89,27 @@ hour — the row is marked **low-confidence overall**, not merely tagged three
 times. Stacked approximations compound into exactly the kind of time-concentrated
 spike a reader over-trusts; one combined flag says "read this number loosely".
 
+## `sql` — query the store directly
+
+```
+ccoptimizer sql [<query>] [--format table|markdown] [--db <path>]
+```
+
+The store's own query surface: run an arbitrary read query and print the result.
+The query is the argument, or — when omitted — read from **stdin**, so both
+`ccoptimizer sql "SELECT …"` and `echo "SELECT …" | ccoptimizer sql` work (stdin
+sidesteps shell quoting for complex queries). This exists because the tool is a
+*session-analysis* tool: anyone wanting a slice the fixed views do not cover —
+notably the `optimize` session chasing a root cause — should query the analyzed
+store, not re-parse the raw transcripts. The store is opened **read-only** so an
+ad-hoc query can never mutate the derived data, and an absent db is an error
+(run `analyze` first), not a silently-created empty one.
+
+A `tool_errors` view (`storage.md`) names the friction columns that are
+otherwise overloaded onto generic event columns (`category`, `excerpt`, `tool`,
+`project`), so a friction query reads cleanly without knowing the encoding;
+`SELECT sql FROM sqlite_master` lists the full schema.
+
 ## `optimize` — act on the findings with an interactive `claude` session
 
 ```
@@ -118,11 +139,14 @@ also carries its **split across the originating tools** (`path-not-found` →
 keeps the tool name and a short error-text excerpt) — so the fix is obvious from
 the briefing and the session need not re-mine the transcripts to attribute or
 locate the failures. The tool split also separates true file friction from a
-browser-automation miss that merely reads as "not found". The session works from the briefing and does not re-run
-`ccoptimizer`; it spends its effort on the evidence the store cannot hold (the
-real CLAUDE.md, rules, hooks). Embedding the whole report rather than headline
-numbers is what stops the seeded session from re-deriving what `analyze` already
-computed.
+browser-automation miss that merely reads as "not found". The briefing is the
+*headline*; for any deeper slice (the full failing-path list, a worktree split,
+arbitrary groupings) the prompt directs the session to **query the store with
+`ccoptimizer sql`** rather than re-parse the raw transcripts in Python — the
+store is exactly the analysis surface ccoptimizer exists to provide. It still
+spends its effort on the evidence the store cannot hold (the real CLAUDE.md,
+rules, hooks). Embedding the headline plus pointing at the queryable store is
+what stops the seeded session from re-deriving what `analyze` already computed.
 
 **The briefing is never passed on argv.** It holds concrete paths and error
 excerpts that may be sensitive, and a process argument is world-visible (`ps`).

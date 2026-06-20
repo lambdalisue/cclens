@@ -66,7 +66,25 @@ CREATE TABLE ingested_files (
     mtime INTEGER NOT NULL,
     size  INTEGER NOT NULL
 );
+
+-- A clean read view over tool_error events for ad-hoc SQL (the `sql` command).
+-- The friction signal is overloaded onto generic event columns; the view names
+-- it and joins the project so a query need not know the encoding.
+CREATE VIEW tool_errors AS
+SELECT e.session_id, s.project,
+       e.surface_id AS category, e.source AS excerpt, e.model AS tool,
+       e.started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+WHERE e.kind = 'tool_error';
 ```
+
+The store is also a **read surface for arbitrary queries** (`cli.md`: `sql`).
+Because it is plain SQLite holding already-extracted facts, the session-analysis
+slices a consumer might want — the `optimize` agent chasing a root cause, say —
+are a `SELECT` away, which is cheaper and less error-prone than re-parsing the
+raw transcripts. `sql` opens the db **read-only** (`Store::open_readonly`) so an
+ad-hoc query cannot mutate the derived store; views like `tool_errors` keep those
+queries clean despite the column overloading.
 
 `attrs_json` is the additive escape hatch: a new event kind or surface attribute
 lands there without a migration, and graduates to a column only if reports query

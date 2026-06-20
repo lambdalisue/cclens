@@ -102,13 +102,26 @@ where the real cost is — far more than the size of the config.
 Investigate autonomously — this is your work, not the user's:
 - Do NOT ask the user which area to start with, and do NOT ask them to run commands or \
 gather data. Drive the investigation yourself, end to end.
-- The briefing is the COMPLETE ccoptimizer analysis — every project's friction \
-breakdown, the full workflow and config detail, all of it. You do NOT need to re-run \
-`ccoptimizer`; its numbers are already provided. Read the briefing, not the tool.
-- Go straight to the evidence the tool cannot see: open the relevant CLAUDE.md, rules, \
-hooks, skills, and settings, and inspect the failing transcripts under ~/.claude/projects, \
-to pin down the concrete root cause of each top finding. Keep going until you can name the \
-cause and the fix — never stop at \"this category is high.\"
+- The briefing below is the headline analysis. For ANY deeper slice — the full list of \
+failing paths, a worktree-vs-main split, counts grouped however you like — query the \
+analyzed store with `ccoptimizer sql`. ccoptimizer has already extracted every session \
+into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
+~/.claude/projects transcripts in Python — that reinvents what ccoptimizer is. Examples:
+    ccoptimizer sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
+    echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | ccoptimizer sql
+  Re-running `ccoptimizer analyze` is unnecessary — the store is already current. Schema crib:
+    - tool_errors(session_id, project, category, excerpt, tool, started_epoch): one row per \
+failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
+the failing path/file — including any worktree segment like `/.wt/`, so a worktree-vs-main \
+split is a `WHERE excerpt LIKE …` away), `tool` = the tool that produced it. `project` = the \
+session's cwd slug.
+    - sessions(id, project, slug, source_path, started_at, …) and events(session_id, kind, \
+surface_id, source, model, started_epoch, …) hold everything else (run `ccoptimizer sql \
+\"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \
+data before relying on it.
+- The store cannot hold the config itself, so still open the actual CLAUDE.md, rules, hooks, \
+skills, and settings to pin down each root cause. Keep going until you can name the cause and \
+the fix — never stop at \"this category is high.\"
 
 Reach concrete conclusions:
 1. Prioritize fixing work friction over shrinking config — stopping a recurring failure \
@@ -254,21 +267,35 @@ fn render_surface(s: &SurfaceRef) -> String {
     }
 }
 
-/// The full prompt with the briefing inline — used for `--print` (so the reader
-/// sees everything in one stream) and for tests.
-pub fn compose_prompt(f: &Findings) -> String {
-    format!("{INSTRUCTIONS}\n\n{}", render_briefing(f))
+/// How to reach the analyzed store for `ccoptimizer sql` — appended so the
+/// `--db` the agent should query is the one this run actually built.
+fn store_pointer(db_path: &str) -> String {
+    format!(
+        "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `ccoptimizer sql` \
+         (or run from a directory where it is `ccoptimizer.db`)."
+    )
 }
 
-/// The argv prompt for launching `claude`: the prescribed instructions plus a
-/// pointer to the briefing file. The briefing — which carries concrete paths and
-/// error excerpts that may be sensitive — is written to that file rather than
-/// passed on argv (where `ps` would expose it); only this generic, data-free
-/// prompt reaches the process table.
-pub fn launch_prompt(briefing_path: &str) -> String {
+/// The full prompt with the briefing inline — used for `--print` (so the reader
+/// sees everything in one stream) and for tests.
+pub fn compose_prompt(f: &Findings, db_path: &str) -> String {
     format!(
-        "{INSTRUCTIONS}\n\nThe briefing — the complete analysis — is in the file \
-         `{briefing_path}`. Read that file in full before doing anything else, then proceed."
+        "{INSTRUCTIONS}\n\n{}\n\n{}",
+        store_pointer(db_path),
+        render_briefing(f)
+    )
+}
+
+/// The argv prompt for launching `claude`: the prescribed instructions, where to
+/// query the store, and a pointer to the briefing file. The briefing — which
+/// carries concrete paths and error excerpts that may be sensitive — is written
+/// to that file rather than passed on argv (where `ps` would expose it); only
+/// this generic, data-free prompt reaches the process table.
+pub fn launch_prompt(briefing_path: &str, db_path: &str) -> String {
+    format!(
+        "{INSTRUCTIONS}\n\n{}\n\nThe briefing — the complete analysis — is in the file \
+         `{briefing_path}`. Read that file in full before doing anything else, then proceed.",
+        store_pointer(db_path)
     )
 }
 
@@ -325,12 +352,15 @@ mod tests {
 
     #[test]
     fn compose_prepends_instructions_to_the_briefing() {
-        let prompt = compose_prompt(&findings());
+        let prompt = compose_prompt(&findings(), "/tmp/cc.db");
         // The advisor role, the autonomy mandate (investigate without handing
-        // the analysis back), and the briefing must all reach the session.
+        // the analysis back), the store pointer, and the briefing must all reach
+        // the session.
         assert!(prompt.contains("Claude Code optimization advisor"));
         assert!(prompt.contains("Do NOT ask the user which area"));
         assert!(prompt.contains("Apply file changes only after the user approves"));
+        assert!(prompt.contains("ccoptimizer sql"));
+        assert!(prompt.contains("--db /tmp/cc.db"));
         assert!(prompt.contains("# ccoptimizer analysis"));
     }
 
@@ -346,9 +376,10 @@ mod tests {
 
     #[test]
     fn launch_prompt_points_at_the_file_and_carries_no_briefing_data() {
-        let prompt = launch_prompt("/tmp/ccoptimizer-briefing-123.md");
-        // The instructions and the file pointer must be present...
+        let prompt = launch_prompt("/tmp/ccoptimizer-briefing-123.md", "/tmp/cc.db");
+        // The instructions, the store pointer, and the file pointer must be present...
         assert!(prompt.contains("Claude Code optimization advisor"));
+        assert!(prompt.contains("--db /tmp/cc.db"));
         assert!(prompt.contains("/tmp/ccoptimizer-briefing-123.md"));
         assert!(prompt.contains("Read that file in full"));
         // ...but none of the analysis (which goes to the file) leaks onto argv.

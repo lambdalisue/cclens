@@ -54,6 +54,20 @@ CREATE TABLE IF NOT EXISTS surfaces (
     load_mode     TEXT NOT NULL,
     PRIMARY KEY (kind, id, scope)
 );
+-- A clean read view over tool_error events: the friction columns are overloaded
+-- onto generic event columns (category in surface_id, excerpt in source, tool in
+-- model), so this view names them and joins the project — letting an ad-hoc SQL
+-- query (e.g. from the optimize session) ask for any slice without knowing the
+-- encoding. `project LIKE '%--wt%'` distinguishes a worktree from the main checkout.
+CREATE VIEW IF NOT EXISTS tool_errors AS
+SELECT e.session_id        AS session_id,
+       s.project           AS project,
+       e.surface_id        AS category,
+       e.source            AS excerpt,
+       e.model             AS tool,
+       e.started_epoch      AS started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+WHERE e.kind = 'tool_error';
 ";
 
 /// Identity and provenance of one analyzed session.
@@ -110,9 +124,39 @@ impl Store {
         Self::from_connection(Connection::open(path)?)
     }
 
+    /// Open an existing store **read-only**, without touching the schema. For
+    /// the `sql` command, where an ad-hoc query must never mutate the derived
+    /// store (and an absent db is an error, not a fresh empty one).
+    pub fn open_readonly(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { conn })
+    }
+
     /// An ephemeral in-memory store, for tests.
     pub fn in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// Run an arbitrary read query, returning `(column names, rows)` with every
+    /// cell stringified. Powers the `sql` command — the store's own query
+    /// surface, so the analyzed data is reachable for any slice without
+    /// re-parsing transcripts. Opened read-only by the caller; a non-read
+    /// statement simply errors at SQLite.
+    pub fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let ncol = columns.len();
+        let rows = stmt
+            .query_map([], |row| {
+                (0..ncol)
+                    .map(|i| Ok(value_to_string(row.get_ref(i)?)))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((columns, rows))
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
@@ -597,6 +641,18 @@ fn epoch_ms_to_rfc3339(epoch_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Stringify a SQLite cell for the generic `query` surface.
+fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => f.to_string(),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        ValueRef::Blob(_) => "<blob>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +940,70 @@ mod tests {
                     "missing /b".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn query_returns_columns_and_stringified_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                &alpha.source_path,
+                &[(100, "path-not-found", "missing /a", "Read")],
+            )
+            .unwrap();
+
+        let (cols, rows) = store
+            .query("SELECT category, tool, COUNT(*) AS n FROM tool_errors GROUP BY category, tool")
+            .unwrap();
+        assert_eq!(cols, vec!["category", "tool", "n"]);
+        assert_eq!(
+            rows,
+            vec![vec![
+                "path-not-found".to_string(),
+                "Read".to_string(),
+                "1".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn tool_errors_view_exposes_named_columns_and_project() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "demo--wt-feature".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                &alpha.source_path,
+                &[(100, "path-not-found", "missing /a", "Read")],
+            )
+            .unwrap();
+
+        // An ad-hoc query against the view sees clean names, not the overloaded
+        // event columns, and the worktree filter works off `project`.
+        let row: (String, String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT project, category, excerpt, tool FROM tool_errors \
+                 WHERE project LIKE '%--wt%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "demo--wt-feature".to_string(),
+                "path-not-found".to_string(),
+                "missing /a".to_string(),
+                "Read".to_string(),
+            )
         );
     }
 

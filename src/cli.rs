@@ -141,6 +141,18 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Run an arbitrary read-only SQL query against the analyzed store. The query
+    /// is the argument, or read from stdin when omitted (so `echo 'SELECT …' |
+    /// ccoptimizer sql` works). A `tool_errors` view names the friction columns.
+    Sql {
+        /// The SQL to run. If omitted, the query is read from stdin.
+        query: Option<String>,
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
     /// Analyze, then hand the findings to an interactive `claude` session so you
     /// can act on them together. Composes the analysis with a prescribed advisor
     /// prompt and launches `claude` seeded with it.
@@ -179,6 +191,9 @@ pub fn run() -> Result<()> {
         Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
         Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
         Command::Summary { db } => summary(&db),
+        Command::Sql { query, format, db } => {
+            sql(query.as_deref(), parse_format(format.as_deref())?, &db)
+        }
         Command::Optimize {
             projects,
             db,
@@ -205,15 +220,21 @@ fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: boo
     let store = Store::open(db).context("open store")?;
     let findings = collect_findings(&store)?;
 
+    // The absolute store path so the session's `ccoptimizer sql --db …` hits the
+    // store this run built, wherever it is launched from.
+    let db_display = std::fs::canonicalize(db)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| db.to_string_lossy().into_owned());
+
     if print {
-        println!("{}", optimize_mod::compose_prompt(&findings));
+        println!("{}", optimize_mod::compose_prompt(&findings, &db_display));
         return Ok(());
     }
 
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
     let briefing = optimize_mod::render_briefing(&findings);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy());
+    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display);
 
     // Hand over the terminal: `claude <prompt>` starts an interactive session,
     // inheriting our stdio so the user takes over. Clean up the briefing file
@@ -413,6 +434,37 @@ fn config_wedges(
         }
     }
     Ok((unused, always_on_heavy))
+}
+
+/// Run a read-only SQL query against the store and print the result. The query
+/// comes from the argument or, when absent, from stdin — so both
+/// `ccoptimizer sql '…'` and `echo '…' | ccoptimizer sql` work. The store is
+/// opened read-only so an ad-hoc query can never mutate the derived data.
+fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
+    let query = match query {
+        Some(q) => q.to_string(),
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read SQL from stdin")?;
+            buf
+        }
+    };
+    let query = query.trim();
+    if query.is_empty() {
+        anyhow::bail!("no SQL provided — pass it as an argument or on stdin");
+    }
+
+    let store = Store::open_readonly(db)
+        .with_context(|| format!("open store {} (run `analyze` first?)", db.display()))?;
+    let (columns, rows) = store.query(query)?;
+    let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
+    let aligns = vec![Align::Left; columns.len()];
+    render(&headers, &aligns, &rows, format);
+    println!("\n{} row(s)", rows.len());
+    Ok(())
 }
 
 /// One-screen health check: pull the few most actionable findings from every

@@ -38,6 +38,7 @@ tool's core questions:
 | `usage` | Event rollups: per surface and/or per time bucket — frequency, tokens, `ctx_growth`, duration. The default per-skill view leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
 | `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence. |
 | `baseline` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
+| `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
 
 Filters (`--kind`, `--project`, `--since/--until`) narrow any view. Output is a
 terminal **table** by default or **Markdown** for pasting into notes/PRs.

@@ -220,21 +220,41 @@ impl Store {
         &mut self,
         session_id: &str,
         source_path: &str,
-        prompts: &[(usize, i64)],
+        prompts: &[(usize, i64, &str)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (line_no, epoch_ms) in prompts {
+        for (line_no, epoch_ms, behavior) in prompts {
+            // The prompt's behavioral class rides in the unused `source` column.
             tx.execute(
                 "INSERT INTO events
-                   (session_id, source_path, source_line, kind,
+                   (session_id, source_path, source_line, kind, source,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, ?3, 'prompt', '', ?4, 0, 0, 0, 0, 0)",
-                (session_id, source_path, *line_no as i64, epoch_ms / 1000),
+                 VALUES (?1, ?2, ?3, 'prompt', ?4, '', ?5, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    *line_no as i64,
+                    *behavior,
+                    epoch_ms / 1000,
+                ),
             )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Counts of prompts by behavioral class (`source` column on prompt events),
+    /// most frequent first.
+    pub fn prompt_behavior_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, COUNT(*) FROM events WHERE kind = 'prompt' AND source IS NOT NULL
+             GROUP BY source ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Per-skill usage rollup, most-invoked first.

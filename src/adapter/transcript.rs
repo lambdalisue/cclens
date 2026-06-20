@@ -8,6 +8,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::core::prompt::{PromptBehavior, classify_prompt};
 use crate::core::span::{Record, RecordKind, Source};
 
 const SYNTHETIC_MODEL: &str = "<synthetic>";
@@ -167,11 +168,12 @@ fn command_content(raw: &Raw) -> Option<&str> {
         .then_some(content)
 }
 
-/// Pointers `(source_line, epoch_ms)` to each user prompt in a transcript. The
-/// prompt *text* is never stored — only where to find it — so prompt clustering
-/// (goal 3) stays possible after transcripts rotate without copying personal
-/// text into the store. See `docs/specs/storage.md`, `events.md`.
-pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64)> {
+/// For each user prompt: a pointer `(source_line, epoch_ms)` and its behavioral
+/// class (steer / correct / question / instruct). The prompt *text* is never
+/// stored — only the pointer and the derived class — so prompt analysis stays
+/// possible after transcripts rotate without copying personal text into the
+/// store. See `docs/specs/storage.md`, `events.md`, `core::prompt`.
+pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64, PromptBehavior)> {
     jsonl
         .lines()
         .enumerate()
@@ -182,7 +184,16 @@ pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64)> {
                 && raw.is_meta != Some(true)
                 && command_content(&raw).is_none()
                 && !line.contains("tool_result");
-            is_prompt.then_some((line_no, ts))
+            if !is_prompt {
+                return None;
+            }
+            let text = raw
+                .message
+                .as_ref()
+                .and_then(|message| message.content.as_ref())
+                .and_then(|content| content.as_str())
+                .unwrap_or("");
+            Some((line_no, ts, classify_prompt(text)))
         })
         .collect()
 }
@@ -357,9 +368,12 @@ mod tests {
 
         let pointers = extract_prompt_pointers(jsonl);
         // Lines 0 and 3 are prompts; line 1 is assistant, line 2 a tool result.
-        assert_eq!(
-            pointers,
-            vec![(0, 1_767_225_600_000), (3, 1_767_225_603_000)]
+        let lines: Vec<usize> = pointers.iter().map(|(line, _, _)| *line).collect();
+        assert_eq!(lines, vec![0, 3]);
+        assert!(
+            pointers
+                .iter()
+                .all(|(_, _, b)| *b == crate::core::prompt::PromptBehavior::Instruct)
         );
     }
 

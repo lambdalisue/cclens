@@ -84,6 +84,15 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Show how you steer the session — the mix of steering / correcting /
+    /// questioning / instructing prompts, with what it suggests.
+    Prompts {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -95,7 +104,66 @@ pub fn run() -> Result<()> {
         Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
         Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
         Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
+        Command::Prompts { format, db } => prompts(parse_format(format.as_deref())?, &db),
     }
+}
+
+/// Show the mix of how the user steers the session, and what it suggests. Heavy
+/// steering points to room for more autonomy; frequent corrections point to
+/// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
+fn prompts(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let counts = store.prompt_behavior_counts()?;
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        println!("no prompts found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+
+    let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
+    let get = |name: &str| {
+        counts
+            .iter()
+            .find(|(b, _)| b == name)
+            .map_or(0, |(_, n)| *n)
+    };
+
+    let rows: Vec<Vec<String>> = counts
+        .iter()
+        .map(|(behavior, n)| vec![behavior.clone(), n.to_string(), format!("{}%", pct(*n))])
+        .collect();
+    render(
+        &["behavior", "count", "share"],
+        &[Align::Left, Align::Right, Align::Right],
+        &rows,
+        format,
+    );
+
+    println!("\n{total} prompts (behavioral classes are lexical heuristics)");
+    let steer = pct(get("steer"));
+    let correct = pct(get("correct"));
+    let mut flagged = false;
+    if steer >= 25 {
+        flagged = true;
+        println!(
+            "  - {steer}% steering (\"go ahead\" / \"yes\" / \"next\"): you approve in small \
+             steps — room for more autonomy (clearer upfront scope, /loop, longer leash)."
+        );
+    }
+    if correct >= 10 {
+        flagged = true;
+        println!(
+            "  - {correct}% corrections (\"no\" / \"instead\" / \"戻して\"): rework after a wrong \
+             turn — tighter initial specs or rules could cut it."
+        );
+    }
+    if !flagged {
+        println!(
+            "  - healthy mix: mostly substantive instructions, low correction ({correct}%) — \
+             good alignment, no obvious babysitting or rework problem."
+        );
+    }
+    Ok(())
 }
 
 /// Reconcile the empirical always-on floor against readable config. The floor is
@@ -159,7 +227,10 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         let sub_tokens: i64 = subagents.iter().map(|(_, tokens)| *tokens as i64).sum();
         let meta = session_meta(&transcript, sub_tokens, subagents.len() as i64);
         store.ingest_session(&meta, &spans, &usage)?;
-        let prompts = extract_prompt_pointers(&text);
+        let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
+            .into_iter()
+            .map(|(line, ts, behavior)| (line, ts, behavior.label()))
+            .collect();
         store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
         sessions += 1;
         spans_total += spans.len();

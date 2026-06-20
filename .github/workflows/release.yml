@@ -1,0 +1,54 @@
+name: Release
+
+# Cut a release by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`).
+# Each target builds natively on its matching runner — no cross-compilation — and
+# uploads its archive to the GitHub Release for the tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rusqlite is built with `bundled`, so SQLite compiles from C against each
+      # runner's native toolchain (cc on unix, MSVC on Windows) — no extra setup.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tar -C target/release -czf \
+            "cclens-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" cclens
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/cclens.exe `
+            -DestinationPath "cclens-${{ github.ref_name }}-${{ matrix.target }}.zip"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cclens-*.tar.gz
+            cclens-*.zip

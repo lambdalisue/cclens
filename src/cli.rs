@@ -765,7 +765,7 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
         // `raw_errors` owns the strings; `error_rows` borrows them.
         let raw_errors = extract_tool_errors(&text);
-        let error_rows: Vec<(i64, &str, &str, &str)> = raw_errors
+        let error_rows: Vec<(i64, &str, &str, &str, &str)> = raw_errors
             .iter()
             .map(|e| {
                 (
@@ -773,6 +773,7 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
                     e.category.label(),
                     e.excerpt.as_str(),
                     e.tool.as_str(),
+                    e.target.as_str(),
                 )
             })
             .collect();

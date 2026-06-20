@@ -21,7 +21,7 @@ identifying the configuration surface it exercises (the join key into
 | `agent_spawn` | `agent` | the subagent's lifetime (cost attributed via `promptId`) |
 | `tool_use` | `mcp_tool` / `mcp_server` / built-in tool | point event |
 | `prompt` | — (user input; raw material for skill extraction) | point event; text referenced, not stored |
-| `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model` |
+| `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model`, the call's target (file_path / command) in `target` |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — heuristic source |
 

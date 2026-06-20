@@ -85,7 +85,7 @@ becomes an event). The adapter recognises at least:
 | Subagent spawn | `assistant` `tool_use` with `name == "Agent"` |
 | Tool use | `assistant` `tool_use` blocks (built-in and MCP tools, by `name`) |
 | User prompt | `user` **human turns** (not `last-prompt`, which is a single leaf-pointer to the latest prompt — one per region, not per turn) |
-| Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. The text is classified into a friction category (`core::friction`); a short readable excerpt is kept (the actual failing path/file), and the **originating tool** is recovered by linking the result's `tool_use_id` to the assistant `tool_use` block's `id` — so a report shows concrete instances and which tool produced them (e.g. a file edit vs a Playwright locator miss), not just counts |
+| Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. The text is classified into a friction category (`core::friction`); a short readable excerpt is kept. Linking the result's `tool_use_id` to the assistant `tool_use` block recovers both the **originating tool** and the call's **target** (its `input.file_path` / `command`) — so a report shows which tool produced each failure and which file/command it hit, even when the error text omits the path (e.g. edit-precondition names no file) |
 | Permission denial | denial text inside a `tool_result` error block (e.g. `"Permission for this action was denied"` / `<tool_use_error>`). **No structured record exists** — this is a low-confidence heuristic; see note below |
 | Compaction | `system` `subtype == compact_boundary` |
 

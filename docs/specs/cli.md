@@ -108,8 +108,11 @@ ad-hoc query can never mutate the derived data, and an absent db is an error
 
 A `tool_errors` view (`storage.md`) names the friction columns that are
 otherwise overloaded onto generic event columns (`category`, `excerpt`, `tool`,
-`project`), so a friction query reads cleanly without knowing the encoding;
-`SELECT sql FROM sqlite_master` lists the full schema.
+`target`, `project`), so a friction query reads cleanly without knowing the
+encoding — e.g. `SELECT target, COUNT(*) FROM tool_errors WHERE
+category='edit-precondition' GROUP BY target` answers "which files keep failing
+to edit", which the error text alone cannot. `SELECT sql FROM sqlite_master`
+lists the full schema.
 
 ## `optimize` — act on the findings with an interactive `claude` session
 

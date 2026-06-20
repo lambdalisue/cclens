@@ -200,12 +200,15 @@ pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64, PromptBehavior)>
 }
 
 /// One failed tool result: when it happened, its friction category, a readable
-/// excerpt of the error text, and the tool that produced it.
+/// excerpt of the error text, the tool that produced it, and the call's target —
+/// the file_path it edited or the command it ran, recovered from the originating
+/// `tool_use` input (the error text alone often omits it, e.g. edit-precondition).
 pub struct ToolError {
     pub epoch_ms: i64,
     pub category: ErrorCategory,
     pub excerpt: String,
     pub tool: String,
+    pub target: String,
 }
 
 /// Extract failed tool results from a transcript — the raw material for friction
@@ -218,9 +221,9 @@ pub struct ToolError {
 /// assistant `tool_use` block's `id`), so file-edit failures are told apart from,
 /// say, a Playwright locator miss that merely reads as "not found".
 pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
-    // tool_use id -> tool name, filled as assistant records stream past (a
-    // tool_use always precedes its result, so one forward pass suffices).
-    let mut tool_names: std::collections::HashMap<String, String> =
+    // tool_use id -> (tool name, target), filled as assistant records stream past
+    // (a tool_use always precedes its result, so one forward pass suffices).
+    let mut tool_calls: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut errors = Vec::new();
     for line in jsonl.lines() {
@@ -245,7 +248,8 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
                         block.get("id").and_then(|v| v.as_str()),
                         block.get("name").and_then(|v| v.as_str()),
                     ) {
-                        tool_names.insert(id.to_string(), name.to_string());
+                        let target = tool_target(block.get("input"));
+                        tool_calls.insert(id.to_string(), (name.to_string(), target));
                     }
                 }
             }
@@ -272,17 +276,20 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
                     let is_error = block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
                         || content.contains("tool_use_error");
                     if is_error {
-                        let tool = block
+                        let call = block
                             .get("tool_use_id")
                             .and_then(|v| v.as_str())
-                            .and_then(|id| tool_names.get(id))
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string());
+                            .and_then(|id| tool_calls.get(id));
+                        let (tool, target) = match call {
+                            Some((name, target)) => (name.clone(), target.clone()),
+                            None => ("unknown".to_string(), String::new()),
+                        };
                         errors.push(ToolError {
                             epoch_ms: ts,
                             category: classify_error(&content),
                             excerpt: content_value.map(error_excerpt).unwrap_or_default(),
                             tool,
+                            target,
                         });
                     }
                 }
@@ -291,6 +298,39 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
         }
     }
     errors
+}
+
+/// The subject of a tool call, from its `input`: the file it touched or the
+/// command it ran — the first present of a small set of identifying fields. This
+/// is what the error text frequently omits (an edit-precondition failure names
+/// no path), so it is what a friction-by-file query needs.
+fn tool_target(input: Option<&Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+    for key in [
+        "file_path",
+        "notebook_path",
+        "path",
+        "command",
+        "pattern",
+        "url",
+    ] {
+        if let Some(value) = input.get(key).and_then(|v| v.as_str()) {
+            return clean_truncate(value);
+        }
+    }
+    String::new()
+}
+
+/// Whitespace-collapse and truncate by Unicode scalar (never mid-character).
+fn clean_truncate(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Distil a tool-result `content` value into a short, readable excerpt: the text
@@ -306,8 +346,7 @@ fn error_excerpt(content: &Value) -> String {
             .join(" "),
         other => other.to_string(),
     };
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(200).collect()
+    clean_truncate(&raw)
 }
 
 /// Extract work events `(epoch_ms, kind, id)` from a transcript: the leading
@@ -592,11 +631,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_errors_are_attributed_to_the_tool_that_produced_them() {
-        // The assistant's tool_use names the tool; the failing tool_result links
-        // back to it via tool_use_id.
+    fn tool_errors_are_attributed_to_the_tool_and_target_that_produced_them() {
+        // The assistant's tool_use names the tool and its input target; the
+        // failing tool_result links back via tool_use_id. The error text omits
+        // the path, so the target must come from the tool_use input.
         let jsonl = concat!(
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"/tmp/example/foo.rs"}}]}}"#,
             "\n",
             r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"File has not been read yet."}]}}"#,
         );
@@ -604,6 +644,20 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].category, ErrorCategory::EditPrecondition);
         assert_eq!(errors[0].tool, "Edit");
+        assert_eq!(errors[0].target, "/tmp/example/foo.rs");
+    }
+
+    #[test]
+    fn bash_tool_error_target_is_the_command() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"fd --type f"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","is_error":true,"content":"command not found: fd"}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].tool, "Bash");
+        assert_eq!(errors[0].target, "fd --type f");
     }
 
     #[test]

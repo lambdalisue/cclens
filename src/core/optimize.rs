@@ -108,13 +108,15 @@ analyzed store with `cclens sql`. cclens has already extracted every session \
 into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
 ~/.claude/projects transcripts in Python — that reinvents what cclens is. Examples:
     cclens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
+    cclens sql \"SELECT target, COUNT(*) n FROM tool_errors WHERE category='edit-precondition' AND target<>'' GROUP BY target ORDER BY n DESC\"
     echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | cclens sql
   Re-running `cclens analyze` is unnecessary — the store is already current. Schema crib:
-    - tool_errors(session_id, project, category, excerpt, tool, started_epoch): one row per \
-failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
+    - tool_errors(session_id, project, category, excerpt, tool, target, started_epoch): one row \
+per failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
 the failing path/file — including any worktree segment like `/.wt/`, so a worktree-vs-main \
-split is a `WHERE excerpt LIKE …` away), `tool` = the tool that produced it. `project` = the \
-session's cwd slug.
+split is a `WHERE excerpt LIKE …` away), `tool` = the tool that produced it, `target` = the \
+file_path it edited or command it ran (use this when the error text omits the path, e.g. \
+edit-precondition's \"File has not been read yet\"). `project` = the session's cwd slug.
     - sessions(id, project, slug, source_path, started_at, …) and events(session_id, kind, \
 surface_id, source, model, started_epoch, …) hold everything else (run `cclens sql \
 \"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \

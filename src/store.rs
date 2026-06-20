@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS events (
     ctx_start     INTEGER NOT NULL,
     ctx_peak      INTEGER NOT NULL,
     model         TEXT,
+    target        TEXT,
     sub_tokens           INTEGER NOT NULL DEFAULT 0,
     sub_agent_count      INTEGER NOT NULL DEFAULT 0,
     sub_tokens_estimated INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +66,7 @@ SELECT e.session_id        AS session_id,
        e.surface_id        AS category,
        e.source            AS excerpt,
        e.model             AS tool,
+       e.target            AS target,
        e.started_epoch      AS started_epoch
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
@@ -289,33 +291,35 @@ impl Store {
     }
 
     /// Insert tool-failure events for a session: `(epoch_ms, category, excerpt,
-    /// tool)`. For a `tool_error` row the otherwise-unused detail columns carry
-    /// the friction signal: `surface_id` = category, `source` = a short excerpt
-    /// of the error text, `model` = the originating tool. `surface_kind` stays
-    /// NULL so these never enter the surface-catalog join. Storing the excerpt
-    /// and tool lets a report show concrete instances and which tool produced
-    /// them without re-reading the transcript. Call after `ingest_session`, whose
-    /// delete-by-`source_path` already cleared prior rows for this file.
+    /// tool, target)`. For a `tool_error` row the otherwise-unused detail columns
+    /// carry the friction signal: `surface_id` = category, `source` = a short
+    /// excerpt of the error text, `model` = the originating tool, `target` = the
+    /// call's subject (file_path / command). `surface_kind` stays NULL so these
+    /// never enter the surface-catalog join. The excerpt, tool, and target let a
+    /// report show concrete instances, which tool produced them, and which file
+    /// or command they hit — without re-reading the transcript. Call after
+    /// `ingest_session`, whose delete-by-`source_path` already cleared prior rows.
     pub fn ingest_tool_errors(
         &mut self,
         session_id: &str,
         source_path: &str,
-        errors: &[(i64, &str, &str, &str)],
+        errors: &[(i64, &str, &str, &str, &str)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (epoch_ms, category, excerpt, tool) in errors {
+        for (epoch_ms, category, excerpt, tool, target) in errors {
             tx.execute(
                 "INSERT INTO events
-                   (session_id, source_path, kind, surface_id, source, model,
+                   (session_id, source_path, kind, surface_id, source, model, target,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, '', ?6, 0, 0, 0, 0, 0)",
+                 VALUES (?1, ?2, 'tool_error', ?3, ?4, ?5, ?6, '', ?7, 0, 0, 0, 0, 0)",
                 (
                     session_id,
                     source_path,
                     *category,
                     *excerpt,
                     *tool,
+                    *target,
                     epoch_ms / 1000,
                 ),
             )?;
@@ -881,8 +885,8 @@ mod tests {
                 "a1",
                 &alpha.source_path,
                 &[
-                    (100, "edit-precondition", "x", "Edit"),
-                    (200, "edit-precondition", "y", "Edit"),
+                    (100, "edit-precondition", "x", "Edit", "f"),
+                    (200, "edit-precondition", "y", "Edit", "f"),
                 ],
             )
             .unwrap();
@@ -890,7 +894,7 @@ mod tests {
             .ingest_tool_errors(
                 "b1",
                 &beta.source_path,
-                &[(300, "edit-precondition", "z", "Write")],
+                &[(300, "edit-precondition", "z", "Write", "f")],
             )
             .unwrap();
 
@@ -917,9 +921,9 @@ mod tests {
                 "a1",
                 &alpha.source_path,
                 &[
-                    (100, "path-not-found", "missing /a", "Read"),
-                    (200, "path-not-found", "missing /b", "Read"),
-                    (300, "path-not-found", "missing /c", "Bash"),
+                    (100, "path-not-found", "missing /a", "Read", "f"),
+                    (200, "path-not-found", "missing /b", "Read", "f"),
+                    (300, "path-not-found", "missing /c", "Bash", "f"),
                 ],
             )
             .unwrap();
@@ -953,7 +957,7 @@ mod tests {
             .ingest_tool_errors(
                 "a1",
                 &alpha.source_path,
-                &[(100, "path-not-found", "missing /a", "Read")],
+                &[(100, "path-not-found", "missing /a", "Read", "f")],
             )
             .unwrap();
 
@@ -981,7 +985,7 @@ mod tests {
             .ingest_tool_errors(
                 "a1",
                 &alpha.source_path,
-                &[(100, "path-not-found", "missing /a", "Read")],
+                &[(100, "path-not-found", "missing /a", "Read", "f")],
             )
             .unwrap();
 
@@ -1018,9 +1022,9 @@ mod tests {
                 "a1",
                 &alpha.source_path,
                 &[
-                    (100, "path-not-found", "missing /a", "Read"),
-                    (200, "path-not-found", "missing /b", "Read"),
-                    (300, "path-not-found", "missing /c", "Bash"),
+                    (100, "path-not-found", "missing /a", "Read", "f"),
+                    (200, "path-not-found", "missing /b", "Read", "f"),
+                    (300, "path-not-found", "missing /c", "Bash", "f"),
                 ],
             )
             .unwrap();

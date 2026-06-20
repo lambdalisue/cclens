@@ -54,6 +54,7 @@ CREATE TABLE events (
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
     model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error)
+    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error)
     attrs_json           TEXT
 );
 
@@ -73,7 +74,7 @@ CREATE TABLE ingested_files (
 CREATE VIEW tool_errors AS
 SELECT e.session_id, s.project,
        e.surface_id AS category, e.source AS excerpt, e.model AS tool,
-       e.started_epoch
+       e.target, e.started_epoch
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
 ```

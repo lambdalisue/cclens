@@ -90,6 +90,21 @@ any other surface; when it is not, the surface is recorded with an unknown
 static cost and the report flags it rather than reporting a false zero. The
 runtime side is unaffected — MCP `tool_use` still shows up in `events`.
 
+**Investigated and found unmeasurable from local data (the honest limit).** None
+of the would-be sources exist: `mcp.json` holds only launch config
+(`command`/`args`), no schema; there is no on-disk cache of advertised tool
+definitions (`mcp-needs-auth-cache.json` is auth state only); the transcript
+exposes only the tools that were *used*, so a server's full tool count is unknown
+and an *unused* server — exactly the one worth flagging — yields no signal at
+all. A differential (baseline with vs without a server) is also unavailable
+because every project shares the global `mcp.json`. A "tool count × average
+schema size" estimate would therefore be a fabrication for the cases that matter,
+so the tool does **not** invent one. The honest substitutes it does provide:
+per-server **call frequency** (`surfaces` / `wedges` — a used vs dead-weight
+signal), and the **residual** in `baseline` (an upper bound on system + built-in
+tools + all MCP schemas combined). Isolating one server's cost would need runtime
+schema access this tool does not have.
+
 ## Frontmatter the adapter reads
 
 - `skill`: `name`, `description` (the startup-loaded text), `argument-hint`,

@@ -13,9 +13,11 @@ use crate::adapter::config::{
     read_skill_surfaces,
 };
 use crate::adapter::transcript::{
-    count_permission_denials, extract_prompt_pointers, parse_session, subagent_prompt_id,
+    count_permission_denials, extract_prompt_pointers, extract_tool_errors, parse_session,
+    subagent_prompt_id,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
+use crate::core::friction::ErrorCategory;
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
@@ -27,7 +29,7 @@ use crate::store::{SessionMeta, Store};
 #[derive(Parser)]
 #[command(
     name = "ccoptimizer",
-    about = "Find where your Claude Code config can be optimized"
+    about = "Analyze your Claude Code sessions — usage, cost, and where the work stumbles"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -93,6 +95,15 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Where the work stumbles: recurring tool failures by category, ranked,
+    /// with what each suggests fixing.
+    Friction {
+        /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -105,7 +116,40 @@ pub fn run() -> Result<()> {
         Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
         Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
         Command::Prompts { format, db } => prompts(parse_format(format.as_deref())?, &db),
+        Command::Friction { format, db } => friction(parse_format(format.as_deref())?, &db),
     }
+}
+
+/// Where the work stumbles: recurring tool failures by category, ranked, each
+/// with what it suggests fixing. This is about the work, not the config —
+/// recurring failures are fixable friction that wastes turns and tokens.
+fn friction(format: Format, db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+    let counts = store.error_counts()?;
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        println!("no tool failures found — run `ccoptimizer analyze` first");
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<String>> = counts
+        .iter()
+        .map(|(label, n)| {
+            vec![
+                label.clone(),
+                n.to_string(),
+                ErrorCategory::from_label(label).suggestion().to_string(),
+            ]
+        })
+        .collect();
+    render(
+        &["error", "count", "suggestion"],
+        &[Align::Left, Align::Right, Align::Left],
+        &rows,
+        format,
+    );
+    println!("\n{total} tool failures (categories are lexical heuristics)");
+    Ok(())
 }
 
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
@@ -232,6 +276,11 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
             .map(|(line, ts, behavior)| (line, ts, behavior.label()))
             .collect();
         store.ingest_prompts(&meta.id, &meta.source_path, &prompts)?;
+        let errors: Vec<(i64, &str)> = extract_tool_errors(&text)
+            .into_iter()
+            .map(|(ts, category)| (ts, category.label()))
+            .collect();
+        store.ingest_tool_errors(&meta.id, &meta.source_path, &errors)?;
         sessions += 1;
         spans_total += spans.len();
     }

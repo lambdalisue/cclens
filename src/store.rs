@@ -244,6 +244,44 @@ impl Store {
         Ok(())
     }
 
+    /// Insert tool-failure events for a session: `(epoch_ms, category)`. The
+    /// category rides in `surface_id`. Call after `ingest_session`, whose
+    /// delete-by-`source_path` already cleared prior rows for this file.
+    pub fn ingest_tool_errors(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        errors: &[(i64, &str)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (epoch_ms, category) in errors {
+            // surface_kind stays NULL so these do not enter the surface catalog
+            // join; the category rides in surface_id for error_counts only.
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, surface_id,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak)
+                 VALUES (?1, ?2, 'tool_error', ?3, '', ?4, 0, 0, 0, 0, 0)",
+                (session_id, source_path, *category, epoch_ms / 1000),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Counts of tool failures by category, most frequent first.
+    pub fn error_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT surface_id, COUNT(*) FROM events WHERE kind = 'tool_error'
+             GROUP BY surface_id ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Counts of prompts by behavioral class (`source` column on prompt events),
     /// most frequent first.
     pub fn prompt_behavior_counts(&self) -> Result<Vec<(String, i64)>> {

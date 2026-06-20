@@ -8,6 +8,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::core::friction::{ErrorCategory, classify_error};
 use crate::core::prompt::{PromptBehavior, classify_prompt};
 use crate::core::span::{Record, RecordKind, Source};
 
@@ -196,6 +197,48 @@ pub fn extract_prompt_pointers(jsonl: &str) -> Vec<(usize, i64, PromptBehavior)>
             Some((line_no, ts, classify_prompt(text)))
         })
         .collect()
+}
+
+/// Extract failed tool results from a transcript as `(epoch_ms, category)` — the
+/// raw material for friction analysis. A tool result is a failure when it is
+/// flagged `is_error` or carries a `tool_use_error` wrapper; its text is
+/// classified into a recurring category (`core::friction`).
+pub fn extract_tool_errors(jsonl: &str) -> Vec<(i64, ErrorCategory)> {
+    let mut errors = Vec::new();
+    for line in jsonl.lines() {
+        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
+            continue;
+        };
+        if raw.kind.as_deref() != Some("user") {
+            continue;
+        }
+        let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+            continue;
+        };
+        let Some(blocks) = raw
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .and_then(|content| content.as_array())
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let content = block
+                .get("content")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let is_error = block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+                || content.contains("tool_use_error");
+            if is_error {
+                errors.push((ts, classify_error(&content)));
+            }
+        }
+    }
+    errors
 }
 
 /// Count permission denials in a transcript — a friction signal. There is no

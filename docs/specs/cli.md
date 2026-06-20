@@ -34,6 +34,7 @@ tool's core questions:
 
 | View | Answers |
 | --- | --- |
+| `summary` | The entry point: a one-screen health check that pulls the few most actionable findings from every view (token destinations, always-on cost, top fixable friction, cd overhead + worst thrash, unused config, prompting) into one prioritised report — so the tool answers "what should I do" without running ten commands. |
 | `surfaces` (default) | The catalog×usage join per surface: static cost, load mode, usage, cost — the optimization wedges (`surfaces.md`), ranked. |
 | `usage` | Event rollups: per surface and/or per time bucket — frequency, tokens, `ctx_growth`, duration. The default per-skill view leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
 | `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence. |

@@ -130,6 +130,12 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// One-screen health check: the few most actionable findings across every
+    /// view, prioritised. Start here.
+    Summary {
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -146,7 +152,123 @@ pub fn run() -> Result<()> {
         Command::Hotspots { format, db } => hotspots(parse_format(format.as_deref())?, &db),
         Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
         Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
+        Command::Summary { db } => summary(&db),
     }
+}
+
+/// One-screen health check: pull the few most actionable findings from every
+/// view into one prioritised report, so the tool answers "what should I do"
+/// without running ten commands.
+fn summary(db: &Path) -> Result<()> {
+    let store = Store::open(db).context("open store")?;
+
+    // Where tokens go.
+    let main_out: i64 = store.skill_usage()?.iter().map(|r| r.out_tokens).sum();
+    let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    println!("== tokens ==");
+    println!("  main-thread skill output  {main_out}");
+    println!("  subagents                 {sub_tokens} ({sub_agents} agents)");
+
+    // Always-on cost picture.
+    let floor = store.baseline_floor()?;
+    if floor > 0 {
+        let config = store.always_on_config_tokens()?;
+        let residual = (floor - config).max(0);
+        println!("\n== always-on context per session ==");
+        println!(
+            "  ~{floor} tokens (your config {config}, the rest {residual} is system+tools+MCP)"
+        );
+    }
+
+    // Top fixable friction (exclude non-actionable noise).
+    let noise = ["cancelled", "transient", "other", "command-failed"];
+    let friction: Vec<_> = store
+        .error_counts()?
+        .into_iter()
+        .filter(|(label, _)| !noise.contains(&label.as_str()))
+        .collect();
+    if !friction.is_empty() {
+        println!("\n== top fixable friction ==");
+        for (label, n) in friction.iter().take(3) {
+            println!(
+                "  {n:>4}  {label} — {}",
+                ErrorCategory::from_label(label).suggestion()
+            );
+        }
+    }
+
+    // Workflow inefficiency: cd overhead + worst thrash.
+    println!("\n== workflow ==");
+    let bash = store.work_counts("bash_cmd")?;
+    let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
+    if bash_total > 0 {
+        let cd = bash.iter().find(|(c, _)| c == "cd").map_or(0, |(_, n)| *n);
+        let cd_pct = (cd as f64 * 100.0 / bash_total as f64).round() as i64;
+        println!("  cd is {cd_pct}% of Bash calls — a working-dir convention would cut the churn");
+    }
+    let edits = store.work_event_rows("file_edit")?;
+    if let Some(worst) = detect_thrash(&edits, 5 * 60, 4).first() {
+        let span = worst.span_secs();
+        println!(
+            "  worst thrash: {} edited {}x within {}m{}s — likely got stuck there",
+            worst.file,
+            worst.edits,
+            span / 60,
+            span % 60
+        );
+    }
+
+    // Config worth cutting: count what `wedges` would flag with real savings.
+    let counts: std::collections::HashMap<(String, String), i64> = store
+        .usage_counts()?
+        .into_iter()
+        .map(|(k, i, c)| ((k, i), c))
+        .collect();
+    let mut unused_measurable = 0;
+    let mut always_on_heavy = 0;
+    for entry in store.catalog()? {
+        let uses = counts
+            .get(&(entry.kind.clone(), entry.id.clone()))
+            .copied()
+            .unwrap_or(0);
+        let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
+        let static_tokens = entry.static_tokens.map(|t| t as u64);
+        if is_usage_measurable(&entry.kind) && uses == 0 {
+            unused_measurable += 1;
+        }
+        if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
+            always_on_heavy += 1;
+        }
+    }
+    println!("\n== config ==");
+    println!(
+        "  {unused_measurable} unused surface(s), {always_on_heavy} always-on heavy — see `wedges`"
+    );
+
+    // Prompting verdict.
+    let pcounts = store.prompt_behavior_counts()?;
+    let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
+    if ptotal > 0 {
+        let share = |name: &str| {
+            let n = pcounts
+                .iter()
+                .find(|(b, _)| b == name)
+                .map_or(0, |(_, n)| *n);
+            (n as f64 * 100.0 / ptotal as f64).round() as i64
+        };
+        println!("\n== prompting ==");
+        println!(
+            "  {}% steering, {}% corrections — {}",
+            share("steer"),
+            share("correct"),
+            if share("correct") >= 10 || share("steer") >= 25 {
+                "see `prompts`"
+            } else {
+                "healthy mix"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Thrash bursts: a file edited many times in a short window — where Claude got

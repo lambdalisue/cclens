@@ -1,4 +1,4 @@
-//! ccoptimizer — analyze Claude Code usage to find configuration optimizations.
+//! cclens — analyze Claude Code usage to find configuration optimizations.
 //!
 //! The crate is layered (see `docs/specs/architecture.md`): an `adapter` owns the
 //! upstream input formats, a pure `core` derives events and aggregates, a `store`

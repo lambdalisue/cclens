@@ -1,6 +1,6 @@
 # Architecture Specification
 
-ccoptimizer answers one question about a Claude Code setup: **where can the
+cclens answers one question about a Claude Code setup: **where can the
 configuration be optimized, and how?** It does that by measuring, from real
 usage, the **cost** and **actual use** of every configuration surface — skills,
 rules, hooks, MCP servers and their tool schemas, agents, `CLAUDE.md` /
@@ -29,17 +29,18 @@ The design follows from three facts about the problem:
 ```mermaid
 flowchart LR
     raw["transcripts + config"] -->|analyze| db[("SQLite<br/>sessions · surfaces · events")]
-    db -->|report| out["CLI tables / Markdown"]
+    db -->|views / sql| out["CLI tables / Markdown"]
     db -->|optimize| ai["interactive claude session<br/>(AI optimization proposals)"]
 ```
 
 - **`analyze`** reads both inputs and writes the normalized store. The verb is
   `analyze` (not `build`): the command *analyzes* raw input into facts, it does
   not build an artifact.
-- **`report`** queries the store and renders. See `cli.md`.
+- **The read commands** — the curated views and the arbitrary-query `sql` —
+  query the store and render. See `cli.md`.
 
-The stages are decoupled *only* by the store. `report` never reads raw input;
-`analyze` never renders. Consumers read the same store. Two were anticipated,
+The stages are decoupled *only* by the store. The read commands never read raw
+input; `analyze` never renders. Consumers read the same store. Two were anticipated,
 and shape what `analyze` must capture:
 
 - **Optimization proposals** — turning the findings into concrete advice. This

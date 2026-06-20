@@ -1,77 +1,108 @@
-# ccoptimizer
+# cclens
 
-Analyze Claude Code usage to see **where your configuration can be optimized**.
-It reads your session transcripts, measures how each skill is actually used —
-invocation count, output tokens, context growth, wall-clock — and reports it so
-heavy or unused configuration stands out.
+A lens onto your Claude Code usage. `cclens` reads your session transcripts and
+live configuration, extracts them into a local SQLite store, and shows **where
+time, tokens, and effort are being wasted — and how to fix it**: unused or heavy
+config, recurring tool failures, where the work gets stuck, and the cost picture
+behind it all.
 
-The design intent lives in [`docs/specs/`](docs/specs/); this README is just how
-to run it.
+The design intent lives in [`docs/specs/`](docs/specs/); this README is how to
+run it.
 
 ## Build
 
 ```sh
-cargo build
+cargo build --release
+# binary at target/release/cclens
 ```
 
-## Use
+## Quick start
 
 ```sh
-# 1. Analyze transcripts + config into a local SQLite store
-cargo run -- analyze --db ccoptimizer.db
+# 1. Analyze your transcripts + config into a local SQLite store.
+cclens analyze
 
-# 2. Start here: one-screen health check — the few most actionable findings
-cargo run -- summary --db ccoptimizer.db
+# 2. Start here — a one-screen health check of the most actionable findings.
+cclens summary
 
-# Act on the findings interactively — hands them to a `claude` session
-cargo run -- optimize --db ccoptimizer.db
-cargo run -- optimize --print --db ccoptimizer.db   # just print the prompt
-
-# 3. See where to optimize — ranked opportunities with a suggested action
-cargo run -- wedges --db ccoptimizer.db
-
-# 4. Other views
-cargo run -- surfaces --db ccoptimizer.db          # every installed surface × its usage
-cargo run -- report   --db ccoptimizer.db          # per-skill usage, most-invoked first
-cargo run -- report --by month --db ccoptimizer.db # usage per time bucket (JST)
-cargo run -- friction --db ccoptimizer.db          # where the work stumbles, ranked
-cargo run -- thrash   --db ccoptimizer.db          # files Claude got stuck re-editing
-
-# any view takes --format markdown to paste into a PR or note
-cargo run -- wedges --format markdown --db ccoptimizer.db
-```
-
-```
-wedge            surface                        static  uses  suggestion
-------------------------------------------------------------------------
-ALWAYS-ON HEAVY  rule/git/safety                   922     0  slim, or make path-conditional / on-demand
-UNUSED           skill/code-review                1345     0  delete / disable
-UNUSED           skill/style-review              1055     0  delete / disable
-...
+# 3. Act on them: hand the findings to an interactive `claude` session that
+#    investigates each root cause and proposes concrete fixes.
+cclens optimize
 ```
 
 `analyze` reads your transcripts (`~/.claude/projects`) and live config
-(`~/.claude/{skills,rules,agents,mcp.json,CLAUDE.md}`) read-only and
-incrementally. Nothing is sent anywhere; the store is a local file.
+(`~/.claude/{skills,rules,agents,mcp.json,CLAUDE.md}`) **read-only** and
+incrementally, writing `cclens.db`. Nothing is sent anywhere; the store is a
+local file. Every command takes `--db <path>` (default `cclens.db`).
+
+## Commands
+
+### Pipeline
+
+| Command | What it does |
+| --- | --- |
+| `cclens analyze` | Extract transcripts + config into the store. Run it to refresh. |
+| `cclens summary` | One-screen health check across every view — **start here**. |
+| `cclens sql '<query>'` | Run an arbitrary read-only SQL query against the store (see below). |
+| `cclens optimize` | Hand the findings to an interactive `claude` session to act on. |
+
+### Views
+
+Each is a curated lens that carries logic a raw query cannot (a classification,
+an algorithm, a suggestion). Add `--format markdown` to paste into a PR or note.
+
+```sh
+cclens wedges                 # ranked optimization opportunities, with a suggested action
+cclens surfaces               # every installed surface × its actual usage
+cclens baseline               # always-on context per session, reconciled vs your config
+cclens usage                  # per-skill usage, most-invoked first
+cclens usage --by month       # usage per time bucket (JST: year|month|week|day|hour)
+cclens friction               # recurring tool failures by category, ranked, with fixes
+cclens friction --project=<slug>   # one project's failures (fix lands in the right config)
+cclens prompts                # how you steer the session (steer/correct/question/instruct)
+cclens thrash                 # files Claude got stuck re-editing in rapid bursts
+```
+
+### `sql` — query the store directly
+
+Anything the curated views don't cover is a SQL query — the store is the whole
+point. The query is an argument, or read from **stdin**:
+
+```sh
+# Which tool produces each friction category?
+cclens sql "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
+
+# The actual failing paths behind path-not-found (stdin form):
+echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | cclens sql
+
+# Discover the schema:
+cclens sql "SELECT sql FROM sqlite_master"
+```
+
+The `tool_errors` view names the friction columns (`category`, `excerpt`,
+`tool`, `project`); the db is opened read-only, so a query can never mutate the
+derived store.
 
 ## What it covers
 
-- **Every configuration surface**: skills, rules, agents, MCP servers,
-  `CLAUDE.md` — each catalogued with its static token cost and load mode.
-- **The catalog × usage join**: what is installed vs. what is actually used,
-  flagging unused (delete), always-on heavy (slim), and costly+rare (trim).
-- **Where tokens actually go**: main-thread skill output vs. subagent cost, and
-  the always-on context floor reconciled against your readable config (the
-  residual is system + tools + MCP you cannot trim from files).
-- **Where the work stumbles**: recurring tool failures by category (`friction`),
-  files Claude got stuck re-editing (`thrash`), the `cd`/Bash command mix, and
-  how you steer the session (`prompts`).
-- **Time-bucketed usage** (`--by year|month|week|day|hour`, JST) and markdown
-  output.
+- **Every configuration surface** — skills, rules, agents, MCP servers,
+  `CLAUDE.md` — catalogued with its static token cost and load mode, joined
+  against actual usage to flag unused (delete), always-on heavy (slim), and
+  costly+rare (trim).
+- **Where the work stumbles** — recurring tool failures by category and
+  originating tool (`friction`), files Claude got stuck re-editing (`thrash`),
+  each with concrete examples and the project it concentrates in.
+- **Where tokens go** — main-thread skill output vs. subagent cost, and the
+  always-on context floor reconciled against your readable config (the residual
+  is system + tools + MCP you cannot trim from files).
+- **How you prompt** — the steer / correct / question / instruct mix.
 
-Not yet implemented (see [`docs/specs/`](docs/specs/) for the full design):
-meta-skill (`loop`) nesting (a design decision on detecting parent/child from
-the transcript).
+## Notes
 
-Counts are usage signals for ranking, not a billing ledger; static cost is a
-token estimate, not a measured runtime figure.
+- Counts are usage signals for ranking, **not a billing ledger**; static cost is
+  a token estimate, not a measured runtime figure.
+- `optimize` launches `claude` (Claude Code) seeded with the findings; the
+  briefing is written to a private temp file, never passed on the command line.
+- Not yet implemented (see [`docs/specs/`](docs/specs/)): meta-skill (`loop`)
+  nesting — a pending design decision on detecting parent/child from the
+  transcript.

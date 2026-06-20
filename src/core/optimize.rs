@@ -83,7 +83,7 @@ pub struct ThrashLine {
 /// tool and reading the actual config — rather than handing the analysis back to
 /// the user, and pauses only to get the concrete fix-plan approved before editing.
 pub const INSTRUCTIONS: &str = "\
-You are acting as a Claude Code optimization advisor. The user ran `ccoptimizer`, \
+You are acting as a Claude Code optimization advisor. The user ran `cclens`, \
 a tool that analyzed their Claude Code session transcripts and configuration to find \
 where time, tokens, and effort are wasted. Its headline findings are below. Your job is \
 to investigate them to a conclusion and propose concrete fixes — not to hand the analysis \
@@ -104,19 +104,19 @@ Investigate autonomously — this is your work, not the user's:
 gather data. Drive the investigation yourself, end to end.
 - The briefing below is the headline analysis. For ANY deeper slice — the full list of \
 failing paths, a worktree-vs-main split, counts grouped however you like — query the \
-analyzed store with `ccoptimizer sql`. ccoptimizer has already extracted every session \
+analyzed store with `cclens sql`. cclens has already extracted every session \
 into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
-~/.claude/projects transcripts in Python — that reinvents what ccoptimizer is. Examples:
-    ccoptimizer sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
-    echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | ccoptimizer sql
-  Re-running `ccoptimizer analyze` is unnecessary — the store is already current. Schema crib:
+~/.claude/projects transcripts in Python — that reinvents what cclens is. Examples:
+    cclens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
+    echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | cclens sql
+  Re-running `cclens analyze` is unnecessary — the store is already current. Schema crib:
     - tool_errors(session_id, project, category, excerpt, tool, started_epoch): one row per \
 failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
 the failing path/file — including any worktree segment like `/.wt/`, so a worktree-vs-main \
 split is a `WHERE excerpt LIKE …` away), `tool` = the tool that produced it. `project` = the \
 session's cwd slug.
     - sessions(id, project, slug, source_path, started_at, …) and events(session_id, kind, \
-surface_id, source, model, started_epoch, …) hold everything else (run `ccoptimizer sql \
+surface_id, source, model, started_epoch, …) hold everything else (run `cclens sql \
 \"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \
 data before relying on it.
 - The store cannot hold the config itself, so still open the actual CLAUDE.md, rules, hooks, \
@@ -145,7 +145,7 @@ approval is the one and only thing you pause for, never direction on what to inv
 /// the session works from this rather than re-running the tool. Any section with
 /// no data is omitted so the prompt never carries an empty heading.
 pub fn render_briefing(f: &Findings) -> String {
-    let mut out = String::from("# ccoptimizer analysis\n");
+    let mut out = String::from("# cclens analysis\n");
 
     out.push_str("\n## Where tokens go\n");
     out.push_str(&format!("- Main-thread skill output: {}\n", f.main_out));
@@ -267,12 +267,12 @@ fn render_surface(s: &SurfaceRef) -> String {
     }
 }
 
-/// How to reach the analyzed store for `ccoptimizer sql` — appended so the
+/// How to reach the analyzed store for `cclens sql` — appended so the
 /// `--db` the agent should query is the one this run actually built.
 fn store_pointer(db_path: &str) -> String {
     format!(
-        "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `ccoptimizer sql` \
-         (or run from a directory where it is `ccoptimizer.db`)."
+        "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `cclens sql` \
+         (or run from a directory where it is `cclens.db`)."
     )
 }
 
@@ -359,9 +359,9 @@ mod tests {
         assert!(prompt.contains("Claude Code optimization advisor"));
         assert!(prompt.contains("Do NOT ask the user which area"));
         assert!(prompt.contains("Apply file changes only after the user approves"));
-        assert!(prompt.contains("ccoptimizer sql"));
+        assert!(prompt.contains("cclens sql"));
         assert!(prompt.contains("--db /tmp/cc.db"));
-        assert!(prompt.contains("# ccoptimizer analysis"));
+        assert!(prompt.contains("# cclens analysis"));
     }
 
     #[test]
@@ -376,14 +376,14 @@ mod tests {
 
     #[test]
     fn launch_prompt_points_at_the_file_and_carries_no_briefing_data() {
-        let prompt = launch_prompt("/tmp/ccoptimizer-briefing-123.md", "/tmp/cc.db");
+        let prompt = launch_prompt("/tmp/cclens-briefing-123.md", "/tmp/cc.db");
         // The instructions, the store pointer, and the file pointer must be present...
         assert!(prompt.contains("Claude Code optimization advisor"));
         assert!(prompt.contains("--db /tmp/cc.db"));
-        assert!(prompt.contains("/tmp/ccoptimizer-briefing-123.md"));
+        assert!(prompt.contains("/tmp/cclens-briefing-123.md"));
         assert!(prompt.contains("Read that file in full"));
         // ...but none of the analysis (which goes to the file) leaks onto argv.
-        assert!(!prompt.contains("# ccoptimizer analysis"));
+        assert!(!prompt.contains("# cclens analysis"));
     }
 
     #[test]

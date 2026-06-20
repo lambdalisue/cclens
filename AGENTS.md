@@ -1,4 +1,4 @@
-# ccoptimizer
+# cclens
 
 A CLI that analyzes Claude Code usage to show **where your Claude Code
 configuration can be optimized, and how**. It measures the **cost** (context

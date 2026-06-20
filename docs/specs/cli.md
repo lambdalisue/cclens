@@ -1,15 +1,15 @@
 # CLI Specification
 
 The CLI is the user's surface onto the stages (`architecture.md`): `analyze`
-populates the store, `report` reads it, and `optimize` hands the findings to an
-interactive `claude` session. This spec defines the command contract and the
-reporting model; exact flag spellings live with the implementation and stay in
-sync via `.claude/rules/spec-sync.md`.
+populates the store, the **views** and `sql` read it, and `optimize` hands the
+findings to an interactive `claude` session. This spec defines the command
+contract and the reporting model; exact flag spellings live with the
+implementation and stay in sync via `.claude/rules/spec-sync.md`.
 
 ## `analyze` — populate the store
 
 ```
-ccoptimizer analyze [--projects <dir>] [--config <dir>] [--db <path>]
+cclens analyze [--projects <dir>] [--config <dir>] [--db <path>]
 ```
 
 Reads both Claude Code inputs — session transcripts (default
@@ -22,32 +22,33 @@ catalog rebuilt from current config (`storage.md`). The verb is `analyze`, not
 `analyze` reads everything **read-only** and never copies input into the repo or
 the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).
 
-## `report` — read the store
+## Views — read the store
 
 ```
-ccoptimizer report [<view>] [--by <bucket>] [--since <t>] [--until <t>]
-                   [--tz <zone>] [--kind <surface-kind>] [--project <name>]
-                   [--format table|markdown] [--db <path>]
+cclens <view> [--by <bucket>] [--project <name>] [--format table|markdown] [--db <path>]
 ```
 
-`report` only queries the store; it never touches raw input. Views answer the
-tool's core questions:
+Each view is its own top-level command; they only query the store, never raw
+input. The set is deliberately curated — a view earns a command by carrying
+logic a one-line query cannot (a classification, an algorithm, a suggestion). Any
+*other* slice is a `sql` query (below), so thin "just count a column" views are
+not commands.
 
 | View | Answers |
 | --- | --- |
 | `summary` | The entry point: a one-screen health check that pulls the few most actionable findings from every view (token destinations, always-on cost, top fixable friction — annotated with the project a category concentrates in — cd overhead + worst thrash, unused config, prompting) into one prioritised report — so the tool answers "what should I do" without running ten commands. |
-| `surfaces` (default) | The catalog×usage join per surface: static cost, load mode, usage, cost — the optimization wedges (`surfaces.md`), ranked. |
-| `usage` | Event rollups: per surface and/or per time bucket — frequency, tokens, `ctx_growth`, duration. The default per-skill view leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
+| `surfaces` | The catalog×usage join per surface: static cost, load mode, usage, cost — the optimization wedges (`surfaces.md`), ranked. |
+| `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
 | `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence. |
 | `baseline` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
-| `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing. This analyses the *work*, not the config — where the real cost is. Recurring failures are fixable friction (e.g. many path-not-found → a file map in CLAUDE.md). The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--project <slug>` restricts the view to one project so the fix lands in the right config — the same per-project breakdown lets `summary` name the project a category concentrates in. Lexical heuristics. |
-| `hotspots` | Files Claude edits most (from `Edit`/`Write` targets) — where effort and churn concentrate; a very high count can flag a file it keeps struggling with. |
-| `commands` | The Bash command mix and the `cd` overhead. Observed: ~half of all Bash calls were `cd` — a working-dir convention would cut that churn. |
-| `thrash` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. Unlike a flat hotspot count, this isolates *where Claude got stuck and kept retrying* from healthy spread-out editing. Observed: a file edited 25× in under 8 minutes. |
+| `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--project <slug>` restricts to one project so the fix lands in the right config. Lexical heuristics. |
+| `thrash` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. |
 
-Filters (`--kind`, `--project`, `--since/--until`) narrow any view. Output is a
-terminal **table** by default or **Markdown** for pasting into notes/PRs.
+Output is a terminal **table** by default or **Markdown** (`--format markdown`)
+for pasting into notes/PRs. Slices not covered here — the Bash command mix, the
+most-edited files, an error category broken down any way — are a `sql` one-liner;
+those once had thin `commands`/`hotspots` views, dropped once `sql` existed.
 
 ## Time bucketing
 
@@ -92,12 +93,12 @@ spike a reader over-trusts; one combined flag says "read this number loosely".
 ## `sql` — query the store directly
 
 ```
-ccoptimizer sql [<query>] [--format table|markdown] [--db <path>]
+cclens sql [<query>] [--format table|markdown] [--db <path>]
 ```
 
 The store's own query surface: run an arbitrary read query and print the result.
 The query is the argument, or — when omitted — read from **stdin**, so both
-`ccoptimizer sql "SELECT …"` and `echo "SELECT …" | ccoptimizer sql` work (stdin
+`cclens sql "SELECT …"` and `echo "SELECT …" | cclens sql` work (stdin
 sidesteps shell quoting for complex queries). This exists because the tool is a
 *session-analysis* tool: anyone wanting a slice the fixed views do not cover —
 notably the `optimize` session chasing a root cause — should query the analyzed
@@ -113,7 +114,7 @@ otherwise overloaded onto generic event columns (`category`, `excerpt`, `tool`,
 ## `optimize` — act on the findings with an interactive `claude` session
 
 ```
-ccoptimizer optimize [--projects <dir>] [--db <path>] [--skip-analyze] [--print]
+cclens optimize [--projects <dir>] [--db <path>] [--skip-analyze] [--print]
 ```
 
 The AI-proposal consumer (`architecture.md`): rather than emit static
@@ -142,8 +143,8 @@ locate the failures. The tool split also separates true file friction from a
 browser-automation miss that merely reads as "not found". The briefing is the
 *headline*; for any deeper slice (the full failing-path list, a worktree split,
 arbitrary groupings) the prompt directs the session to **query the store with
-`ccoptimizer sql`** rather than re-parse the raw transcripts in Python — the
-store is exactly the analysis surface ccoptimizer exists to provide. It still
+`cclens sql`** rather than re-parse the raw transcripts in Python — the
+store is exactly the analysis surface cclens exists to provide. It still
 spends its effort on the evidence the store cannot hold (the real CLAUDE.md,
 rules, hooks). Embedding the headline plus pointing at the queryable store is
 what stops the seeded session from re-deriving what `analyze` already computed.

@@ -30,7 +30,7 @@ use crate::store::{SessionMeta, Store};
 
 #[derive(Parser)]
 #[command(
-    name = "ccoptimizer",
+    name = "cclens",
     about = "Analyze your Claude Code sessions — usage, cost, and where the work stumbles"
 )]
 pub struct Cli {
@@ -46,18 +46,18 @@ enum Command {
         #[arg(long)]
         projects: Option<PathBuf>,
         /// Output store path.
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Report skill usage from the store — per skill, or per time bucket.
-    Report {
+    /// Skill usage from the store — per skill, or per time bucket.
+    Usage {
         /// Bucket usage by time: year | month | week | day | hour (JST).
         #[arg(long)]
         by: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Join the skill catalog against usage — installed skills, their cost, and
@@ -66,7 +66,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// List optimization opportunities (unused, always-on heavy, costly+rare),
@@ -75,7 +75,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Reconcile the measured always-on context against your readable config —
@@ -85,7 +85,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Show how you steer the session — the mix of steering / correcting /
@@ -94,7 +94,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Where the work stumbles: recurring tool failures by category, ranked,
@@ -107,23 +107,7 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
-        db: PathBuf,
-    },
-    /// Files Claude edits most — where effort and churn concentrate.
-    Hotspots {
-        /// Output format: table | markdown.
-        #[arg(long)]
-        format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
-        db: PathBuf,
-    },
-    /// The Bash command mix — what Claude runs most, and the `cd` overhead.
-    Commands {
-        /// Output format: table | markdown.
-        #[arg(long)]
-        format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Thrash episodes — bursts of rapid re-edits to one file, where Claude got
@@ -132,25 +116,25 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// One-screen health check: the few most actionable findings across every
     /// view, prioritised. Start here.
     Summary {
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Run an arbitrary read-only SQL query against the analyzed store. The query
     /// is the argument, or read from stdin when omitted (so `echo 'SELECT …' |
-    /// ccoptimizer sql` works). A `tool_errors` view names the friction columns.
+    /// cclens sql` works). A `tool_errors` view names the friction columns.
     Sql {
         /// The SQL to run. If omitted, the query is read from stdin.
         query: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Analyze, then hand the findings to an interactive `claude` session so you
@@ -161,7 +145,7 @@ enum Command {
         #[arg(long)]
         projects: Option<PathBuf>,
         /// Store to analyze into / read from.
-        #[arg(long, default_value = "ccoptimizer.db")]
+        #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
         /// Use the existing store as-is; skip the analyze step.
         #[arg(long)]
@@ -175,8 +159,8 @@ enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Analyze { projects, db } => analyze(projects, &db),
-        Command::Report { by, format, db } => {
-            report(by.as_deref(), parse_format(format.as_deref())?, &db)
+        Command::Usage { by, format, db } => {
+            usage(by.as_deref(), parse_format(format.as_deref())?, &db)
         }
         Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
         Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
@@ -187,8 +171,6 @@ pub fn run() -> Result<()> {
             format,
             db,
         } => friction(project.as_deref(), parse_format(format.as_deref())?, &db),
-        Command::Hotspots { format, db } => hotspots(parse_format(format.as_deref())?, &db),
-        Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
         Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
         Command::Summary { db } => summary(&db),
         Command::Sql { query, format, db } => {
@@ -220,7 +202,7 @@ fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: boo
     let store = Store::open(db).context("open store")?;
     let findings = collect_findings(&store)?;
 
-    // The absolute store path so the session's `ccoptimizer sql --db …` hits the
+    // The absolute store path so the session's `cclens sql --db …` hits the
     // store this run built, wherever it is launched from.
     let db_display = std::fs::canonicalize(db)
         .map(|p| p.to_string_lossy().into_owned())
@@ -257,7 +239,7 @@ fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut path = std::env::temp_dir();
-    path.push(format!("ccoptimizer-briefing-{}.md", std::process::id()));
+    path.push(format!("cclens-briefing-{}.md", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -438,7 +420,7 @@ fn config_wedges(
 
 /// Run a read-only SQL query against the store and print the result. The query
 /// comes from the argument or, when absent, from stdin — so both
-/// `ccoptimizer sql '…'` and `echo '…' | ccoptimizer sql` work. The store is
+/// `cclens sql '…'` and `echo '…' | cclens sql` work. The store is
 /// opened read-only so an ad-hoc query can never mutate the derived data.
 fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let query = match query {
@@ -612,68 +594,6 @@ fn thrash(format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Files Claude edits most. A high edit count is where effort concentrates — and
-/// can flag churn (re-editing the same file many times = struggling).
-fn hotspots(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
-    let counts = store.work_counts("file_edit")?;
-    if counts.is_empty() {
-        println!("no edits found — run `ccoptimizer analyze` first");
-        return Ok(());
-    }
-    let rows: Vec<Vec<String>> = counts
-        .iter()
-        .take(25)
-        .map(|(file, n)| vec![file.clone(), n.to_string()])
-        .collect();
-    render(
-        &["file", "edits"],
-        &[Align::Left, Align::Right],
-        &rows,
-        format,
-    );
-    Ok(())
-}
-
-/// The Bash command mix, and how much of it is `cd` overhead.
-fn commands(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
-    let counts = store.work_counts("bash_cmd")?;
-    let total: i64 = counts.iter().map(|(_, n)| n).sum();
-    if total == 0 {
-        println!("no Bash commands found — run `ccoptimizer analyze` first");
-        return Ok(());
-    }
-    let rows: Vec<Vec<String>> = counts
-        .iter()
-        .take(20)
-        .map(|(cmd, n)| {
-            let pct = (*n as f64 * 100.0 / total as f64).round() as i64;
-            vec![cmd.clone(), n.to_string(), format!("{pct}%")]
-        })
-        .collect();
-    render(
-        &["command", "count", "share"],
-        &[Align::Left, Align::Right, Align::Right],
-        &rows,
-        format,
-    );
-
-    let cd = counts
-        .iter()
-        .find(|(c, _)| c == "cd")
-        .map_or(0, |(_, n)| *n);
-    let cd_pct = (cd as f64 * 100.0 / total as f64).round() as i64;
-    println!("\n{total} Bash commands");
-    if cd_pct >= 25 {
-        println!(
-            "  - {cd_pct}% are `cd` ({cd}): a lot of directory churn — absolute paths or a \
-             working-dir convention (noted in CLAUDE.md) would cut it."
-        );
-    }
-    Ok(())
-}
-
 /// Where the work stumbles: recurring tool failures by category, ranked, each
 /// with what it suggests fixing. This is about the work, not the config —
 /// recurring failures are fixable friction that wastes turns and tokens.
@@ -694,7 +614,7 @@ fn friction(project: Option<&str>, format: Format, db: &Path) -> Result<()> {
     if total == 0 {
         match project {
             Some(name) => println!("no tool failures found for project `{name}`"),
-            None => println!("no tool failures found — run `ccoptimizer analyze` first"),
+            None => println!("no tool failures found — run `cclens analyze` first"),
         }
         return Ok(());
     }
@@ -727,7 +647,7 @@ fn prompts(format: Format, db: &Path) -> Result<()> {
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if total == 0 {
-        println!("no prompts found — run `ccoptimizer analyze` first");
+        println!("no prompts found — run `cclens analyze` first");
         return Ok(());
     }
 
@@ -786,7 +706,7 @@ fn baseline(format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
     let floor = store.baseline_floor()?;
     if floor == 0 {
-        println!("no data — run `ccoptimizer analyze` first");
+        println!("no data — run `cclens analyze` first");
         return Ok(());
     }
     let config = store.always_on_config_tokens()?;
@@ -903,31 +823,31 @@ fn subagent_costs(transcript: &Path) -> Vec<(String, u64)> {
     costs
 }
 
-fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
+fn usage(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
             .with_context(|| format!("unknown --by value '{by}' (year|month|week|day|hour)"))?;
-        return report_by_time(&store, bucket, format);
+        return usage_by_time(&store, bucket, format);
     }
 
-    let usage = store.skill_usage()?;
-    if usage.is_empty() {
-        println!("no skill usage found — run `ccoptimizer analyze` first");
+    let skills = store.skill_usage()?;
+    if skills.is_empty() {
+        println!("no skill usage found — run `cclens analyze` first");
         return Ok(());
     }
 
     // Where the tokens actually go: main-thread skill output vs subagents. The
     // subagent figure is usually the larger by far — worth seeing before reading
     // the per-skill table.
-    let main_out: i64 = usage.iter().map(|row| row.out_tokens).sum();
+    let main_out: i64 = skills.iter().map(|row| row.out_tokens).sum();
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
     println!(
         "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)\n"
     );
 
-    let rows: Vec<Vec<String>> = usage
+    let rows: Vec<Vec<String>> = skills
         .iter()
         .map(|row| {
             vec![
@@ -956,10 +876,10 @@ fn report(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
 
 /// Skill usage rolled up per time bucket (JST). A long span is assigned whole to
 /// its start bucket (`docs/specs/cli.md`).
-fn report_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
+fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
     let events = store.skill_event_costs()?;
     if events.is_empty() {
-        println!("no skill usage found — run `ccoptimizer analyze` first");
+        println!("no skill usage found — run `cclens analyze` first");
         return Ok(());
     }
 
@@ -1028,7 +948,7 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
     let usage = store.usage_counts()?;
 
     if catalog.is_empty() && usage.is_empty() {
-        println!("nothing catalogued — run `ccoptimizer analyze` first");
+        println!("nothing catalogued — run `cclens analyze` first");
         return Ok(());
     }
 
@@ -1142,7 +1062,7 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
     }
 
     if found.is_empty() {
-        println!("no optimization wedges found — run `ccoptimizer analyze` first");
+        println!("no optimization wedges found — run `cclens analyze` first");
         return Ok(());
     }
 

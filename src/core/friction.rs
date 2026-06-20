@@ -20,6 +20,18 @@ pub enum ErrorCategory {
     TestFailure,
     /// An operation timed out.
     Timeout,
+    /// A non-MCP tool name that does not exist (wrong/deferred tool).
+    ToolNotAvailable,
+    /// A tool was called with invalid arguments.
+    InputValidation,
+    /// An MCP server returned an error (auth, validation, upstream).
+    McpError,
+    /// A user-stopped or cascade-cancelled call — not a code failure.
+    Cancelled,
+    /// A transient infrastructure error (model unavailable, etc.).
+    Transient,
+    /// A generic command failure (non-zero exit) with no more specific cause.
+    CommandFailed,
     /// Anything else.
     Other,
 }
@@ -34,6 +46,12 @@ impl ErrorCategory {
             ErrorCategory::CompileError => "compile-error",
             ErrorCategory::TestFailure => "test-failure",
             ErrorCategory::Timeout => "timeout",
+            ErrorCategory::ToolNotAvailable => "tool-not-available",
+            ErrorCategory::InputValidation => "input-validation",
+            ErrorCategory::McpError => "mcp-error",
+            ErrorCategory::Cancelled => "cancelled",
+            ErrorCategory::Transient => "transient",
+            ErrorCategory::CommandFailed => "command-failed",
             ErrorCategory::Other => "other",
         }
     }
@@ -48,6 +66,12 @@ impl ErrorCategory {
             "compile-error" => ErrorCategory::CompileError,
             "test-failure" => ErrorCategory::TestFailure,
             "timeout" => ErrorCategory::Timeout,
+            "tool-not-available" => ErrorCategory::ToolNotAvailable,
+            "input-validation" => ErrorCategory::InputValidation,
+            "mcp-error" => ErrorCategory::McpError,
+            "cancelled" => ErrorCategory::Cancelled,
+            "transient" => ErrorCategory::Transient,
+            "command-failed" => ErrorCategory::CommandFailed,
             _ => ErrorCategory::Other,
         }
     }
@@ -70,6 +94,19 @@ impl ErrorCategory {
             }
             ErrorCategory::TestFailure => "flaky or hard tests; worth stabilising the worst",
             ErrorCategory::Timeout => "slow commands; raise timeout or split the work",
+            ErrorCategory::ToolNotAvailable => {
+                "a tool was called by a name that doesn't exist — wrong/deferred tool"
+            }
+            ErrorCategory::InputValidation => "tool called with invalid arguments",
+            ErrorCategory::McpError => "an MCP server erroring (auth/validation/upstream)",
+            ErrorCategory::Cancelled => {
+                "not a code failure: a user stop or parallel-cascade cancel; frequent stops \
+                 may mean the work went off-track"
+            }
+            ErrorCategory::Transient => {
+                "transient infra (e.g. model unavailable) — not yours to fix"
+            }
+            ErrorCategory::CommandFailed => "a command exited non-zero; cause unclassified",
             ErrorCategory::Other => "uncategorised — inspect the raw errors",
         }
     }
@@ -87,12 +124,27 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("file has not been read yet")
     {
         ErrorCategory::EditPrecondition
+    } else if has("cancelled: parallel tool call")
+        || has("request interrupted by user")
+        || has("the user doesn't want to proceed")
+    {
+        // User stop or a sibling failing in a parallel batch — not a code fault.
+        ErrorCategory::Cancelled
     } else if has("permission for this action was denied")
         || has("enforce-perl")
         || has("use perl instead")
         || has("denied by")
+        || has("blocked:")
     {
         ErrorCategory::BlockedByHook
+    } else if has("temporarily unavailable") || has("overloaded") {
+        ErrorCategory::Transient
+    } else if has("no such tool available") {
+        ErrorCategory::ToolNotAvailable
+    } else if has("inputvalidationerror") || has("input validation error") {
+        ErrorCategory::InputValidation
+    } else if has("mcp error") {
+        ErrorCategory::McpError
     } else if has("command not found") || has("is not recognized") {
         ErrorCategory::CommandNotFound
     } else if has("no such file") || has("does not exist") || has("cannot find the path") {
@@ -103,6 +155,9 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         ErrorCategory::TestFailure
     } else if has("timed out") || has("timeout") {
         ErrorCategory::Timeout
+    } else if has("exit code") {
+        // Generic non-zero exit, checked last so specific causes above win.
+        ErrorCategory::CommandFailed
     } else {
         ErrorCategory::Other
     }
@@ -165,6 +220,52 @@ mod tests {
         assert_eq!(
             classify_error("Command timed out after 120s"),
             ErrorCategory::Timeout
+        );
+    }
+
+    #[test]
+    fn user_stops_and_cascades_are_cancelled_not_failures() {
+        assert_eq!(
+            classify_error("<tool_use_error>Cancelled: parallel tool call Bash(grep ...)"),
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(
+            classify_error("The user doesn't want to proceed with this tool use."),
+            ErrorCategory::Cancelled
+        );
+    }
+
+    #[test]
+    fn infra_tool_and_validation_errors() {
+        assert_eq!(
+            classify_error("claude-opus-4-8 is temporarily unavailable"),
+            ErrorCategory::Transient
+        );
+        assert_eq!(
+            classify_error("<tool_use_error>Error: No such tool available: Glob"),
+            ErrorCategory::ToolNotAvailable
+        );
+        assert_eq!(
+            classify_error("InputValidationError: Read failed"),
+            ErrorCategory::InputValidation
+        );
+        assert_eq!(
+            classify_error("MCP error -32602: Input validation"),
+            ErrorCategory::McpError
+        );
+    }
+
+    #[test]
+    fn a_specific_cause_beats_generic_exit_code() {
+        // A compile error that also prints "Exit code 1" is a compile error.
+        assert_eq!(
+            classify_error("error[E0599]: no method\nExit code 1"),
+            ErrorCategory::CompileError
+        );
+        // A bare non-zero exit with no known cause is command-failed.
+        assert_eq!(
+            classify_error("Exit code 2 (eval): bad substitution"),
+            ErrorCategory::CommandFailed
         );
     }
 

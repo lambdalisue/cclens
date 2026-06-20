@@ -330,6 +330,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// Tool-failure counts split by project and category, densest pair first.
+    /// Joins each error event back to its session's project so a friction
+    /// category can be attributed to the project whose config should carry the
+    /// fix — backing a `--project` filter and the dominant-project line in the
+    /// summary.
+    pub fn error_counts_by_project(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, e.surface_id, COUNT(*)
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.kind = 'tool_error'
+             GROUP BY s.project, e.surface_id
+             ORDER BY COUNT(*) DESC, s.project, e.surface_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Counts of prompts by behavioral class (`source` column on prompt events),
     /// most frequent first.
     pub fn prompt_behavior_counts(&self) -> Result<Vec<(String, i64)>> {
@@ -731,5 +750,38 @@ mod tests {
         let catalog = store.catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "new");
+    }
+
+    #[test]
+    fn error_counts_break_down_by_project_and_category() {
+        let mut store = Store::in_memory().unwrap();
+        // Two projects, the same category concentrated in one of them.
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        let mut beta = session("b1");
+        beta.project = "beta".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store.ingest_session(&beta, &[], &[]).unwrap();
+        store
+            .ingest_tool_errors(
+                "a1",
+                &alpha.source_path,
+                &[(100, "edit-precondition"), (200, "edit-precondition")],
+            )
+            .unwrap();
+        store
+            .ingest_tool_errors("b1", &beta.source_path, &[(300, "edit-precondition")])
+            .unwrap();
+
+        let rows = store.error_counts_by_project().unwrap();
+
+        // Densest (project, category) pair first — alpha owns the friction.
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha".to_string(), "edit-precondition".to_string(), 2),
+                ("beta".to_string(), "edit-precondition".to_string(), 1),
+            ]
+        );
     }
 }

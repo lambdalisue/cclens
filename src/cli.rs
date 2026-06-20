@@ -99,6 +99,10 @@ enum Command {
     /// Where the work stumbles: recurring tool failures by category, ranked,
     /// with what each suggests fixing.
     Friction {
+        /// Restrict to one project (its cwd slug) — see which project owns the
+        /// friction so its config can carry the fix.
+        #[arg(long)]
+        project: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -148,7 +152,11 @@ pub fn run() -> Result<()> {
         Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
         Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
         Command::Prompts { format, db } => prompts(parse_format(format.as_deref())?, &db),
-        Command::Friction { format, db } => friction(parse_format(format.as_deref())?, &db),
+        Command::Friction {
+            project,
+            format,
+            db,
+        } => friction(project.as_deref(), parse_format(format.as_deref())?, &db),
         Command::Hotspots { format, db } => hotspots(parse_format(format.as_deref())?, &db),
         Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
         Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
@@ -188,11 +196,24 @@ fn summary(db: &Path) -> Result<()> {
         .filter(|(label, _)| !noise.contains(&label.as_str()))
         .collect();
     if !friction.is_empty() {
+        // Per-category project breakdown, so each line can name the project that
+        // owns the friction when it concentrates there.
+        let mut by_cat: std::collections::HashMap<String, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        for (proj, label, n) in store.error_counts_by_project()? {
+            by_cat.entry(label).or_default().push((proj, n));
+        }
+        let dominant = |label: &str, total: i64| -> Option<String> {
+            let (proj, n) = by_cat.get(label)?.iter().max_by_key(|(_, n)| *n)?;
+            // Only call it out when one project owns the clear majority.
+            (*n * 2 > total).then(|| format!(" — mostly in `{proj}`"))
+        };
         println!("\n== top fixable friction ==");
         for (label, n) in friction.iter().take(3) {
             println!(
-                "  {n:>4}  {label} — {}",
-                ErrorCategory::from_label(label).suggestion()
+                "  {n:>4}  {label} — {}{}",
+                ErrorCategory::from_label(label).suggestion(),
+                dominant(label, *n).unwrap_or_default()
             );
         }
     }
@@ -373,12 +394,25 @@ fn commands(format: Format, db: &Path) -> Result<()> {
 /// Where the work stumbles: recurring tool failures by category, ranked, each
 /// with what it suggests fixing. This is about the work, not the config —
 /// recurring failures are fixable friction that wastes turns and tokens.
-fn friction(format: Format, db: &Path) -> Result<()> {
+fn friction(project: Option<&str>, format: Format, db: &Path) -> Result<()> {
     let store = Store::open(db).context("open store")?;
-    let counts = store.error_counts()?;
+    // With --project, fold the per-project breakdown down to one project's
+    // categories; without it, the global per-category counts.
+    let counts: Vec<(String, i64)> = match project {
+        Some(name) => store
+            .error_counts_by_project()?
+            .into_iter()
+            .filter(|(proj, _, _)| proj == name)
+            .map(|(_, label, n)| (label, n))
+            .collect(),
+        None => store.error_counts()?,
+    };
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if total == 0 {
-        println!("no tool failures found — run `ccoptimizer analyze` first");
+        match project {
+            Some(name) => println!("no tool failures found for project `{name}`"),
+            None => println!("no tool failures found — run `ccoptimizer analyze` first"),
+        }
         return Ok(());
     }
 

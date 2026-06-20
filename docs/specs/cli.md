@@ -1,9 +1,10 @@
 # CLI Specification
 
-The CLI is the user's surface onto the two stages (`architecture.md`). It is
-deliberately small: one command to populate the store, one to read it. This spec
-defines the command contract and the reporting model; exact flag spellings live
-with the implementation and stay in sync via `.claude/rules/spec-sync.md`.
+The CLI is the user's surface onto the stages (`architecture.md`): `analyze`
+populates the store, `report` reads it, and `optimize` hands the findings to an
+interactive `claude` session. This spec defines the command contract and the
+reporting model; exact flag spellings live with the implementation and stay in
+sync via `.claude/rules/spec-sync.md`.
 
 ## `analyze` — populate the store
 
@@ -88,8 +89,23 @@ hour — the row is marked **low-confidence overall**, not merely tagged three
 times. Stacked approximations compound into exactly the kind of time-concentrated
 spike a reader over-trusts; one combined flag says "read this number loosely".
 
-## Not in the CLI (yet)
+## `optimize` — act on the findings with an interactive `claude` session
 
-There is no `recommend` / AI-proposal command. That consumer reads the same store
-but its surface is undesigned until decided (`architecture.md`), and is
-deliberately absent here rather than stubbed.
+```
+ccoptimizer optimize [--projects <dir>] [--db <path>] [--skip-analyze] [--print]
+```
+
+The AI-proposal consumer (`architecture.md`): rather than emit static
+"recommendations" the tool cannot safely act on, `optimize` analyzes (unless
+`--skip-analyze`), composes the headline findings with a prescribed advisor
+prompt, and launches `claude` seeded with it — so the user optimizes
+*interactively*, with an agent that can read their config and apply edits on
+agreement. The prompt instructs the session to prioritise work friction over
+config size, verify before recommending removal (an "unused" skill may be
+invoked by subagents), and change nothing without the user's say-so.
+
+The split mirrors the rest of the tool: prompt composition is a pure transform
+(`core::optimize` — the prescribed instructions plus a Markdown briefing of the
+findings, each empty section omitted), and only the process launch is I/O.
+`--print` writes the composed prompt to stdout instead of launching `claude`,
+for piping into another tool or inspecting what would be sent.

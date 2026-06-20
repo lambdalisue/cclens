@@ -158,5 +158,5 @@ The core computes the join and the wedge classifications above from thresholds
 injected as tuning constants (what counts as "high cost", "low usage"). It does
 **not** rank surfaces against each other by importance, infer intent, or decide
 that a wedge should be acted on — those judgements belong to the human reading
-the report, or to the future AI proposal layer that consumes this same joined
-data.
+the report, or to the `optimize` AI-proposal session that consumes this same
+joined data.

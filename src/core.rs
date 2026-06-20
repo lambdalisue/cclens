@@ -4,6 +4,7 @@
 pub mod bucket;
 pub mod friction;
 pub mod metrics;
+pub mod optimize;
 pub mod prompt;
 pub mod span;
 pub mod surface;

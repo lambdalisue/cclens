@@ -30,7 +30,7 @@ The design follows from three facts about the problem:
 flowchart LR
     raw["transcripts + config"] -->|analyze| db[("SQLite<br/>sessions · surfaces · events")]
     db -->|report| out["CLI tables / Markdown"]
-    db -.->|future| ai["AI optimization proposals"]
+    db -->|optimize| ai["interactive claude session<br/>(AI optimization proposals)"]
 ```
 
 - **`analyze`** reads both inputs and writes the normalized store. The verb is
@@ -39,12 +39,15 @@ flowchart LR
 - **`report`** queries the store and renders. See `cli.md`.
 
 The stages are decoupled *only* by the store. `report` never reads raw input;
-`analyze` never renders. Future consumers read the same store; their surfaces
-are deliberately undesigned until decided, and absent from these specs until
-then. Two are anticipated, and shape what `analyze` must capture now:
+`analyze` never renders. Consumers read the same store. Two were anticipated,
+and shape what `analyze` must capture:
 
-- **Optimization proposals** — turning the wedges (`surfaces.md`) into concrete
-  advice. Reads aggregates; needs nothing the store does not already hold.
+- **Optimization proposals** — turning the findings into concrete advice. This
+  is realized by `optimize` (`cli.md`): it composes the headline findings with a
+  prescribed advisor prompt and hands them to an interactive `claude` session.
+  The prompt composition is a pure transform (`core::optimize`); only the process
+  launch is I/O. It reads aggregates; it needs nothing the store does not already
+  hold.
 - **Skill extraction** — clustering recurring user prompts into candidate new
   skills (the "synthesize a new surface" goal, distinct from pruning existing
   ones). This needs the **raw prompt text**, which the store does not keep — so

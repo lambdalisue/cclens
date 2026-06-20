@@ -18,6 +18,7 @@ use crate::adapter::transcript::{
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
+use crate::core::optimize as optimize_mod;
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
@@ -140,6 +141,23 @@ enum Command {
         #[arg(long, default_value = "ccoptimizer.db")]
         db: PathBuf,
     },
+    /// Analyze, then hand the findings to an interactive `claude` session so you
+    /// can act on them together. Composes the analysis with a prescribed advisor
+    /// prompt and launches `claude` seeded with it.
+    Optimize {
+        /// Transcript root (default: ~/.claude/projects).
+        #[arg(long)]
+        projects: Option<PathBuf>,
+        /// Store to analyze into / read from.
+        #[arg(long, default_value = "ccoptimizer.db")]
+        db: PathBuf,
+        /// Use the existing store as-is; skip the analyze step.
+        #[arg(long)]
+        skip_analyze: bool,
+        /// Print the composed prompt instead of launching `claude`.
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -161,7 +179,155 @@ pub fn run() -> Result<()> {
         Command::Commands { format, db } => commands(parse_format(format.as_deref())?, &db),
         Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
         Command::Summary { db } => summary(&db),
+        Command::Optimize {
+            projects,
+            db,
+            skip_analyze,
+            print,
+        } => optimize(projects, &db, skip_analyze, print),
     }
+}
+
+/// Analyze, compose the advisor prompt from the findings, and hand it to an
+/// interactive `claude` session — the AI-proposal layer's entry point. The pure
+/// composition lives in `core::optimize`; this shell does the I/O: run the
+/// analysis, read the store into `Findings`, then launch `claude` seeded with
+/// the prompt (or print it with `--print` for piping / inspection).
+fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: bool) -> Result<()> {
+    if !skip_analyze {
+        analyze(projects, db)?;
+    }
+    let store = Store::open(db).context("open store")?;
+    let prompt = optimize_mod::compose_prompt(&collect_findings(&store)?);
+
+    if print {
+        println!("{prompt}");
+        return Ok(());
+    }
+
+    // Hand over the terminal: `claude <prompt>` starts an interactive session
+    // seeded with the briefing, inheriting our stdio so the user takes over.
+    let status = std::process::Command::new("claude")
+        .arg(&prompt)
+        .status()
+        .context("launch `claude` — is Claude Code installed and on PATH?")?;
+    if !status.success() {
+        anyhow::bail!("claude exited with {status}");
+    }
+    Ok(())
+}
+
+/// Gather the headline findings the optimization briefing needs from the store —
+/// the same signals `summary` reports, as owned data for `core::optimize`.
+fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
+    let floor = store.baseline_floor()?;
+
+    // Per-category project breakdown, so a friction line can name the project
+    // that owns it when one holds the clear majority.
+    let mut by_cat: std::collections::HashMap<String, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (proj, label, n) in store.error_counts_by_project()? {
+        by_cat.entry(label).or_default().push((proj, n));
+    }
+    let dominant = |label: &str, total: i64| -> Option<String> {
+        let (proj, n) = by_cat.get(label)?.iter().max_by_key(|(_, n)| *n)?;
+        (*n * 2 > total).then(|| proj.clone())
+    };
+    let noise = ["cancelled", "transient", "other", "command-failed"];
+    let friction: Vec<optimize_mod::FrictionLine> = store
+        .error_counts()?
+        .into_iter()
+        .filter(|(label, _)| !noise.contains(&label.as_str()))
+        .take(5)
+        .map(|(label, count)| {
+            let dominant_project = dominant(&label, count);
+            optimize_mod::FrictionLine {
+                label,
+                count,
+                dominant_project,
+            }
+        })
+        .collect();
+
+    let bash = store.work_counts("bash_cmd")?;
+    let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
+    let cd_pct = (bash_total > 0).then(|| {
+        let cd = bash.iter().find(|(c, _)| c == "cd").map_or(0, |(_, n)| *n);
+        (cd as f64 * 100.0 / bash_total as f64).round() as i64
+    });
+
+    let edits = store.work_event_rows("file_edit")?;
+    let worst_thrash = detect_thrash(&edits, 5 * 60, 4)
+        .first()
+        .map(|w| optimize_mod::ThrashLine {
+            file: w.file.clone(),
+            edits: w.edits,
+            span_secs: w.span_secs(),
+        });
+
+    let (unused_count, always_on_heavy) = config_wedge_counts(store)?;
+
+    let pcounts = store.prompt_behavior_counts()?;
+    let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
+    let share = |name: &str| {
+        let n = pcounts
+            .iter()
+            .find(|(b, _)| b == name)
+            .map_or(0, |(_, n)| *n);
+        (n as f64 * 100.0 / ptotal as f64).round() as i64
+    };
+    let (steer_pct, correct_pct) = if ptotal > 0 {
+        (Some(share("steer")), Some(share("correct")))
+    } else {
+        (None, None)
+    };
+
+    let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    Ok(optimize_mod::Findings {
+        main_out: store.skill_usage()?.iter().map(|r| r.out_tokens).sum(),
+        sub_tokens,
+        sub_agents,
+        floor,
+        config_tokens: if floor > 0 {
+            store.always_on_config_tokens()?
+        } else {
+            0
+        },
+        friction,
+        cd_pct,
+        worst_thrash,
+        unused_count,
+        always_on_heavy,
+        steer_pct,
+        correct_pct,
+    })
+}
+
+/// Count the surfaces `wedges` would flag: unused-but-measurable and always-on
+/// heavy. Shared shape with the `summary` config line.
+fn config_wedge_counts(store: &Store) -> Result<(i64, i64)> {
+    let counts: std::collections::HashMap<(String, String), i64> = store
+        .usage_counts()?
+        .into_iter()
+        .map(|(k, i, c)| ((k, i), c))
+        .collect();
+    let mut unused_measurable = 0;
+    let mut always_on_heavy = 0;
+    for entry in store.catalog()? {
+        let uses = counts
+            .get(&(entry.kind.clone(), entry.id.clone()))
+            .copied()
+            .unwrap_or(0);
+        let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
+        let static_tokens = entry.static_tokens.map(|t| t as u64);
+        if is_usage_measurable(&entry.kind) && uses == 0 {
+            unused_measurable += 1;
+        }
+        if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
+            always_on_heavy += 1;
+        }
+    }
+    Ok((unused_measurable, always_on_heavy))
 }
 
 /// One-screen health check: pull the few most actionable findings from every
@@ -240,27 +406,7 @@ fn summary(db: &Path) -> Result<()> {
     }
 
     // Config worth cutting: count what `wedges` would flag with real savings.
-    let counts: std::collections::HashMap<(String, String), i64> = store
-        .usage_counts()?
-        .into_iter()
-        .map(|(k, i, c)| ((k, i), c))
-        .collect();
-    let mut unused_measurable = 0;
-    let mut always_on_heavy = 0;
-    for entry in store.catalog()? {
-        let uses = counts
-            .get(&(entry.kind.clone(), entry.id.clone()))
-            .copied()
-            .unwrap_or(0);
-        let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
-        let static_tokens = entry.static_tokens.map(|t| t as u64);
-        if is_usage_measurable(&entry.kind) && uses == 0 {
-            unused_measurable += 1;
-        }
-        if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
-            always_on_heavy += 1;
-        }
-    }
+    let (unused_measurable, always_on_heavy) = config_wedge_counts(&store)?;
     println!("\n== config ==");
     println!(
         "  {unused_measurable} unused surface(s), {always_on_heavy} always-on heavy — see `wedges`"

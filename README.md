@@ -23,6 +23,10 @@ cargo run -- analyze --db ccoptimizer.db
 # 2. Start here: one-screen health check — the few most actionable findings
 cargo run -- summary --db ccoptimizer.db
 
+# Act on the findings interactively — hands them to a `claude` session
+cargo run -- optimize --db ccoptimizer.db
+cargo run -- optimize --print --db ccoptimizer.db   # just print the prompt
+
 # 3. See where to optimize — ranked opportunities with a suggested action
 cargo run -- wedges --db ccoptimizer.db
 

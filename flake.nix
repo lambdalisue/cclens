@@ -1,6 +1,16 @@
 {
   description = "cclens — a lens onto your Claude Code usage";
 
+  # Advertise the shared Cachix cache so `nix run github:lambdalisue/cclens`
+  # pulls prebuilt artifacts instead of compiling from source. Trusted users
+  # get it automatically; others are prompted to accept it on first use.
+  nixConfig = {
+    extra-substituters = [ "https://cclens.cachix.org" ];
+    extra-trusted-public-keys = [
+      "cclens.cachix.org-1:0QUNU6PuVyf+yXOvg3n1rd3FksBoB3s3/Jty50iKRNQ="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";

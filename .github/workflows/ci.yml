@@ -19,6 +19,12 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      # Pull prebuilt toolchain/deps and push what this run builds. Pushing needs
+      # the auth token; forks/PRs without the secret fall back to pull-only.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: cclens
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       # Same pinned tools as local dev (flake devShell) — see flake.nix / justfile.
       - run: nix develop -c just check
 
@@ -31,4 +37,8 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v15
+        with:
+          name: cclens
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix develop -c just test

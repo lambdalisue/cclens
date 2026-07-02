@@ -110,6 +110,10 @@ into a SQLite store; querying it is the tool's job, so do NOT re-parse the raw \
     cclens sql \"SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC\"
     cclens sql \"SELECT target, COUNT(*) n FROM tool_errors WHERE category='edit-precondition' AND target<>'' GROUP BY target ORDER BY n DESC\"
     echo \"SELECT excerpt FROM tool_errors WHERE category='path-not-found'\" | cclens sql
+  If `cclens` is not on your PATH — e.g. this session was started via \
+`nix run github:lambdalisue/cclens` — run it through Nix wherever these instructions say \
+`cclens`, with the same subcommands and flags: \
+`nix run github:lambdalisue/cclens -- sql --db <path> \"SELECT …\"`.
   Re-running `cclens analyze` is unnecessary — the store is already current. Schema crib:
     - tool_errors(session_id, project, category, excerpt, tool, target, started_epoch): one row \
 per failed tool call. `category` = friction class, `excerpt` = the actual error text (carries \
@@ -364,6 +368,9 @@ mod tests {
         assert!(prompt.contains("cclens sql"));
         assert!(prompt.contains("--db /tmp/cc.db"));
         assert!(prompt.contains("# cclens analysis"));
+        // The session may have been launched via `nix run` (cclens not on PATH),
+        // so the prompt must document the Nix invocation as a substitution rule.
+        assert!(prompt.contains("nix run github:lambdalisue/cclens"));
     }
 
     #[test]
@@ -384,6 +391,7 @@ mod tests {
         assert!(prompt.contains("--db /tmp/cc.db"));
         assert!(prompt.contains("/tmp/cclens-briefing-123.md"));
         assert!(prompt.contains("Read that file in full"));
+        assert!(prompt.contains("nix run github:lambdalisue/cclens"));
         // ...but none of the analysis (which goes to the file) leaks onto argv.
         assert!(!prompt.contains("# cclens analysis"));
     }

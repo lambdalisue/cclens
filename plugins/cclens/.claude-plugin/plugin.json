@@ -1,0 +1,12 @@
+{
+  "name": "cclens",
+  "description": "Use cclens from Claude Code: a usage health check, an optimization advisor that acts on the findings, and ad-hoc SQL over the analyzed store.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Alisue",
+    "email": "lambdalisue@gmail.com"
+  },
+  "homepage": "https://github.com/lambdalisue/cclens",
+  "repository": "https://github.com/lambdalisue/cclens",
+  "keywords": ["claude-code", "usage", "tokens", "optimization"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "cclens",
+  "owner": {
+    "name": "Alisue",
+    "email": "lambdalisue@gmail.com"
+  },
+  "description": "Skills for driving cclens — analyze Claude Code usage, get a health check, act on the findings, and query the store — from inside a Claude Code session.",
+  "plugins": [
+    {
+      "name": "cclens",
+      "source": "./plugins/cclens",
+      "description": "Use cclens from Claude Code: /cclens:summary (health check), /cclens:optimize (investigate findings and propose config fixes), /cclens:query (ad-hoc SQL over the usage store)."
+    }
+  ]
+}

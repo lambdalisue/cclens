@@ -32,6 +32,28 @@ Plain Cargo also works (`cargo build --release`) if you have a recent stable
 Rust; the flake just pins it. CI runs `nix develop -c just check` / `just test`,
 and tagged releases (`vX.Y.Z`) build native binaries for Linux/macOS/Windows.
 
+## Claude Code plugin
+
+The repository is also a Claude Code plugin marketplace
+([`.claude-plugin/`](.claude-plugin/) + [`plugins/cclens/`](plugins/cclens/)),
+so you can drive cclens from inside a Claude Code session:
+
+```
+/plugin marketplace add lambdalisue/cclens
+/plugin install cclens@cclens
+```
+
+| Skill | What it does |
+| --- | --- |
+| `/cclens:summary` | Analyze and present the one-screen health check in the session. |
+| `/cclens:optimize` | The `cclens optimize` advisor, in the **current** session: investigate the findings to root cause and propose concrete config fixes. |
+| `/cclens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
+
+The skills use the `cclens` binary when it is on PATH and fall back to
+`nix run github:lambdalisue/cclens` otherwise. Outside this repository they
+keep the store at `~/.cache/cclens/cclens.db` instead of dropping a
+`cclens.db` into your project.
+
 ## Quick start
 
 ```sh

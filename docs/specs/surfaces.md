@@ -91,7 +91,7 @@ A wedge is only useful if it says how much *removing the surface saves at
 session start* — and that is not its static token count. Skills and agents load
 only their **description** at startup (their body is on-demand), so deleting an
 unused one is **decluttering**, not a token win, even if its body tokenizes
-large. The `wedges` view therefore ranks by `startup_savings` (see
+large. The `waste` view therefore ranks by `startup_savings` (see
 `core::surface`):
 
 - **measured tokens** — always-on config (`startup_full`): removing it saves that
@@ -135,7 +135,7 @@ session starts with. Comparing `sum(static_tokens WHERE load_mode = startup_full
 against that observed floor is the only evidence-backed form of the always-on
 claim.
 
-This is implemented as the `baseline` command (`cli.md`): it reports the observed
+This is implemented as the `overhead` command (`cli.md`): it reports the observed
 floor, the readable config that accounts for part of it, and the **residual** —
 the floor minus the config — which is everything not in the user's files: the
 system prompt, built-in tools, and **MCP tool schemas** the catalog cannot weigh

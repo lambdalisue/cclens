@@ -12,7 +12,7 @@ use crate::core::scope::ScopeFilter;
 /// the tool. Findings are pre-routed to the config layer that owns each fix
 /// (`core::scope`): the flat fields are the **global** picture, `projects`
 /// holds each project's own findings. The renderer stays pure and testable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Findings {
     pub main_out: i64,
     pub sub_tokens: i64,
@@ -44,7 +44,7 @@ pub struct Findings {
 /// One project's own findings: the friction it owns (strict-majority routing,
 /// `core::scope`), where the work got stuck, and its project-scoped config
 /// wedges — everything whose fix belongs in that project's config.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProjectFindings {
     pub project: String,
     /// The project's real root directory (empty when no session recorded one)
@@ -68,7 +68,7 @@ impl ProjectFindings {
 /// file friction is told apart from, say, a Playwright locator miss), and a few
 /// concrete example excerpts (the actual failing paths/files) — enough that the
 /// fix is obvious from the briefing alone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FrictionCat {
     pub label: String,
     pub count: i64,
@@ -79,7 +79,7 @@ pub struct FrictionCat {
 }
 
 /// A configuration surface referenced in the config sections.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SurfaceRef {
     pub kind: String,
     pub id: String,
@@ -87,7 +87,7 @@ pub struct SurfaceRef {
 }
 
 /// A thrash burst — a file re-edited many times in a short window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ThrashLine {
     pub file: String,
     pub edits: u32,
@@ -474,6 +474,20 @@ mod tests {
                 always_on_heavy: vec![],
             }],
         }
+    }
+
+    #[test]
+    fn findings_serialize_for_the_json_format() {
+        // `summary --format json` emits the routed findings as-is; the shape is
+        // the machine contract, so key names must be stable and typed.
+        let json = serde_json::to_value(findings()).unwrap();
+        assert_eq!(json["main_out"], 8_000_000);
+        assert_eq!(json["friction_global"][0]["label"], "blocked-by-hook");
+        assert_eq!(json["friction_global"][0]["projects"], 5);
+        assert_eq!(json["projects"][0]["project"], "alpha");
+        assert_eq!(json["projects"][0]["friction"][0]["count"], 92);
+        assert_eq!(json["projects"][0]["thrash"][0]["edits"], 25);
+        assert_eq!(json["unused"][0]["static_tokens"], 1345);
     }
 
     #[test]

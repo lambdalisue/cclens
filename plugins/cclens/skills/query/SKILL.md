@@ -45,7 +45,7 @@ sample the data before relying on an encoding:
 
 - `tool_errors` (view): one row per failed tool call —
   `session_id, project, category, excerpt, tool, target, started_epoch`.
-  `category` is the friction class (`edit-precondition`, `path-not-found`,
+  `category` is the failure class (`edit-precondition`, `path-not-found`,
   `blocked-by-hook`, …), `excerpt` the actual error text (carries the failing
   path), `target` the file/command when the text omits it, `project` the
   session's cwd slug.
@@ -56,5 +56,5 @@ sample the data before relying on an encoding:
 
 Answer the user's actual question, with the query you ran shown so it can be
 tweaked. Timestamps in the store are UTC epoch — convert before presenting.
-For "how is my setup doing overall", point at `/cclens:summary` instead of
+For "how is my setup doing overall", point at `/cclens:doctor` instead of
 assembling it by hand.

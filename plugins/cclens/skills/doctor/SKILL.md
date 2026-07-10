@@ -1,9 +1,9 @@
 ---
-name: summary
-description: One-screen health check of the user's Claude Code usage via cclens — where tokens go, always-on context cost, recurring tool friction, unused config. Use when the user asks how their Claude Code setup is doing, where time or tokens are being spent or wasted, or for a cclens summary / health check.
+name: doctor
+description: One-screen health check of the user's Claude Code usage via cclens — where tokens go, always-on context cost, recurring tool failures, unused config. Use when the user asks how their Claude Code setup is doing, where time or tokens are being spent or wasted, or for a cclens doctor / health check.
 ---
 
-# cclens summary — usage health check
+# cclens doctor — usage health check
 
 Run cclens over the user's Claude Code transcripts and config, then present the
 one-screen health check. Everything runs locally and read-only over
@@ -29,13 +29,12 @@ one-screen health check. Everything runs locally and read-only over
 ## 2. Report
 
 ```sh
-cclens summary --db "$DB"
+cclens doctor --db "$DB"
 ```
 
-`summary` refreshes the store automatically (incremental; fast when current)
+`doctor` refreshes the store automatically (incremental; fast when current)
 and prints a freshness line on stderr. If the user asked about one layer, add
-`--scope global` or `--scope project:<slug>`. (`summary` has no `--format`
-flag; the individual views do.)
+`--scope global` or `--scope project:<slug>`. (`doctor` has a `--format json` for machine use, but present the default text form.)
 
 ## 3. Present
 

@@ -9,7 +9,7 @@
     {
       "name": "cclens",
       "source": "./plugins/cclens",
-      "description": "Use cclens from Claude Code: /cclens:summary (health check), /cclens:optimize (investigate findings and propose config fixes), /cclens:query (ad-hoc SQL over the usage store)."
+      "description": "Use cclens from Claude Code: /cclens:doctor (health check), /cclens:optimize (investigate findings and propose config fixes), /cclens:query (ad-hoc SQL over the usage store)."
     }
   ]
 }

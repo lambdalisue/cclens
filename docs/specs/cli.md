@@ -26,7 +26,7 @@ the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).
 
 ```
 cclens <view> [--scope global|project[:<slug>]] [--by <bucket>] [--frozen]
-              [--format table|markdown] [--db <path>]
+              [--format table|markdown|json] [--db <path>]
 ```
 
 Each view is its own top-level command; their queries only read the store, never
@@ -63,25 +63,48 @@ routed (`core::scope`):
   totals** are behavioral, hence global.
 
 `--scope` narrows a report to one layer: `global`, `project` (all projects), or
-`project:<slug>` (one). `summary`, the optimize briefing, and (by default) the
+`project:<slug>` (one). `doctor`, the optimize briefing, and (by default) the
 scoped views show **both layers split into sections** rather than a merged
 ranking.
 
 | View | Answers |
 | --- | --- |
-| `summary` | The entry point: a one-screen health check that pulls the few most actionable findings from every view into one prioritised report, **split by owning layer** — a `== global ==` section (token destinations, always-on cost, spread friction, cd overhead, global config wedges, prompting) then a `== projects ==` section (each project's owned friction, worst thrash, project config wedges; capped, with a `--scope project` pointer) — so the tool answers "what should I do, and in which config" without running ten commands. |
-| `surfaces` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
+| `doctor` | The entry point: a one-screen health check **written for someone who has never seen cclens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
+| `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
-| `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
-| `baseline` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
+| `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
+| `overhead` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
-| `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Lexical heuristics. |
-| `thrash` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. |
+| `failures` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Lexical heuristics. |
+| `stuck` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. |
 
-Output is a terminal **table** by default or **Markdown** (`--format markdown`)
-for pasting into notes/PRs. Slices not covered here — the Bash command mix, the
-most-edited files, an error category broken down any way — are a `sql` one-liner;
-those once had thin `commands`/`hotspots` views, dropped once `sql` existed.
+### Output formats — human vs machine
+
+Every command has both a human form and a machine form, strictly separated:
+
+- **Human** (default `table`, plus `--format markdown` for pasting into
+  notes/PRs; `doctor` and `analyze` have their own text layouts instead of
+  markdown). The output must explain itself: every table opens with a dimmed
+  **framing block** saying what the view shows and how to read it (table
+  format only — markdown stays a bare table), headers are words rather than
+  abbreviations, and interpretation notes are dimmed footnotes. ANSI styling —
+  headings, dimmed context, highlighted counts and staleness warnings — turns
+  on only when stdout (stderr for the freshness line) is a terminal,
+  `NO_COLOR` is unset, and `TERM` is not `dumb`; pipes and captures always get
+  plain bytes. Styling is applied after column padding so it never skews table
+  alignment.
+- **Machine** (`--format json`, on every command): a typed JSON document alone
+  on stdout — SQLite integers/reals/NULLs stay JSON numbers/null
+  (`Store::query_json`), `doctor` emits the routed findings structure
+  (`core::optimize::Findings`, `projects` filtered by `--scope`), and each view
+  emits its rows as named objects. All freshness/refresh chatter goes to
+  **stderr** (see above), so `cclens <cmd> --format json | jq` needs no
+  filtering. Human-only footnotes (row counts, heuristic caveats) are either
+  folded into the JSON (`total`, …) or dropped, never mixed into it.
+
+Slices not covered here — the Bash command mix, the most-edited files, an error
+category broken down any way — are a `sql` one-liner; those once had thin
+`commands`/`hotspots` views, dropped once `sql` existed.
 
 ## Time bucketing
 
@@ -126,7 +149,7 @@ spike a reader over-trusts; one combined flag says "read this number loosely".
 ## `sql` — query the store directly
 
 ```
-cclens sql [<query>] [--format table|markdown] [--db <path>]
+cclens sql [<query>] [--format table|markdown|json] [--db <path>]
 ```
 
 `sql` is the one read that never auto-refreshes — it opens the store strictly

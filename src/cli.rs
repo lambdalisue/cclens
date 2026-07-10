@@ -32,7 +32,9 @@ use crate::store::{SessionMeta, Store};
 #[derive(Parser)]
 #[command(
     name = "cclens",
-    about = "Analyze your Claude Code sessions — usage, cost, and where the work stumbles"
+    about = "See where your Claude Code time and tokens go, and which config to fix.\n\
+             Start with `cclens doctor`; every report explains itself and names the\n\
+             follow-up command."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -41,16 +43,22 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Analyze session transcripts into the store.
+    /// Read your session logs and config into the local store. Runs
+    /// automatically before every report — call it directly only to refresh
+    /// without reading anything.
     Analyze {
         /// Transcript root (default: ~/.claude/projects).
         #[arg(long)]
         projects: Option<PathBuf>,
+        /// Output format: table | json (the run's counters).
+        #[arg(long)]
+        format: Option<String>,
         /// Output store path.
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Skill usage from the store — per skill, or per time bucket.
+    /// How often each skill ran and what it cost — per skill, or over time
+    /// with --by.
     Usage {
         /// Bucket usage by time: year | month | week | day | hour (JST).
         #[arg(long)]
@@ -64,10 +72,11 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Join the skill catalog against usage — installed skills, their cost, and
-    /// what is unused.
-    Surfaces {
-        /// Restrict to a config layer: global | project | project:<slug>.
+    /// Everything installed in your config (skills, rules, agents, MCP
+    /// servers, CLAUDE.md), what it weighs, and whether it was ever used.
+    Inventory {
+        /// Show one config layer only: global (~/.claude) | project (all
+        /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
         /// Output format: table | markdown.
@@ -79,10 +88,12 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// List optimization opportunities (unused, always-on heavy, costly+rare),
-    /// ranked, with a suggested action.
-    Wedges {
-        /// Restrict to a config layer: global | project | project:<slug>.
+    /// Cleanup opportunities: config that is never used, loaded every session
+    /// while heavy, or rarely worth its cost — ranked by what removing it
+    /// actually saves.
+    Waste {
+        /// Show one config layer only: global (~/.claude) | project (all
+        /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
         /// Output format: table | markdown.
@@ -94,10 +105,9 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Reconcile the measured always-on context against your readable config —
-    /// what every session actually loads, and how much is MCP/system you cannot
-    /// read from files.
-    Baseline {
+    /// What every session pays in context before any work starts, and how
+    /// much of that comes from your own config files vs Claude Code itself.
+    Overhead {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -107,8 +117,9 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Show how you steer the session — the mix of steering / correcting /
-    /// questioning / instructing prompts, with what it suggests.
+    /// How you steer Claude: the mix of instructing, steering ("go ahead"),
+    /// correcting ("no, instead…"), and questioning prompts — and what that
+    /// mix suggests changing.
     Prompts {
         /// Output format: table | markdown.
         #[arg(long)]
@@ -119,12 +130,12 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Where the work stumbles: recurring tool failures by category, ranked,
-    /// with what each suggests fixing.
-    Friction {
-        /// Restrict to a config layer: global (failures spread across projects),
-        /// project (each project's majority-owned failures), or project:<slug>
-        /// (every failure in that one project).
+    /// Tool calls that kept failing the same way — recurring failures that
+    /// waste turns and tokens, each with a suggested fix.
+    Failures {
+        /// Show one config layer only: global (failures spread across
+        /// projects — habits), project (each project's own failures), or
+        /// project:<slug> (everything in that one project).
         #[arg(long)]
         scope: Option<String>,
         /// Output format: table | markdown.
@@ -136,9 +147,9 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Thrash episodes — bursts of rapid re-edits to one file, where Claude got
-    /// stuck (distinct from a healthy hotspot's spread-out edits).
-    Thrash {
+    /// Files Claude kept re-editing in rapid bursts — where it got stuck
+    /// retrying instead of making progress.
+    Stuck {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
@@ -148,21 +159,25 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// One-screen health check: the few most actionable findings across every
-    /// view, split by the config layer that owns each fix. Start here.
-    Summary {
-        /// Restrict to a config layer: global | project | project:<slug>.
+    /// The health check — what to fix first, what your sessions cost, and
+    /// what is fine as-is. Start here.
+    Doctor {
+        /// Show one config layer only: global (~/.claude) | project (all
+        /// projects' own config) | project:<slug> (one project's).
         #[arg(long)]
         scope: Option<String>,
+        /// Output format: table (human text) | json (the routed findings).
+        #[arg(long)]
+        format: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Run an arbitrary read-only SQL query against the analyzed store. The query
-    /// is the argument, or read from stdin when omitted (so `echo 'SELECT …' |
-    /// cclens sql` works). A `tool_errors` view names the friction columns.
+    /// Ask anything the fixed reports don't cover: run a read-only SQL query
+    /// against the analyzed store (as an argument, or piped via stdin).
+    /// `SELECT sql FROM sqlite_master` shows the schema.
     Sql {
         /// The SQL to run. If omitted, the query is read from stdin.
         query: Option<String>,
@@ -172,9 +187,9 @@ enum Command {
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
-    /// Analyze, then hand the findings to an interactive `claude` session so you
-    /// can act on them together. Composes the analysis with a prescribed advisor
-    /// prompt and launches `claude` seeded with it.
+    /// Act on the findings: opens an interactive `claude` session pre-loaded
+    /// with the full analysis, which investigates each problem and proposes
+    /// concrete config edits for your approval.
     Optimize {
         /// Transcript root (default: ~/.claude/projects).
         #[arg(long)]
@@ -182,7 +197,8 @@ enum Command {
         /// Store to analyze into / read from.
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
-        /// Optimize one config layer: global | project | project:<slug>.
+        /// Optimize one config layer only: global (~/.claude) | project |
+        /// project:<slug>.
         #[arg(long)]
         scope: Option<String>,
         /// Use the existing store as-is; skip the analyze step.
@@ -196,58 +212,70 @@ enum Command {
 
 pub fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Analyze { projects, db } => analyze(projects, &db),
+        Command::Analyze {
+            projects,
+            format,
+            db,
+        } => analyze(projects, parse_format(format.as_deref())?, &db),
         Command::Usage {
             by,
             format,
             frozen,
             db,
         } => usage(by.as_deref(), parse_format(format.as_deref())?, frozen, &db),
-        Command::Surfaces {
+        Command::Inventory {
             scope,
             format,
             frozen,
             db,
-        } => surfaces(
+        } => inventory(
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
             &db,
         ),
-        Command::Wedges {
+        Command::Waste {
             scope,
             format,
             frozen,
             db,
-        } => wedges(
+        } => waste(
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
             &db,
         ),
-        Command::Baseline { format, frozen, db } => {
-            baseline(parse_format(format.as_deref())?, frozen, &db)
+        Command::Overhead { format, frozen, db } => {
+            overhead(parse_format(format.as_deref())?, frozen, &db)
         }
         Command::Prompts { format, frozen, db } => {
             prompts(parse_format(format.as_deref())?, frozen, &db)
         }
-        Command::Friction {
+        Command::Failures {
             scope,
             format,
             frozen,
             db,
-        } => friction(
+        } => failures(
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
             &db,
         ),
-        Command::Thrash { format, frozen, db } => {
-            thrash(parse_format(format.as_deref())?, frozen, &db)
+        Command::Stuck { format, frozen, db } => {
+            stuck(parse_format(format.as_deref())?, frozen, &db)
         }
-        Command::Summary { scope, frozen, db } => {
-            summary(&parse_scope(scope.as_deref())?, frozen, &db)
-        }
+        Command::Doctor {
+            scope,
+            format,
+            frozen,
+            db,
+        } => doctor(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &db,
+        ),
         Command::Sql { query, format, db } => {
             sql(query.as_deref(), parse_format(format.as_deref())?, &db)
         }
@@ -295,8 +323,11 @@ fn optimize(
     if !frozen {
         let stats = run_analyze(projects, db)?;
         eprintln!(
-            "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-            stats.sessions, stats.skipped
+            "{}",
+            Style::stderr().dim(&format!(
+                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
+                stats.sessions, stats.skipped
+            ))
         );
     }
     let store = Store::open(db).context("open store")?;
@@ -637,13 +668,23 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     // store's age instead so a stale read is at least visible. An old db whose
     // schema predates `meta` just skips the header.
     if let Ok(analyzed_at) = store.meta("analyzed_at") {
-        eprintln!("{}", freshness_line(analyzed_at.as_deref()));
+        eprint_freshness(&freshness_line(analyzed_at.as_deref()));
+    }
+    if format == Format::Json {
+        // Typed rows as objects — SQLite integers/reals/NULLs survive as JSON
+        // numbers/null. Duplicate column names keep the last value.
+        let (columns, rows) = store.query_json(query)?;
+        let objects: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|row| serde_json::Value::Object(columns.iter().cloned().zip(row).collect()))
+            .collect();
+        return emit_json(&serde_json::Value::Array(objects));
     }
     let (columns, rows) = store.query(query)?;
     let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
     let aligns = vec![Align::Left; columns.len()];
     render(&headers, &aligns, &rows, format);
-    println!("\n{} row(s)", rows.len());
+    note(&format!("{} row(s)", rows.len()));
     Ok(())
 }
 
@@ -651,141 +692,328 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 /// split by the config layer that owns each fix — the global picture first,
 /// then each project's own findings ("optimize my global setup" and "optimize
 /// this project" are different tasks). `--scope` narrows to one layer.
-fn summary(filter: &ScopeFilter, frozen: bool, db: &Path) -> Result<()> {
+fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    if format == Format::Markdown {
+        anyhow::bail!("summary has no markdown form — use the default text or --format json");
+    }
     let store = open_for_read(db, frozen)?;
     let f = collect_findings(&store)?;
 
-    if filter.includes_global() {
-        println!("== global — fix in ~/.claude ==");
-        println!(
-            "  tokens      main-thread skill output {} · subagents {} ({} agents)",
-            f.main_out, f.sub_tokens, f.sub_agents
-        );
-        if f.floor > 0 {
-            let residual = (f.floor - f.config_tokens).max(0);
-            println!(
-                "  always-on   ~{} tok/session = your global config {} + system/tools/MCP {}",
-                f.floor, f.config_tokens, residual
-            );
-        }
-        if let Some(cd_pct) = f.cd_pct {
-            println!(
-                "  workflow    cd is {cd_pct}% of Bash calls — a working-dir convention would cut the churn"
-            );
-        }
-        println!(
-            "  config      {} → `wedges --scope global`",
-            count_summary(f.unused.len(), f.always_on_heavy.len())
-        );
-        if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct) {
-            println!(
-                "  prompting   {steer}% steering, {correct}% corrections — {}",
-                if correct >= 10 || steer >= 25 {
-                    "see `prompts`"
-                } else {
-                    "healthy mix"
-                }
-            );
-        }
-        if !f.friction_global.is_empty() {
-            println!("\n  friction spread across projects (no single owner — a global habit):");
-            for cat in f.friction_global.iter().take(3) {
-                println!(
-                    "  {:>5}  {} ({} projects) — {}",
-                    cat.count,
-                    cat.label,
-                    cat.projects,
-                    ErrorCategory::from_label(&cat.label).suggestion()
-                );
-            }
-        }
+    if format == Format::Json {
+        // The routed findings, filtered the same way the text form is: the
+        // global picture (minus the projects list) and each visible project.
+        let global = filter.includes_global().then(|| {
+            let mut value = serde_json::to_value(&f).expect("findings serialize");
+            value.as_object_mut().expect("object").remove("projects");
+            value
+        });
+        let projects: Vec<&optimize_mod::ProjectFindings> = f
+            .projects
+            .iter()
+            .filter(|p| filter.includes_project(&p.project))
+            .collect();
+        return emit_json(&serde_json::json!({
+            "global": global,
+            "projects": projects,
+        }));
     }
 
-    // A project block earns its screen space with friction or config wedges;
-    // thrash-only projects fold into the trailing count instead of five
-    // near-empty blocks.
-    const PROJECTS_SHOWN: usize = 5;
+    // The text form is written for someone who has never seen cclens's
+    // vocabulary: every item says what happened, why it costs, and what to do
+    // — prioritized, so the report reads top to bottom as a to-do list.
+    let style = Style::stdout();
+    let (session_count, project_count) = store.session_stats()?;
+    if session_count == 0 {
+        println!("nothing analyzed yet — run `cclens analyze` first");
+        return Ok(());
+    }
+    println!(
+        "{}",
+        style.heading(&format!(
+            "Claude Code usage health check — {session_count} sessions across \
+             {project_count} projects"
+        ))
+    );
+
     let visible: Vec<_> = f
         .projects
         .iter()
         .filter(|p| filter.includes_project(&p.project))
         .collect();
-    let shown: Vec<_> = if *filter == ScopeFilter::All {
-        visible
-            .iter()
-            .filter(|p| {
-                p.total_friction() > 0 || !p.unused.is_empty() || !p.always_on_heavy.is_empty()
-            })
-            .take(PROJECTS_SHOWN)
-            .copied()
-            .collect()
-    } else {
-        // An explicit project scope means the user asked for everything.
-        visible.clone()
+    let display = |p: &optimize_mod::ProjectFindings| {
+        if p.root.is_empty() {
+            p.project.clone()
+        } else {
+            tilde_path(&p.root)
+        }
     };
-    if !visible.is_empty() {
-        if filter.includes_global() {
-            println!("\n== projects — fix each in its own .claude / CLAUDE.md ==");
+
+    // ---- WHAT TO FIX FIRST: recurring problems, biggest first. -------------
+    struct Item {
+        weight: i64,
+        lines: Vec<String>,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    for p in &visible {
+        if p.total_friction() == 0 {
+            continue;
         }
-        for p in &shown {
-            let heading = if p.root.is_empty() {
-                p.project.clone()
-            } else {
-                tilde_path(&p.root)
-            };
-            match p.total_friction() {
-                0 => println!("\n  {heading}"),
-                n => println!("\n  {heading} — owns {n} failure(s)"),
-            }
-            for cat in p.friction.iter().take(3) {
-                println!(
-                    "  {:>5}  {} — {}",
-                    cat.count,
-                    cat.label,
+        let mut lines = vec![format!(
+            "In {}, {} tool calls failed in recurring ways:",
+            style.bold(&display(p)),
+            style.warn(&p.total_friction().to_string())
+        )];
+        for cat in p.friction.iter().take(3) {
+            lines.push(format!(
+                "  {:>4}× {} {}",
+                cat.count,
+                cat.label,
+                style.dim(&format!(
+                    "— {}",
                     ErrorCategory::from_label(&cat.label).suggestion()
-                );
-            }
-            if let Some(worst) = p.thrash.first() {
-                println!(
-                    "         thrash: {} edited {}x in {}m{}s",
-                    worst.file,
-                    worst.edits,
-                    worst.span_secs / 60,
-                    worst.span_secs % 60
-                );
-            }
-            if !p.unused.is_empty() || !p.always_on_heavy.is_empty() {
-                println!(
-                    "         config: {} → `wedges --scope project:{}`",
-                    count_summary(p.unused.len(), p.always_on_heavy.len()),
-                    p.project
-                );
-            }
+                ))
+            ));
         }
-        if visible.len() > shown.len() {
+        if let Some(worst) = p.thrash.first() {
+            lines.push(format!(
+                "  …and Claude got stuck re-editing {} ({} edits in {}m).",
+                worst.file,
+                worst.edits,
+                worst.span_secs.div_euclid(60).max(1)
+            ));
+        }
+        lines.push(format!(
+            "  Fix in this project's own CLAUDE.md / .claude — details: {}",
+            style.command(&format!("cclens failures --scope project:{}", p.project))
+        ));
+        items.push(Item {
+            weight: p.total_friction(),
+            lines,
+        });
+    }
+    if filter.includes_global() {
+        for cat in &f.friction_global {
+            items.push(Item {
+                weight: cat.count,
+                lines: vec![
+                    format!(
+                        "The same failure hit {} different projects ({}× total): {} {}",
+                        cat.projects,
+                        style.warn(&cat.count.to_string()),
+                        style.bold(&cat.label),
+                        style.dim(&format!(
+                            "— {}",
+                            ErrorCategory::from_label(&cat.label).suggestion()
+                        ))
+                    ),
+                    format!(
+                        "  No single project owns it, so the fix belongs in ~/.claude — \
+                         details: {}",
+                        style.command("cclens failures --scope global")
+                    ),
+                ],
+            });
+        }
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.weight));
+    let dropped_items = items.len().saturating_sub(4);
+    items.truncate(4);
+    if filter.includes_global() {
+        if let Some(cd_pct) = f.cd_pct.filter(|pct| *pct >= 25) {
+            items.push(Item {
+                weight: 0,
+                lines: vec![format!(
+                    "{} of all Bash commands are just `cd` — a working-directory \
+                     convention in your global CLAUDE.md would cut the churn.",
+                    style.warn(&format!("{cd_pct}%"))
+                )],
+            });
+        }
+        if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct)
+            && (correct >= 10 || steer >= 25)
+        {
+            items.push(Item {
+                weight: 0,
+                lines: vec![format!(
+                    "{steer}% of your prompts steer and {correct}% correct — rework that \
+                     clearer upfront specs could cut. Details: {}",
+                    style.command("cclens prompts")
+                )],
+            });
+        }
+    }
+
+    println!("\n{}", style.heading("WHAT TO FIX FIRST"));
+    if items.is_empty() {
+        println!("  {}", style.good("nothing recurring found — looking good"));
+    }
+    for (i, item) in items.iter().enumerate() {
+        let (first, rest) = item.lines.split_first().expect("item has lines");
+        println!("  {}. {first}", i + 1);
+        for line in rest {
+            println!("   {line}");
+        }
+    }
+    // Never truncate silently (reporting honesty, cli.md).
+    if dropped_items > 0 {
+        println!(
+            "  {}",
+            style.dim(&format!(
+                "… and {dropped_items} smaller recurring problem(s) — see `cclens failures --scope project`"
+            ))
+        );
+    }
+
+    // ---- COST: what a session pays, in plain words. -------------------------
+    if filter.includes_global() {
+        println!("\n{}", style.heading("COST (token estimates, not billing)"));
+        if f.floor > 0 {
+            let residual = (f.floor - f.config_tokens).max(0);
             println!(
-                "\n  … and {} more project(s) with minor findings — see `summary --scope project`",
-                visible.len() - shown.len()
+                "  Every session starts with ~{} tokens of context before any work:",
+                style.bold(&fmt_tokens(f.floor))
             );
+            println!(
+                "  {} comes from your own global config files; the other {} is Claude Code",
+                fmt_tokens(f.config_tokens),
+                fmt_tokens(residual)
+            );
+            println!(
+                "  {}",
+                style.dim("itself (system prompt, built-in tools, MCP schemas) — not trimmable from files.")
+            );
+        }
+        println!(
+            "  Output written so far: {} tokens by skills on the main thread, {} by {} subagent runs.",
+            fmt_tokens(f.main_out),
+            fmt_tokens(f.sub_tokens),
+            f.sub_agents
+        );
+    }
+
+    // ---- CONFIG WORTH PRUNING: installed-but-dead weight, by owner. ---------
+    let mut pruning: Vec<String> = Vec::new();
+    if filter.includes_global() && (!f.unused.is_empty() || !f.always_on_heavy.is_empty()) {
+        pruning.push(format!(
+            "  ~/.claude: {} → {}",
+            prune_phrase(&f.unused, &f.always_on_heavy),
+            style.command("cclens waste --scope global")
+        ));
+    }
+    let mut prunable: Vec<_> = visible
+        .iter()
+        .filter(|p| !p.unused.is_empty() || !p.always_on_heavy.is_empty())
+        .collect();
+    prunable.sort_by_key(|p| std::cmp::Reverse(p.unused.len() + p.always_on_heavy.len()));
+    for p in prunable.iter().take(3) {
+        pruning.push(format!(
+            "  {}: {} → {}",
+            display(p),
+            prune_phrase(&p.unused, &p.always_on_heavy),
+            style.command(&format!("cclens waste --scope project:{}", p.project))
+        ));
+    }
+    if !pruning.is_empty() {
+        println!("\n{}", style.heading("CONFIG WORTH PRUNING"));
+        println!(
+            "  {}",
+            style.dim("Installed config that costs attention (or context) without earning it:")
+        );
+        for line in pruning {
+            println!("{line}");
+        }
+        if prunable.len() > 3 {
+            println!(
+                "  {}",
+                style.dim(&format!(
+                    "… and {} more project(s) with prunable config — see `cclens waste --scope project`",
+                    prunable.len() - 3
+                ))
+            );
+        }
+    }
+
+    // ---- LOOKS HEALTHY: say explicitly what needs no action. ----------------
+    if filter.includes_global() {
+        let mut healthy: Vec<String> = Vec::new();
+        if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct)
+            && correct < 10
+            && steer < 25
+        {
+            healthy.push(format!(
+                "prompting mix ({steer}% steering / {correct}% corrections) — good autonomy balance"
+            ));
+        }
+        if f.friction_global.is_empty() {
+            healthy.push("no failure habit spans multiple projects".to_string());
+        }
+        if f.always_on_heavy.is_empty() && f.floor > 0 {
+            healthy.push(format!(
+                "your global config is lean ({} of the ~{} startup tokens)",
+                fmt_tokens(f.config_tokens),
+                fmt_tokens(f.floor)
+            ));
+        }
+        if !healthy.is_empty() {
+            println!("\n{}", style.heading("LOOKS HEALTHY"));
+            for line in healthy {
+                println!("  {}", style.good(&line));
+            }
         }
     }
     Ok(())
 }
 
-/// `"N unused, M always-on heavy"` with zero parts dropped (never both zero at
-/// a call site that prints it).
-fn count_summary(unused: usize, always_on_heavy: usize) -> String {
+/// `"3 unused surfaces, 4 always-on files costing ~8.5k tokens/session"` — the
+/// pruning line's plain-language phrase, zero parts dropped.
+fn prune_phrase(
+    unused: &[optimize_mod::SurfaceRef],
+    always_on_heavy: &[optimize_mod::SurfaceRef],
+) -> String {
     let mut parts = Vec::new();
-    if unused > 0 {
-        parts.push(format!("{unused} unused"));
+    if !unused.is_empty() {
+        parts.push(format!(
+            "{} installed but never used",
+            plural(unused.len(), "surface")
+        ));
     }
-    if always_on_heavy > 0 {
-        parts.push(format!("{always_on_heavy} always-on heavy"));
-    }
-    if parts.is_empty() {
-        return "nothing flagged".to_string();
+    if !always_on_heavy.is_empty() {
+        let tokens: i64 = always_on_heavy.iter().filter_map(|s| s.static_tokens).sum();
+        parts.push(format!(
+            "{} loaded every session (~{} tokens each time)",
+            plural(always_on_heavy.len(), "heavy file"),
+            fmt_tokens(tokens)
+        ));
     }
     parts.join(", ")
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// Humanize a token count: `6467406` → `6.5M`, `32139` → `32.1k`.
+fn fmt_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One dimmed framing block above a table: what this view shows and how to
+/// read it, so the output explains itself. Table format only — markdown is for
+/// pasting the table, json is the machine contract.
+fn preamble(format: Format, text: &str) {
+    if matches!(format, Format::Table) {
+        println!("{}\n", Style::stdout().dim(text));
+    }
 }
 
 /// Shorten an absolute path under $HOME to `~/…` for display.
@@ -802,16 +1030,34 @@ fn tilde_path(path: &str) -> String {
 
 /// Thrash bursts: a file edited many times in a short window — where Claude got
 /// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
-fn thrash(format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
     let store = open_for_read(db, frozen)?;
     let edits = store.work_event_rows("file_edit")?;
     let episodes = detect_thrash(&edits, GAP_SECS, MIN_EDITS);
+    if format == Format::Json {
+        let episodes: Vec<serde_json::Value> = episodes
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "file": e.file,
+                    "edits": e.edits,
+                    "span_secs": e.span_secs(),
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "episodes": episodes }));
+    }
     if episodes.is_empty() {
         println!("no thrash episodes (>= {MIN_EDITS} rapid re-edits) — run analyze first");
         return Ok(());
     }
+    preamble(
+        format,
+        "Files Claude kept re-editing in rapid bursts — the signature of getting stuck\n\
+         and retrying. Worth checking what blocked it there (a rule? missing context?).",
+    );
     let rows: Vec<Vec<String>> = episodes
         .iter()
         .take(20)
@@ -830,11 +1076,16 @@ fn thrash(format: Format, frozen: bool, db: &Path) -> Result<()> {
         &rows,
         format,
     );
-    println!(
-        "\nbursts of >= {MIN_EDITS} edits to one file within {}m — likely where Claude got stuck.",
+    note(&format!(
+        "bursts of >= {MIN_EDITS} edits to one file within {}m — likely where Claude got stuck.",
         GAP_SECS / 60
-    );
+    ));
     Ok(())
+}
+
+/// A dimmed footnote under a table — context, not data.
+fn note(text: &str) {
+    println!("\n{}", Style::stdout().dim(text));
 }
 
 /// Where the work stumbles: recurring tool failures by category, ranked, each
@@ -843,74 +1094,125 @@ fn thrash(format: Format, frozen: bool, db: &Path) -> Result<()> {
 /// `--scope` routes by ownership (`core::scope`): `global` shows the failures
 /// no project owns, `project` each project's majority-owned failures, and
 /// `project:<slug>` everything that happened in that one project.
-fn friction(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    struct FrictionRow {
+        project: Option<String>,
+        category: String,
+        count: i64,
+        /// How many projects the count spreads across (global scope only).
+        spread: Option<usize>,
+    }
+
     let store = open_for_read(db, frozen)?;
     let cells = store.error_counts_by_project()?;
 
-    // (project column shown?, rows)
-    let (with_project, counts): (bool, Vec<(String, String, i64)>) = match filter {
-        ScopeFilter::All => (
-            false,
-            store
-                .error_counts()?
-                .into_iter()
-                .map(|(label, n)| (String::new(), label, n))
-                .collect(),
-        ),
-        ScopeFilter::Global => (
-            false,
-            split_friction(&cells)
-                .global
-                .into_iter()
-                .map(|g| {
-                    (
-                        String::new(),
-                        format!("{} (across {} projects)", g.category, g.projects),
-                        g.total,
-                    )
+    let counts: Vec<FrictionRow> = match filter {
+        ScopeFilter::All => store
+            .error_counts()?
+            .into_iter()
+            .map(|(category, count)| FrictionRow {
+                project: None,
+                category,
+                count,
+                spread: None,
+            })
+            .collect(),
+        ScopeFilter::Global => split_friction(&cells)
+            .global
+            .into_iter()
+            .map(|g| FrictionRow {
+                project: None,
+                category: g.category,
+                count: g.total,
+                spread: Some(g.projects),
+            })
+            .collect(),
+        ScopeFilter::Project(None) => split_friction(&cells)
+            .per_project
+            .into_iter()
+            .flat_map(|(project, cats)| {
+                cats.into_iter().map(move |(category, count)| FrictionRow {
+                    project: Some(project.clone()),
+                    category,
+                    count,
+                    spread: None,
                 })
-                .collect(),
-        ),
-        ScopeFilter::Project(None) => (
-            true,
-            split_friction(&cells)
-                .per_project
-                .into_iter()
-                .flat_map(|(project, cats)| {
-                    cats.into_iter()
-                        .map(move |(label, n)| (project.clone(), label, n))
-                })
-                .collect(),
-        ),
-        ScopeFilter::Project(Some(slug)) => (
-            false,
-            cells
-                .into_iter()
-                .filter(|(project, _, _)| project == slug)
-                .map(|(_, label, n)| (String::new(), label, n))
-                .collect(),
-        ),
+            })
+            .collect(),
+        ScopeFilter::Project(Some(slug)) => cells
+            .into_iter()
+            .filter(|(project, _, _)| project == slug)
+            .map(|(project, category, count)| FrictionRow {
+                project: Some(project),
+                category,
+                count,
+                spread: None,
+            })
+            .collect(),
     };
-    let total: i64 = counts.iter().map(|(_, _, n)| n).sum();
+    let total: i64 = counts.iter().map(|row| row.count).sum();
+
+    if format == Format::Json {
+        let failures: Vec<serde_json::Value> = counts
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "project": row.project,
+                    "category": row.category,
+                    "count": row.count,
+                    "spread_projects": row.spread,
+                    "suggestion": ErrorCategory::from_label(&row.category).suggestion(),
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "total": total, "failures": failures }));
+    }
     if total == 0 {
         println!("no tool failures found for this scope — run `cclens analyze` first?");
         return Ok(());
     }
 
+    preamble(
+        format,
+        match filter {
+            ScopeFilter::All => {
+                "Tool calls that kept failing the same way, grouped by kind of failure.\n\
+                 Every row wastes turns and tokens; the suggestion says what usually fixes it."
+            }
+            ScopeFilter::Global => {
+                "Failures spread across several projects — no single project owns them, so\n\
+                 they read as habits or global-config problems. Fix these in ~/.claude."
+            }
+            ScopeFilter::Project(None) => {
+                "Failures each project owns (it holds the majority of that kind). Fix each\n\
+                 in that project's own CLAUDE.md / .claude, not globally."
+            }
+            ScopeFilter::Project(Some(_)) => {
+                "Every recurring failure inside this one project, most frequent first.\n\
+                 Fix them in this project's own CLAUDE.md / .claude."
+            }
+        },
+    );
+    let with_project = matches!(filter, ScopeFilter::Project(None));
     let rows: Vec<Vec<String>> = counts
         .iter()
-        .map(|(project, label, n)| {
-            let mut row = Vec::new();
+        .map(|row| {
+            let mut cells = Vec::new();
             if with_project {
-                row.push(project.clone());
+                cells.push(row.project.clone().unwrap_or_default());
             }
-            let category = label.split(' ').next().unwrap_or(label);
-            row.extend([
-                label.clone(),
-                n.to_string(),
-                ErrorCategory::from_label(category).suggestion().to_string(),
+            let error = match row.spread {
+                Some(spread) => format!("{} (across {spread} projects)", row.category),
+                None => row.category.clone(),
+            };
+            cells.extend([
+                error,
+                row.count.to_string(),
+                ErrorCategory::from_label(&row.category)
+                    .suggestion()
+                    .to_string(),
             ]);
-            row
+            cells
         })
         .collect();
     let (headers, aligns): (Vec<&str>, Vec<Align>) = if with_project {
@@ -925,7 +1227,9 @@ fn friction(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
         )
     };
     render(&headers, &aligns, &rows, format);
-    println!("\n{total} tool failures (categories are lexical heuristics)");
+    note(&format!(
+        "{total} tool failures (categories are lexical heuristics)"
+    ));
     Ok(())
 }
 
@@ -936,11 +1240,34 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    if format == Format::Json {
+        let behaviors: Vec<serde_json::Value> = counts
+            .iter()
+            .map(|(behavior, n)| {
+                serde_json::json!({
+                    "behavior": behavior,
+                    "count": n,
+                    "share_pct": if total > 0 {
+                        (*n as f64 * 100.0 / total as f64).round() as i64
+                    } else {
+                        0
+                    },
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "total": total, "behaviors": behaviors }));
+    }
     if total == 0 {
         println!("no prompts found — run `cclens analyze` first");
         return Ok(());
     }
 
+    preamble(
+        format,
+        "How you steer Claude, classified per prompt: instruct (substantive asks),\n\
+         steer (\"go ahead\" / \"yes\"), correct (\"no, instead…\"), question. Lots of\n\
+         steering = room for more autonomy; lots of correcting = unclear upfront specs.",
+    );
     let pct = |n: i64| (n as f64 * 100.0 / total as f64).round() as i64;
     let get = |name: &str| {
         counts
@@ -960,28 +1287,40 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
         format,
     );
 
-    println!("\n{total} prompts (behavioral classes are lexical heuristics)");
+    let style = Style::stdout();
+    note(&format!(
+        "{total} prompts (behavioral classes are lexical heuristics)"
+    ));
     let steer = pct(get("steer"));
     let correct = pct(get("correct"));
     let mut flagged = false;
     if steer >= 25 {
         flagged = true;
         println!(
-            "  - {steer}% steering (\"go ahead\" / \"yes\" / \"next\"): you approve in small \
-             steps — room for more autonomy (clearer upfront scope, /loop, longer leash)."
+            "  - {}",
+            style.warn(&format!(
+                "{steer}% steering (\"go ahead\" / \"yes\" / \"next\"): you approve in small \
+                 steps — room for more autonomy (clearer upfront scope, /loop, longer leash)."
+            ))
         );
     }
     if correct >= 10 {
         flagged = true;
         println!(
-            "  - {correct}% corrections (\"no\" / \"instead\" / \"戻して\"): rework after a wrong \
-             turn — tighter initial specs or rules could cut it."
+            "  - {}",
+            style.warn(&format!(
+                "{correct}% corrections (\"no\" / \"instead\" / \"戻して\"): rework after a \
+                 wrong turn — tighter initial specs or rules could cut it."
+            ))
         );
     }
     if !flagged {
         println!(
-            "  - healthy mix: mostly substantive instructions, low correction ({correct}%) — \
-             good alignment, no obvious babysitting or rework problem."
+            "  - {}",
+            style.good(&format!(
+                "healthy mix: mostly substantive instructions, low correction ({correct}%) — \
+                 good alignment, no obvious babysitting or rework problem."
+            ))
         );
     }
     Ok(())
@@ -992,27 +1331,52 @@ fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn baseline(format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
     let floor = store.baseline_floor()?;
+    let config = store.always_on_config_tokens()?;
+    let residual = (floor - config).max(0);
+    let per_project = store.baseline_floor_per_project()?;
+
+    if format == Format::Json {
+        let per_project: Vec<serde_json::Value> = per_project
+            .iter()
+            .map(|(project, floor)| serde_json::json!({ "project": project, "floor": floor }))
+            .collect();
+        return emit_json(&serde_json::json!({
+            "floor": floor,
+            "config_tokens": config,
+            "residual": residual,
+            "per_project": per_project,
+        }));
+    }
     if floor == 0 {
         println!("no data — run `cclens analyze` first");
         return Ok(());
     }
-    let config = store.always_on_config_tokens()?;
-    let residual = (floor - config).max(0);
 
-    println!("Observed always-on floor (leanest session-start context): {floor} tokens");
+    preamble(
+        format,
+        "What every session pays in context before any work starts, and how much of\n\
+         it your own config files account for.",
+    );
+    let style = Style::stdout();
+    println!(
+        "Observed always-on floor (leanest session-start context): {}",
+        style.bold(&format!("{floor} tokens"))
+    );
     println!("  readable config (CLAUDE.md + always-on rules):          {config} tokens");
     println!("  residual (system prompt + built-in tools + MCP schemas): {residual} tokens");
-    println!("  -> the residual is what you cannot read from files; compare projects below");
     println!(
-        "     to see an MCP server's marginal cost (a project that enables it starts higher)."
+        "{}",
+        style.dim(
+            "  -> the residual is what you cannot read from files; compare projects below\n\
+             \x20    to see an MCP server's marginal cost (a project that enables it starts higher)."
+        )
     );
     println!();
 
-    let rows: Vec<Vec<String>> = store
-        .baseline_floor_per_project()?
+    let rows: Vec<Vec<String>> = per_project
         .into_iter()
         .map(|(project, floor)| vec![project, floor.to_string()])
         .collect();
@@ -1039,10 +1403,22 @@ struct AnalyzeStats {
     denials: usize,
 }
 
-fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
+fn analyze(projects: Option<PathBuf>, format: Format, db: &Path) -> Result<()> {
     let stats = run_analyze(projects, db)?;
     let store = Store::open(db).context("open store")?;
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    if format == Format::Json {
+        return emit_json(&serde_json::json!({
+            "sessions": stats.sessions,
+            "unchanged": stats.skipped,
+            "skill_invocations": stats.spans_total,
+            "surfaces": stats.surface_count,
+            "subagent_tokens": sub_tokens,
+            "subagents": sub_agents,
+            "permission_denials": stats.denials,
+            "db": db.display().to_string(),
+        }));
+    }
     println!(
         "analyzed {} session(s) ({} unchanged), {} skill invocation(s), \
          {} surface(s) catalogued, \
@@ -1170,15 +1546,29 @@ fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
         };
         let stats = run_analyze(projects, db)?;
         eprintln!(
-            "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
-            stats.sessions, stats.skipped
+            "{}",
+            Style::stderr().dim(&format!(
+                "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
+                stats.sessions, stats.skipped
+            ))
         );
         return Store::open(db).context("open store");
     }
 
     let store = Store::open(db).context("open store")?;
-    eprintln!("{}", freshness_line(store.meta("analyzed_at")?.as_deref()));
+    eprint_freshness(&freshness_line(store.meta("analyzed_at")?.as_deref()));
     Ok(store)
+}
+
+/// Print a freshness line to stderr — dimmed context normally, highlighted
+/// when it carries a staleness hint the user should act on.
+fn eprint_freshness(line: &str) {
+    let style = Style::stderr();
+    if line.contains("cclens analyze") {
+        eprintln!("{}", style.warn(line));
+    } else {
+        eprintln!("{}", style.dim(line));
+    }
 }
 
 /// The `--frozen` freshness header: how old the store is, with a refresh hint
@@ -1266,16 +1656,30 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
     }
 
     let skills = store.skill_usage()?;
-    if skills.is_empty() {
-        println!("no skill usage found — run `cclens analyze` first");
-        return Ok(());
-    }
-
     // Where the tokens actually go: main-thread skill output vs subagents. The
     // subagent figure is usually the larger by far — worth seeing before reading
     // the per-skill table.
     let main_out: i64 = skills.iter().map(|row| row.out_tokens).sum();
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    if format == Format::Json {
+        return emit_json(&serde_json::json!({
+            "tokens": {
+                "main_out": main_out,
+                "sub_tokens": sub_tokens,
+                "sub_agents": sub_agents,
+            },
+            "skills": skills,
+        }));
+    }
+    if skills.is_empty() {
+        println!("no skill usage found — run `cclens analyze` first");
+        return Ok(());
+    }
+    preamble(
+        format,
+        "How often each skill ran and what it cost: output tokens written, context\n\
+         growth while it ran, and wall-clock seconds. Most-invoked first.",
+    );
     println!(
         "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)\n"
     );
@@ -1293,7 +1697,7 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
         })
         .collect();
     render(
-        &["skill", "count", "out_tok", "ctx_grow", "sec"],
+        &["skill", "runs", "out tokens", "ctx growth", "seconds"],
         &[
             Align::Left,
             Align::Right,
@@ -1311,10 +1715,6 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
 /// its start bucket (`docs/specs/cli.md`).
 fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
     let events = store.skill_event_costs()?;
-    if events.is_empty() {
-        println!("no skill usage found — run `cclens analyze` first");
-        return Ok(());
-    }
 
     let mut totals: std::collections::BTreeMap<String, (i64, i64, i64, f64)> =
         std::collections::BTreeMap::new();
@@ -1327,6 +1727,31 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
         row.3 += event.duration_sec;
     }
 
+    if format == Format::Json {
+        let buckets: Vec<serde_json::Value> = totals
+            .iter()
+            .map(|(label, (count, out_tokens, ctx_growth, duration_sec))| {
+                serde_json::json!({
+                    "bucket": label,
+                    "count": count,
+                    "out_tokens": out_tokens,
+                    "ctx_growth": ctx_growth,
+                    "duration_sec": duration_sec,
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "buckets": buckets }));
+    }
+    if events.is_empty() {
+        println!("no skill usage found — run `cclens analyze` first");
+        return Ok(());
+    }
+
+    preamble(
+        format,
+        "Skill activity per time bucket (times in JST). A long-running skill counts\n\
+         whole in the bucket it started in, so fine buckets can show spikes.",
+    );
     let rows: Vec<Vec<String>> = totals
         .into_iter()
         .map(|(label, (count, out_tokens, ctx_growth, duration_sec))| {
@@ -1340,7 +1765,7 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
         })
         .collect();
     render(
-        &["bucket", "count", "out_tok", "ctx_grow", "sec"],
+        &["bucket", "runs", "out tokens", "ctx growth", "seconds"],
         &[
             Align::Left,
             Align::Right,
@@ -1371,7 +1796,7 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn surfaces(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
@@ -1380,11 +1805,53 @@ fn surfaces(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
         .collect();
     let usage = store.usage_counts()?;
 
+    if format == Format::Json {
+        let catalogued: std::collections::HashSet<(&str, &str)> = catalog
+            .iter()
+            .map(|e| (e.kind.as_str(), e.id.as_str()))
+            .collect();
+        let mut items: Vec<serde_json::Value> = catalog
+            .iter()
+            .map(|entry| {
+                let measurable = is_usage_measurable(&entry.kind);
+                serde_json::json!({
+                    "kind": entry.kind,
+                    "id": entry.id,
+                    "scope": entry.scope,
+                    "project": if entry.project.is_empty() { None } else { Some(&entry.project) },
+                    "static_tokens": entry.static_tokens,
+                    "uses": if measurable { Some(entry.uses) } else { None },
+                    "load_mode": entry.load_mode,
+                    "status": if measurable && entry.uses == 0 { "unused" }
+                              else if !measurable { "catalog-only" } else { "" },
+                })
+            })
+            .collect();
+        if *filter == ScopeFilter::All {
+            for (kind, id, count) in &usage {
+                if !catalogued.contains(&(kind.as_str(), id.as_str())) {
+                    items.push(serde_json::json!({
+                        "kind": kind, "id": id, "scope": null, "project": null,
+                        "static_tokens": null, "uses": count, "load_mode": null,
+                        "status": "orphaned",
+                    }));
+                }
+            }
+        }
+        return emit_json(&serde_json::json!({ "surfaces": items }));
+    }
     if catalog.is_empty() && usage.is_empty() {
         println!("nothing catalogued — run `cclens analyze` first");
         return Ok(());
     }
 
+    preamble(
+        format,
+        "Everything installed in your config — skills, rules, agents, MCP servers,\n\
+         CLAUDE.md — with its static token weight, where it is installed (scope), and\n\
+         whether it was ever used. UNUSED marks delete candidates; rules and CLAUDE.md\n\
+         are catalog-only because using them leaves no trace in transcripts.",
+    );
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
@@ -1435,7 +1902,15 @@ fn surfaces(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
     }
 
     render(
-        &["kind", "id", "scope", "static", "uses", "load", "status"],
+        &[
+            "kind",
+            "id",
+            "scope",
+            "static tok",
+            "uses",
+            "load mode",
+            "status",
+        ],
         &[
             Align::Left,
             Align::Left,
@@ -1473,7 +1948,7 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn wedges(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
     let catalog: Vec<_> = store
         .effective_catalog()?
@@ -1515,15 +1990,45 @@ fn wedges(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
         }
     }
 
-    if found.is_empty() {
-        println!("no optimization wedges found — run `cclens analyze` first");
-        return Ok(());
-    }
-
     // Rank by real startup savings: measured tokens (desc), then unmeasured MCP
     // schemas, then declutter-only.
     found.sort_by_key(|row| savings_rank(row.savings));
 
+    if format == Format::Json {
+        let wedges: Vec<serde_json::Value> = found
+            .iter()
+            .map(|row| {
+                let (savings, savings_tokens) = match row.savings {
+                    StartupSavings::Tokens(n) => ("tokens", Some(n)),
+                    StartupSavings::UnknownSchema => ("unknown_schema", None),
+                    StartupSavings::Declutter => ("declutter", None),
+                };
+                serde_json::json!({
+                    "wedge": row.wedge.label(),
+                    "kind": row.kind,
+                    "id": row.id,
+                    "scope": row.scope,
+                    "project": if row.project.is_empty() { None } else { Some(row.project) },
+                    "savings": savings,
+                    "savings_tokens": savings_tokens,
+                    "uses": if is_usage_measurable(row.kind) { Some(row.uses) } else { None },
+                    "suggestion": savings_suggestion(row.wedge, row.savings),
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "wedges": wedges }));
+    }
+    if found.is_empty() {
+        println!("nothing wasteful found — run `cclens analyze` first");
+        return Ok(());
+    }
+
+    preamble(
+        format,
+        "Concrete cleanup opportunities in your config, ranked by what removing each\n\
+         one actually saves at session start. \"~0\" means deleting only declutters —\n\
+         the body loads on demand, so it costs nothing until used.",
+    );
     let rows: Vec<Vec<String>> = found
         .iter()
         .map(|row| {
@@ -1544,7 +2049,7 @@ fn wedges(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
         .collect();
     render(
         &[
-            "wedge",
+            "problem",
             "surface",
             "scope",
             "saves@start",
@@ -1671,25 +2176,101 @@ enum Align {
     Right,
 }
 
-/// Output format for reports.
-#[derive(Clone, Copy)]
+/// Output format for reports: `table` and `markdown` are for humans, `json`
+/// is the machine contract — typed values, nothing but JSON on stdout (all
+/// meta/freshness chatter goes to stderr).
+#[derive(Clone, Copy, PartialEq)]
 enum Format {
     Table,
     Markdown,
+    Json,
 }
 
 fn parse_format(value: Option<&str>) -> Result<Format> {
     match value.unwrap_or("table") {
         "table" => Ok(Format::Table),
         "markdown" | "md" => Ok(Format::Markdown),
-        other => anyhow::bail!("unknown --format '{other}' (table|markdown)"),
+        "json" => Ok(Format::Json),
+        other => anyhow::bail!("unknown --format '{other}' (table|markdown|json)"),
     }
 }
 
+/// Print a machine-readable payload: pretty JSON, alone on stdout.
+fn emit_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// ANSI styling for the human formats. Colors turn on only when the target is
+/// a terminal, `NO_COLOR` is unset, and `TERM` is not `dumb` — so pipes,
+/// captures, and `--format markdown|json` always get plain bytes.
+#[derive(Clone, Copy)]
+struct Style {
+    on: bool,
+}
+
+impl Style {
+    fn stdout() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            on: use_color(std::io::stdout().is_terminal()),
+        }
+    }
+
+    fn stderr() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            on: use_color(std::io::stderr().is_terminal()),
+        }
+    }
+
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.on {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn bold(&self, text: &str) -> String {
+        self.paint("1", text)
+    }
+
+    fn dim(&self, text: &str) -> String {
+        self.paint("2", text)
+    }
+
+    /// Section headings (`== … ==`, table headers).
+    fn heading(&self, text: &str) -> String {
+        self.paint("1;36", text)
+    }
+
+    /// Pointers to follow-up commands.
+    fn command(&self, text: &str) -> String {
+        self.paint("36", text)
+    }
+
+    /// Attention: a finding's count, a wedge label, a staleness warning.
+    fn warn(&self, text: &str) -> String {
+        self.paint("33", text)
+    }
+
+    fn good(&self, text: &str) -> String {
+        self.paint("32", text)
+    }
+}
+
+fn use_color(tty: bool) -> bool {
+    tty && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
+
 /// Render a table as aligned text or GitHub-flavored markdown. Auto-sizes
-/// columns; `aligns` controls per-column alignment in table mode.
+/// columns; `aligns` controls per-column alignment in table mode. `json` is
+/// each command's own payload, emitted before reaching here.
 fn render(headers: &[&str], aligns: &[Align], rows: &[Vec<String>], format: Format) {
     match format {
+        Format::Json => unreachable!("json is emitted by the command, not the table renderer"),
         Format::Markdown => {
             println!("| {} |", headers.join(" | "));
             let sep: Vec<&str> = headers.iter().map(|_| "---").collect();
@@ -1699,6 +2280,9 @@ fn render(headers: &[&str], aligns: &[Align], rows: &[Vec<String>], format: Form
             }
         }
         Format::Table => {
+            // Styling wraps a cell only after padding, so ANSI codes never
+            // enter the width math.
+            let style = Style::stdout();
             let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
             for row in rows {
                 for (col, cell) in row.iter().enumerate() {
@@ -1714,9 +2298,9 @@ fn render(headers: &[&str], aligns: &[Align], rows: &[Vec<String>], format: Form
                     .join("  ")
             };
             let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
-            println!("{}", format_row(&header_cells));
+            println!("{}", style.heading(&format_row(&header_cells)));
             let total: usize = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
-            println!("{}", "-".repeat(total));
+            println!("{}", style.dim(&"-".repeat(total)));
             for row in rows {
                 println!("{}", format_row(row));
             }

@@ -106,8 +106,8 @@ all. A differential (baseline with vs without a server) is also unavailable
 because every project shares the global `mcp.json`. A "tool count × average
 schema size" estimate would therefore be a fabrication for the cases that matter,
 so the tool does **not** invent one. The honest substitutes it does provide:
-per-server **call frequency** (`surfaces` / `wedges` — a used vs dead-weight
-signal), and the **residual** in `baseline` (an upper bound on system + built-in
+per-server **call frequency** (`inventory` / `waste` — a used vs dead-weight
+signal), and the **residual** in `overhead` (an upper bound on system + built-in
 tools + all MCP schemas combined). Isolating one server's cost would need runtime
 schema access this tool does not have.
 

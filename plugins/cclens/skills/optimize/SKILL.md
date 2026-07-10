@@ -1,6 +1,6 @@
 ---
 name: optimize
-description: Investigate cclens findings about the user's Claude Code usage to root cause and propose concrete config fixes — recurring tool failures, unused or heavy config, always-on context cost. Use when the user wants to optimize their Claude Code configuration, cut token waste or friction, or act on cclens summary findings.
+description: Investigate cclens findings about the user's Claude Code usage to root cause and propose concrete config fixes — recurring tool failures, unused or heavy config, always-on context cost. Use when the user wants to optimize their Claude Code configuration, cut token waste or friction, or act on cclens doctor findings.
 ---
 
 # cclens optimize — act on the findings in this session

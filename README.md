@@ -14,7 +14,7 @@ run it.
 With Nix (no toolchain to set up):
 
 ```sh
-nix run github:lambdalisue/cclens -- summary   # run without installing
+nix run github:lambdalisue/cclens -- doctor   # run without installing
 nix profile install github:lambdalisue/cclens  # install `cclens` onto PATH
 ```
 
@@ -45,7 +45,7 @@ so you can drive cclens from inside a Claude Code session:
 
 | Skill | What it does |
 | --- | --- |
-| `/cclens:summary` | Analyze and present the one-screen health check in the session. |
+| `/cclens:doctor` | Analyze and present the one-screen health check in the session. |
 | `/cclens:optimize` | The `cclens optimize` advisor, in the **current** session: investigate the findings to root cause and propose concrete config fixes. |
 | `/cclens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
 
@@ -59,11 +59,11 @@ keep the store at `~/.cache/cclens/cclens.db` instead of dropping a
 ```sh
 # 1. Start here — a one-screen health check, split into what to fix globally
 #    (~/.claude) vs per project. Analyzes automatically on first run.
-cclens summary
+cclens doctor
 
 # 2. Narrow to the layer you're optimizing.
-cclens summary --scope global
-cclens summary --scope project:<slug>
+cclens doctor --scope global
+cclens doctor --scope project:<slug>
 
 # 3. Act on the findings: hand them to an interactive `claude` session that
 #    investigates each root cause and proposes concrete fixes.
@@ -85,34 +85,38 @@ on stderr; pass `--frozen` to read the store exactly as it is. Running
 
 | Command | What it does |
 | --- | --- |
-| `cclens summary` | One-screen health check, split global / per-project — **start here**. |
+| `cclens doctor` | The health check, split global / per-project — **start here**. |
 | `cclens analyze` | Extract transcripts + config into the store (incremental). Reads run it automatically. |
 | `cclens sql '<query>'` | Run an arbitrary read-only SQL query against the store (see below). |
 | `cclens optimize` | Hand the findings to an interactive `claude` session to act on. |
 
-`--scope global | project | project:<slug>` (on `summary`, `friction`,
-`wedges`, `surfaces`, `optimize`) restricts a report to the config layer being
-optimized: config wedges route by where the surface is installed, and a
-friction category belongs to the project that owns a strict majority of it —
-otherwise it is a cross-project habit and shows up as global.
+`--scope global | project | project:<slug>` (on `doctor`, `failures`,
+`waste`, `inventory`, `optimize`) restricts a report to the config layer being
+optimized: an unused/heavy config finding routes by where that file is
+installed, and a recurring failure belongs to the project that owns a strict
+majority of it — otherwise it is a cross-project habit and shows up as global.
 
 ### Views
 
 Each is a curated lens that carries logic a raw query cannot (a classification,
-an algorithm, a suggestion). Add `--format markdown` to paste into a PR or note.
+an algorithm, a suggestion). Add `--format markdown` to paste into a PR or
+note, or `--format json` (every command, `doctor` and `analyze` included) for
+typed machine-readable output — stdout carries nothing but the JSON, since all
+freshness chatter goes to stderr. Human output is colorized on a terminal;
+`NO_COLOR` or piping turns it off.
 
 ```sh
-cclens wedges                 # ranked optimization opportunities, with a suggested action
-cclens wedges --scope global  # …only what a global-config cleanup should touch
-cclens surfaces               # every installed surface (with its scope) × its actual usage
-cclens baseline               # always-on context per session, reconciled vs your config
+cclens waste                 # ranked optimization opportunities, with a suggested action
+cclens waste --scope global  # …only what a global-config cleanup should touch
+cclens inventory               # every installed surface (with its scope) × its actual usage
+cclens overhead               # always-on context per session, reconciled vs your config
 cclens usage                  # per-skill usage, most-invoked first
 cclens usage --by month       # usage per time bucket (JST: year|month|week|day|hour)
-cclens friction               # recurring tool failures by category, ranked, with fixes
-cclens friction --scope global          # failures no project owns (a cross-project habit)
-cclens friction --scope project:<slug>  # one project's failures (fix lands in its config)
+cclens failures               # recurring tool failures by category, ranked, with fixes
+cclens failures --scope global          # failures no project owns (a cross-project habit)
+cclens failures --scope project:<slug>  # one project's failures (fix lands in its config)
 cclens prompts                # how you steer the session (steer/correct/question/instruct)
-cclens thrash                 # files Claude got stuck re-editing in rapid bursts
+cclens stuck                 # files Claude got stuck re-editing in rapid bursts
 ```
 
 ### `sql` — query the store directly
@@ -121,7 +125,7 @@ Anything the curated views don't cover is a SQL query — the store is the whole
 point. The query is an argument, or read from **stdin**:
 
 ```sh
-# Which tool produces each friction category?
+# Which tool produces each failure category?
 cclens sql "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
 
 # The actual failing paths behind path-not-found (stdin form):
@@ -131,7 +135,7 @@ echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | cclens 
 cclens sql "SELECT sql FROM sqlite_master"
 ```
 
-The `tool_errors` view names the friction columns (`category`, `excerpt`,
+The `tool_errors` view names the failure columns (`category`, `excerpt`,
 `tool`, `project`); the db is opened read-only, so a query can never mutate the
 derived store.
 
@@ -142,7 +146,7 @@ derived store.
   against actual usage to flag unused (delete), always-on heavy (slim), and
   costly+rare (trim).
 - **Where the work stumbles** — recurring tool failures by category and
-  originating tool (`friction`), files Claude got stuck re-editing (`thrash`),
+  originating tool (`failures`), files Claude got stuck re-editing (`stuck`),
   each with concrete examples and the project it concentrates in.
 - **Where tokens go** — main-thread skill output vs. subagent cost, and the
   always-on context floor reconciled against your readable config (the residual

@@ -108,7 +108,7 @@ pub struct SessionMeta {
 /// subagents spawned by later same-window work, so a per-skill figure
 /// over-counts for skills that do not themselves spawn agents. The exact figure
 /// is the session-level total (`subagent_totals`). See `docs/specs/events.md`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub struct SkillUsage {
     pub skill: String,
     pub invocations: i64,
@@ -121,7 +121,7 @@ pub struct SkillUsage {
 /// attributed to this row under per-project shadowing (a project row absorbs
 /// its own project's events; the global row keeps everyone else's). See
 /// `docs/specs/surfaces.md`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub struct CatalogEntry {
     pub kind: String,
     pub id: String,
@@ -135,7 +135,7 @@ pub struct CatalogEntry {
 }
 
 /// One skill event's cost, with its UTC start, for time bucketing.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub struct EventCost {
     pub started_epoch: i64,
     pub out_tokens: i64,
@@ -182,6 +182,24 @@ impl Store {
             .query_map([], |row| {
                 (0..ncol)
                     .map(|i| Ok(value_to_string(row.get_ref(i)?)))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((columns, rows))
+    }
+
+    /// Like `query`, but with SQLite's types preserved as JSON values — the
+    /// machine half of the output contract (`--format json`): integers and
+    /// reals stay numbers, NULL stays null, so a consumer never re-parses
+    /// strings.
+    pub fn query_json(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let ncol = columns.len();
+        let rows = stmt
+            .query_map([], |row| {
+                (0..ncol)
+                    .map(|i| Ok(value_to_json(row.get_ref(i)?)))
                     .collect::<rusqlite::Result<Vec<_>>>()
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -594,6 +612,17 @@ impl Store {
         Ok(floor)
     }
 
+    /// How much data the store holds: `(sessions, distinct projects)` — the
+    /// summary's "what was analyzed" context line.
+    pub fn session_stats(&self) -> Result<(i64, i64)> {
+        let row = self.conn.query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT project) FROM sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(row)
+    }
+
     /// Total subagent output tokens and subagent count across all sessions.
     pub fn subagent_totals(&self) -> Result<(i64, i64)> {
         let row = self.conn.query_row(
@@ -795,6 +824,18 @@ fn epoch_ms_to_rfc3339(epoch_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(epoch_ms)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
+}
+
+/// A SQLite cell as a typed JSON value, for the `--format json` surface.
+fn value_to_json(v: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => serde_json::json!(i),
+        ValueRef::Real(f) => serde_json::json!(f),
+        ValueRef::Text(t) => serde_json::json!(String::from_utf8_lossy(t)),
+        ValueRef::Blob(_) => serde_json::json!("<blob>"),
+    }
 }
 
 /// Stringify a SQLite cell for the generic `query` surface.
@@ -1214,6 +1255,22 @@ mod tests {
     }
 
     #[test]
+    fn session_stats_count_sessions_and_distinct_projects() {
+        let mut store = Store::in_memory().unwrap();
+        let mut a = session("a1");
+        a.project = "alpha".to_string();
+        let mut b = session("b1");
+        b.project = "alpha".to_string();
+        let mut c = session("c1");
+        c.project = "beta".to_string();
+        store.ingest_session(&a, &[], &[]).unwrap();
+        store.ingest_session(&b, &[], &[]).unwrap();
+        store.ingest_session(&c, &[], &[]).unwrap();
+
+        assert_eq!(store.session_stats().unwrap(), (3, 2));
+    }
+
+    #[test]
     fn work_event_rows_carry_their_project() {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
@@ -1230,6 +1287,31 @@ mod tests {
         assert_eq!(
             store.work_event_rows_by_project("file_edit").unwrap(),
             vec![("alpha".to_string(), "x.rs".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn query_json_preserves_sqlite_types() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+
+        let (cols, rows) = store
+            .query_json("SELECT project, COUNT(*) AS n, NULL AS absent, 1.5 AS ratio FROM sessions")
+            .unwrap();
+
+        assert_eq!(cols, vec!["project", "n", "absent", "ratio"]);
+        // Numbers stay numbers, NULL stays null — a `--format json` consumer
+        // must not need to re-parse strings.
+        assert_eq!(
+            rows,
+            vec![vec![
+                serde_json::json!("alpha"),
+                serde_json::json!(1),
+                serde_json::Value::Null,
+                serde_json::json!(1.5),
+            ]]
         );
     }
 

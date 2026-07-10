@@ -24,6 +24,14 @@ two specs most likely to change when Claude Code ships a new release.
 - `<cwd-slug>` encodes the working directory (path separators → `-`). Worktree
   directories appear as their own slugs (e.g. a `...--wt-feat-x` suffix); the
   store folds these to a parent project — see `storage.md`.
+- The slug is **lossy** (`-` in a path component is indistinguishable from a
+  separator), so the real project root comes from the records themselves: most
+  record types carry a `cwd` field with the absolute working directory. A
+  session that changes directory stamps later records with the child path, so
+  the adapter takes the **first** recorded `cwd` as the session root
+  (`session_cwd` in `transcript.rs`) — the directory the session started in,
+  which is what the slug encodes. Sessions whose records carry no `cwd` have an
+  unknown root; project-config scanning simply skips them (`config-format.md`).
 - A **main** transcript and its **subagent** transcripts are separate files.
   This separation is load-bearing: a main transcript's records describe only the
   main thread's context, so main-thread metrics are computed from the main file

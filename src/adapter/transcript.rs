@@ -417,6 +417,23 @@ pub fn count_permission_denials(jsonl: &str) -> usize {
         .count()
 }
 
+/// The working directory a session started in — the project root. Records carry
+/// a `cwd` field; a session that changes directory mid-way stamps later records
+/// with the child path, so the **first** recorded cwd is the root (it is the
+/// directory the transcript's own cwd-slug encodes, and it is deterministic).
+/// `None` when no record carries one.
+pub fn session_cwd(jsonl: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct RawCwd {
+        cwd: Option<String>,
+    }
+    jsonl.lines().find_map(|line| {
+        serde_json::from_str::<RawCwd>(line)
+            .ok()
+            .and_then(|raw| raw.cwd)
+    })
+}
+
 /// The `promptId` a subagent transcript was spawned under — the join key back to
 /// the spawning span. Read from the first record that carries one.
 pub fn subagent_prompt_id(jsonl: &str) -> Option<String> {
@@ -617,6 +634,28 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","content":"x"}]}}"#,
         );
         assert!(parse_session(jsonl).is_empty());
+    }
+
+    #[test]
+    fn session_cwd_is_the_first_recorded_cwd() {
+        // A session may change directory mid-way (records then carry a child
+        // cwd); the project root is the cwd the session *started* in — the same
+        // directory the transcript's slug encodes.
+        let jsonl = concat!(
+            r#"{"type":"user","cwd":"/tmp/example/project","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/tmp/example/project/subdir","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":"more"}}"#,
+        );
+        assert_eq!(session_cwd(jsonl).as_deref(), Some("/tmp/example/project"));
+    }
+
+    #[test]
+    fn session_cwd_is_none_when_no_record_carries_one() {
+        let jsonl = concat!(
+            "not json\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"hi"}}"#,
+        );
+        assert_eq!(session_cwd(jsonl), None);
     }
 
     #[test]

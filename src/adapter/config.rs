@@ -17,11 +17,11 @@ pub fn approx_tokens(text: &str) -> u64 {
 /// Build a `skill` surface from one `SKILL.md`. Skills load only their
 /// description at startup, so the load mode is `StartupDescription`; the static
 /// cost is the whole file (what is paid on-demand when invoked).
-pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: Scope) -> Surface {
+pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     Surface {
         kind: "skill".to_string(),
         id: id.to_string(),
-        scope,
+        scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
         load_mode: LoadMode::StartupDescription,
@@ -30,7 +30,7 @@ pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: Scope) -
 
 /// Read every `<name>/SKILL.md` under a skills directory into surfaces. A
 /// missing directory yields nothing (the scope may simply not exist).
-pub fn read_skill_surfaces(skills_dir: &Path, scope: Scope) -> Vec<Surface> {
+pub fn read_skill_surfaces(skills_dir: &Path, scope: &Scope) -> Vec<Surface> {
     let Ok(entries) = fs::read_dir(skills_dir) else {
         return Vec::new();
     };
@@ -53,7 +53,7 @@ pub fn read_skill_surfaces(skills_dir: &Path, scope: Scope) -> Vec<Surface> {
 /// Build a `rule` surface. A rule with a `paths:` frontmatter key is loaded
 /// only when a matching file is in play (`PathConditional`); one without is
 /// always loaded (`StartupFull`). See `docs/specs/config-format.md`.
-pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: Scope) -> Surface {
+pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     let load_mode = if has_paths_frontmatter(content) {
         LoadMode::PathConditional
     } else {
@@ -62,7 +62,7 @@ pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: Scope) ->
     Surface {
         kind: "rule".to_string(),
         id: id.to_string(),
-        scope,
+        scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
         load_mode,
@@ -70,11 +70,11 @@ pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: Scope) ->
 }
 
 /// Build an `agent` surface. Like skills, only the description loads at startup.
-pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: Scope) -> Surface {
+pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     Surface {
         kind: "agent".to_string(),
         id: id.to_string(),
-        scope,
+        scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
         load_mode: LoadMode::StartupDescription,
@@ -82,11 +82,11 @@ pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: Scope) -
 }
 
 /// Build a `claude_md` surface — always-on context paid every session.
-pub fn claude_md_surface(id: &str, config_path: &str, content: &str, scope: Scope) -> Surface {
+pub fn claude_md_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     Surface {
         kind: "claude_md".to_string(),
         id: id.to_string(),
-        scope,
+        scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
         load_mode: LoadMode::StartupFull,
@@ -107,7 +107,7 @@ fn has_paths_frontmatter(content: &str) -> bool {
 }
 
 /// Read every `<name>.md` agent file in a directory into surfaces.
-pub fn read_agent_surfaces(agents_dir: &Path, scope: Scope) -> Vec<Surface> {
+pub fn read_agent_surfaces(agents_dir: &Path, scope: &Scope) -> Vec<Surface> {
     read_markdown_files(agents_dir)
         .into_iter()
         .map(|(id, path, content)| agent_surface(&id, &path, &content, scope))
@@ -116,13 +116,13 @@ pub fn read_agent_surfaces(agents_dir: &Path, scope: Scope) -> Vec<Surface> {
 
 /// Read every `*.md` rule (recursively, so category subdirs are included) into
 /// surfaces. The id is the path relative to the rules dir, without `.md`.
-pub fn read_rule_surfaces(rules_dir: &Path, scope: Scope) -> Vec<Surface> {
+pub fn read_rule_surfaces(rules_dir: &Path, scope: &Scope) -> Vec<Surface> {
     let mut surfaces = Vec::new();
     collect_rule_surfaces(rules_dir, rules_dir, scope, &mut surfaces);
     surfaces
 }
 
-fn collect_rule_surfaces(root: &Path, dir: &Path, scope: Scope, out: &mut Vec<Surface>) {
+fn collect_rule_surfaces(root: &Path, dir: &Path, scope: &Scope, out: &mut Vec<Surface>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -150,7 +150,7 @@ fn collect_rule_surfaces(root: &Path, dir: &Path, scope: Scope, out: &mut Vec<Su
 }
 
 /// Read a single `CLAUDE.md` / `AGENTS.md` file into a surface, if it exists.
-pub fn read_claude_md_surface(path: &Path, id: &str, scope: Scope) -> Option<Surface> {
+pub fn read_claude_md_surface(path: &Path, id: &str, scope: &Scope) -> Option<Surface> {
     let content = fs::read_to_string(path).ok()?;
     Some(claude_md_surface(
         id,
@@ -160,10 +160,29 @@ pub fn read_claude_md_surface(path: &Path, id: &str, scope: Scope) -> Option<Sur
     ))
 }
 
+/// Read one project's installed config into surfaces, every one stamped with
+/// that project's scope. Mirrors the global layout under `<root>/.claude`, plus
+/// the in-repo `CLAUDE.md` / `AGENTS.md` and `.mcp.json`
+/// (`docs/specs/config-format.md`). A root with none of these yields nothing.
+pub fn read_project_surfaces(root: &Path, project: &str) -> Vec<Surface> {
+    let scope = Scope::Project(project.to_string());
+    let claude = root.join(".claude");
+    let mut surfaces = read_skill_surfaces(&claude.join("skills"), &scope);
+    surfaces.extend(read_rule_surfaces(&claude.join("rules"), &scope));
+    surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
+    surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        if let Some(surface) = read_claude_md_surface(&root.join(name), name, &scope) {
+            surfaces.push(surface);
+        }
+    }
+    surfaces
+}
+
 /// Read MCP server declarations from an `mcp.json` (top-level `mcpServers`
 /// object) into surfaces. The tool-schema cost is dynamic and not on disk, so
 /// `static_tokens` is unknown (`None`) — see `docs/specs/config-format.md`.
-pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: Scope) -> Vec<Surface> {
+pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: &Scope) -> Vec<Surface> {
     let Ok(text) = fs::read_to_string(mcp_json) else {
         return Vec::new();
     };
@@ -183,7 +202,7 @@ pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: Scope) -> Vec<Surface> {
             // server like `grafana:prod` joins its `grafana_prod` usage instead
             // of showing up as both UNUSED (catalog) and ORPHANED (usage).
             id: sanitize_mcp_server_id(name),
-            scope,
+            scope: scope.clone(),
             config_path: mcp_json.display().to_string(),
             static_tokens: None,
             load_mode: LoadMode::ToolSchema,
@@ -243,7 +262,7 @@ mod tests {
             "git-commit",
             "/tmp/skills/git-commit/SKILL.md",
             "12345678", // 8 chars -> 2 tokens
-            Scope::Global,
+            &Scope::Global,
         );
 
         assert_eq!(surface.kind, "skill");
@@ -256,7 +275,7 @@ mod tests {
     #[test]
     fn a_rule_with_paths_frontmatter_is_path_conditional() {
         let content = "---\npaths:\n  - \"src/**/*.rs\"\n---\n# Rule body";
-        let surface = rule_surface("spec-sync", "/cfg/spec-sync.md", content, Scope::Global);
+        let surface = rule_surface("spec-sync", "/cfg/spec-sync.md", content, &Scope::Global);
         assert_eq!(surface.kind, "rule");
         assert_eq!(surface.load_mode, LoadMode::PathConditional);
     }
@@ -264,13 +283,13 @@ mod tests {
     #[test]
     fn a_rule_without_paths_is_always_on() {
         let content = "---\ndescription: a thing\n---\n# Body";
-        let surface = rule_surface("convention", "/cfg/convention.md", content, Scope::Global);
+        let surface = rule_surface("convention", "/cfg/convention.md", content, &Scope::Global);
         assert_eq!(surface.load_mode, LoadMode::StartupFull);
     }
 
     #[test]
     fn a_rule_with_no_frontmatter_is_always_on() {
-        let surface = rule_surface("plain", "/cfg/plain.md", "# Just a heading", Scope::Global);
+        let surface = rule_surface("plain", "/cfg/plain.md", "# Just a heading", &Scope::Global);
         assert_eq!(surface.load_mode, LoadMode::StartupFull);
     }
 
@@ -288,13 +307,44 @@ mod tests {
     }
 
     #[test]
+    fn read_project_surfaces_walks_the_project_layout() {
+        // A synthetic project directory (privacy rule: fixtures are fabricated).
+        let root = std::env::temp_dir().join(format!("cclens-test-project-{}", std::process::id()));
+        let claude = root.join(".claude");
+        fs::create_dir_all(claude.join("skills/deploy")).unwrap();
+        fs::write(claude.join("skills/deploy/SKILL.md"), "deploy skill").unwrap();
+        fs::create_dir_all(claude.join("rules")).unwrap();
+        fs::write(claude.join("rules/tdd.md"), "# tdd").unwrap();
+        fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"playwright":{}}}"#,
+        )
+        .unwrap();
+
+        let surfaces = read_project_surfaces(&root, "alpha");
+        fs::remove_dir_all(&root).ok();
+
+        let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
+        assert!(
+            surfaces
+                .iter()
+                .all(|s| s.scope == Scope::Project("alpha".to_string()))
+        );
+        assert!(has("skill", "deploy"));
+        assert!(has("rule", "tdd"));
+        assert!(has("claude_md", "CLAUDE.md"));
+        assert!(has("mcp_server", "playwright"));
+    }
+
+    #[test]
     fn claude_md_is_always_on_and_agents_load_by_description() {
         assert_eq!(
-            claude_md_surface("global", "/c/CLAUDE.md", "x", Scope::Global).load_mode,
+            claude_md_surface("global", "/c/CLAUDE.md", "x", &Scope::Global).load_mode,
             LoadMode::StartupFull
         );
         assert_eq!(
-            agent_surface("explorer", "/c/explorer.md", "x", Scope::Global).load_mode,
+            agent_surface("explorer", "/c/explorer.md", "x", &Scope::Global).load_mode,
             LoadMode::StartupDescription
         );
     }

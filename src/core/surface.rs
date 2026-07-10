@@ -3,18 +3,29 @@
 //! (`docs/specs/surfaces.md`). The adapter fills these from live config; the
 //! join against events lives in the store.
 
-/// Where a surface is installed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a surface is installed: the shared `~/.claude`, or one specific
+/// project's config. The project scope names its project (the normalized slug)
+/// because many projects coexist in one catalog and shadowing is per-project
+/// (`docs/specs/surfaces.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Global,
-    Project,
+    Project(String),
 }
 
 impl Scope {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Scope::Global => "global",
-            Scope::Project => "project",
+            Scope::Project(_) => "project",
+        }
+    }
+
+    /// The owning project's normalized slug — empty for the global scope.
+    pub fn project(&self) -> &str {
+        match self {
+            Scope::Global => "",
+            Scope::Project(project) => project,
         }
     }
 }

@@ -13,7 +13,13 @@ that tracks an upstream format and will drift.
 ## Where config lives
 
 Config exists at two scopes; project overrides/extends global. The adapter scans
-both and records the scope on each surface.
+both and records the scope on each surface — `Scope::Project` carries the
+owning project's normalized slug, since many projects coexist in one catalog
+(`storage.md`). Which project roots get scanned is driven by the *sessions*:
+`analyze` collects the distinct real session roots (`session-format.md`, the
+records' `cwd`, worktree folded onto the parent checkout) and scans each root
+that still exists on disk (`read_project_surfaces` in `config.rs`); a root that
+was deleted since its sessions ran simply contributes no project surfaces.
 
 | Surface kind | Global | Project-local |
 | --- | --- | --- |

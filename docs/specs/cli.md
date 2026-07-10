@@ -25,24 +25,57 @@ the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).
 ## Views — read the store
 
 ```
-cclens <view> [--by <bucket>] [--project <name>] [--format table|markdown] [--db <path>]
+cclens <view> [--scope global|project[:<slug>]] [--by <bucket>] [--frozen]
+              [--format table|markdown] [--db <path>]
 ```
 
-Each view is its own top-level command; they only query the store, never raw
-input. The set is deliberately curated — a view earns a command by carrying
+Each view is its own top-level command; their queries only read the store, never
+raw input. The set is deliberately curated — a view earns a command by carrying
 logic a one-line query cannot (a classification, an algorithm, a suggestion). Any
 *other* slice is a `sql` query (below), so thin "just count a column" views are
 not commands.
 
+### Freshness — reads auto-refresh
+
+A stale store the user cannot notice was a real failure mode, so a read command
+**runs the incremental `analyze` stage first by default** — the same composition
+`optimize` always had (`architecture.md`). With `ingested_files` skipping
+unchanged transcripts (`storage.md`), an up-to-date store costs one stat per
+transcript. The refresh reuses the roots recorded in `meta` (`projects_dir`),
+and a missing db is simply created — "absent db" is an error only for `sql`.
+`--frozen` suppresses the refresh and reads the store as-is.
+
+Every read prints a **one-line freshness header on stderr** (stdout stays clean
+for pipes): what was refreshed, or — under `--frozen` / `sql` — how old the
+store is, with a re-analyze hint once it is older than a day.
+
+### Scope — route each finding to the config layer that owns the fix
+
+"Optimize my global setup" and "optimize this project" are different tasks, and
+mixing them lets one busy project drown the global picture. Every finding is
+routed (`core::scope`):
+
+- **Config wedges** route by the surface's own scope column (`storage.md`).
+- **Friction categories** route by concentration: a strict-majority project owns
+  the category (fix in that project's config); a spread category is global (a
+  cross-project habit).
+- **Thrash** routes to the project it happened in; **cd% / prompting / token
+  totals** are behavioral, hence global.
+
+`--scope` narrows a report to one layer: `global`, `project` (all projects), or
+`project:<slug>` (one). `summary`, the optimize briefing, and (by default) the
+scoped views show **both layers split into sections** rather than a merged
+ranking.
+
 | View | Answers |
 | --- | --- |
-| `summary` | The entry point: a one-screen health check that pulls the few most actionable findings from every view (token destinations, always-on cost, top fixable friction — annotated with the project a category concentrates in — cd overhead + worst thrash, unused config, prompting) into one prioritised report — so the tool answers "what should I do" without running ten commands. |
-| `surfaces` | The catalog×usage join per surface: static cost, load mode, usage, cost — the optimization wedges (`surfaces.md`), ranked. |
+| `summary` | The entry point: a one-screen health check that pulls the few most actionable findings from every view into one prioritised report, **split by owning layer** — a `== global ==` section (token destinations, always-on cost, spread friction, cd overhead, global config wedges, prompting) then a `== projects ==` section (each project's owned friction, worst thrash, project config wedges; capped, with a `--scope project` pointer) — so the tool answers "what should I do, and in which config" without running ten commands. |
+| `surfaces` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
-| `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence. |
+| `wedges` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
 | `baseline` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
-| `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--project <slug>` restricts to one project so the fix lands in the right config. Lexical heuristics. |
+| `friction` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Lexical heuristics. |
 | `thrash` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. |
 
 Output is a terminal **table** by default or **Markdown** (`--format markdown`)
@@ -96,6 +129,11 @@ spike a reader over-trusts; one combined flag says "read this number loosely".
 cclens sql [<query>] [--format table|markdown] [--db <path>]
 ```
 
+`sql` is the one read that never auto-refreshes — it opens the store strictly
+read-only, so an ad-hoc query is reproducible and can never mutate anything.
+It prints the freshness header (store age) on stderr instead, so a stale read
+is at least visible.
+
 The store's own query surface: run an arbitrary read query and print the result.
 The query is the argument, or — when omitted — read from **stdin**, so both
 `cclens sql "SELECT …"` and `echo "SELECT …" | cclens sql` work (stdin
@@ -117,12 +155,13 @@ lists the full schema.
 ## `optimize` — act on the findings with an interactive `claude` session
 
 ```
-cclens optimize [--projects <dir>] [--db <path>] [--skip-analyze] [--print]
+cclens optimize [--projects <dir>] [--db <path>] [--scope global|project[:<slug>]]
+                [--frozen] [--print]
 ```
 
 The AI-proposal consumer (`architecture.md`): rather than emit static
 "recommendations" the tool cannot safely act on, `optimize` analyzes (unless
-`--skip-analyze`), composes the findings with a prescribed advisor prompt, and
+`--frozen`, the same flag the views use), composes the findings with a prescribed advisor prompt, and
 launches `claude` seeded with it — so the user optimizes *interactively*, with an
 agent that can read their config and apply edits on agreement. The prompt makes
 the session **investigate autonomously to a conclusion**: it pins down each root
@@ -136,7 +175,12 @@ plan, gate only on applying it" shape is the design; if it changes, update
 
 Crucially the briefing is the **complete** analysis, not a headline — every
 project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
-unused / always-on-heavy surface lists with token costs. Each friction category
+unused / always-on-heavy surface lists with token costs — **routed the same way
+the views are** (see "Scope"): global sections first, then one section per
+project, so the session fixes each finding in the layer that owns it. `--scope`
+restricts the briefing to one layer and prepends an explicit scope statement
+(`core::optimize::scope_statement`), turning the session into "optimize my
+global setup" or "optimize this project" specifically. Each friction category
 also carries its **split across the originating tools** (`path-not-found` →
 `Bash 33, Read 29, Edit 9, playwright 7`) and a few **concrete example excerpts**
 — the actual failing paths/files behind the count (`events.md`: `tool_error`

@@ -24,10 +24,15 @@ exercised in a transcript but absent from the catalog (e.g. a skill that was
 since deleted) is also meaningful — it is reported as **orphaned usage**, the
 mirror of unused config.
 
-A surface exists at one or both scopes (global, project). The catalog keeps both
-rows, but the join resolves to the **effective surface** — project shadows global
-— so one event never double-counts across scopes (`storage.md` "Surface
-identity, scope, and the effective join").
+A surface exists at the global scope, in any number of projects, or both. The
+catalog keeps every row (scope + owning project), and the join resolves each
+event against the **effective surface for its session's project** — that
+project's copy shadows global there, while other projects' events still land on
+the global row — so one event never double-counts across scopes and one
+project's usage never inflates another's copy (`storage.md` "Surface identity,
+scope, and the effective join"). Scope is also the routing key for reports: a
+wedge on a project-scoped surface is that project's finding, not a global one
+(`cli.md` `--scope`).
 
 ### Usage-measurable vs catalog-only surfaces
 

@@ -57,21 +57,27 @@ keep the store at `~/.cache/cclens/cclens.db` instead of dropping a
 ## Quick start
 
 ```sh
-# 1. Analyze your transcripts + config into a local SQLite store.
-cclens analyze
-
-# 2. Start here — a one-screen health check of the most actionable findings.
+# 1. Start here — a one-screen health check, split into what to fix globally
+#    (~/.claude) vs per project. Analyzes automatically on first run.
 cclens summary
 
-# 3. Act on them: hand the findings to an interactive `claude` session that
+# 2. Narrow to the layer you're optimizing.
+cclens summary --scope global
+cclens summary --scope project:<slug>
+
+# 3. Act on the findings: hand them to an interactive `claude` session that
 #    investigates each root cause and proposes concrete fixes.
-cclens optimize
+cclens optimize --scope global
 ```
 
-`analyze` reads your transcripts (`~/.claude/projects`) and live config
-(`~/.claude/{skills,rules,agents,mcp.json,CLAUDE.md}`) **read-only** and
-incrementally, writing `cclens.db`. Nothing is sent anywhere; the store is a
-local file. Every command takes `--db <path>` (default `cclens.db`).
+Analysis reads your transcripts (`~/.claude/projects`) and live config —
+`~/.claude/*` plus each analyzed project's own `.claude/` / `CLAUDE.md` —
+**read-only** and incrementally, writing `cclens.db`. Nothing is sent anywhere;
+the store is a local file. Every command takes `--db <path>` (default
+`cclens.db`). Read commands refresh the store automatically before reporting
+(unchanged transcripts are skipped, so this is fast) and print a freshness line
+on stderr; pass `--frozen` to read the store exactly as it is. Running
+`cclens analyze` yourself is only needed to refresh without reading.
 
 ## Commands
 
@@ -79,10 +85,16 @@ local file. Every command takes `--db <path>` (default `cclens.db`).
 
 | Command | What it does |
 | --- | --- |
-| `cclens analyze` | Extract transcripts + config into the store. Run it to refresh. |
-| `cclens summary` | One-screen health check across every view — **start here**. |
+| `cclens summary` | One-screen health check, split global / per-project — **start here**. |
+| `cclens analyze` | Extract transcripts + config into the store (incremental). Reads run it automatically. |
 | `cclens sql '<query>'` | Run an arbitrary read-only SQL query against the store (see below). |
 | `cclens optimize` | Hand the findings to an interactive `claude` session to act on. |
+
+`--scope global | project | project:<slug>` (on `summary`, `friction`,
+`wedges`, `surfaces`, `optimize`) restricts a report to the config layer being
+optimized: config wedges route by where the surface is installed, and a
+friction category belongs to the project that owns a strict majority of it —
+otherwise it is a cross-project habit and shows up as global.
 
 ### Views
 
@@ -91,12 +103,14 @@ an algorithm, a suggestion). Add `--format markdown` to paste into a PR or note.
 
 ```sh
 cclens wedges                 # ranked optimization opportunities, with a suggested action
-cclens surfaces               # every installed surface × its actual usage
+cclens wedges --scope global  # …only what a global-config cleanup should touch
+cclens surfaces               # every installed surface (with its scope) × its actual usage
 cclens baseline               # always-on context per session, reconciled vs your config
 cclens usage                  # per-skill usage, most-invoked first
 cclens usage --by month       # usage per time bucket (JST: year|month|week|day|hour)
 cclens friction               # recurring tool failures by category, ranked, with fixes
-cclens friction --project=<slug>   # one project's failures (fix lands in the right config)
+cclens friction --scope global          # failures no project owns (a cross-project habit)
+cclens friction --scope project:<slug>  # one project's failures (fix lands in its config)
 cclens prompts                # how you steer the session (steer/correct/question/instruct)
 cclens thrash                 # files Claude got stuck re-editing in rapid bursts
 ```
@@ -139,6 +153,9 @@ derived store.
 
 - Counts are usage signals for ranking, **not a billing ledger**; static cost is
   a token estimate, not a measured runtime figure.
+- The store is a regenerable cache. After upgrading cclens across a schema
+  change, commands refuse the old file with a hint — delete `cclens.db` (or
+  point `--db` somewhere fresh) and it is rebuilt on the next read.
 - `optimize` launches `claude` (Claude Code) seeded with the findings; the
   briefing is written to a private temp file, never passed on the command line.
 - Not yet implemented (see [`docs/specs/`](docs/specs/)): meta-skill (`loop`)

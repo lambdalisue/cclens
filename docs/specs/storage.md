@@ -15,6 +15,7 @@ CREATE TABLE sessions (
     id          TEXT PRIMARY KEY,   -- sessionId
     project     TEXT NOT NULL,      -- normalized (worktree folded; see below)
     slug        TEXT NOT NULL,      -- raw cwd-slug
+    root        TEXT NOT NULL,      -- real start directory (records' cwd, worktree folded); '' when unknown
     source_path TEXT NOT NULL,      -- the main transcript file
     started_at  TEXT NOT NULL,      -- RFC3339 UTC
     version     TEXT                -- Claude Code version, when present
@@ -25,11 +26,12 @@ CREATE TABLE surfaces (
     kind          TEXT NOT NULL,    -- skill | rule | mcp_server | mcp_tool | hook | claude_md | permission | agent
     id            TEXT NOT NULL,    -- stable identity within the kind
     scope         TEXT NOT NULL,    -- global | project
+    project       TEXT NOT NULL,    -- owning project's normalized slug; '' for global rows
     config_path   TEXT,
     static_tokens INTEGER,          -- token weight of the injected definition; NULL if unknown (e.g. mcp_tool)
     load_mode     TEXT NOT NULL,    -- startup_full | startup_description | path_conditional | on_demand | tool_schema
     attrs_json    TEXT,             -- kind-specific extras (paths glob, hook matcher, …)
-    PRIMARY KEY (kind, id, scope)
+    PRIMARY KEY (kind, id, scope, project)
 );
 
 -- Usage spine. One row per extracted event; a skill span is one kind.
@@ -68,6 +70,14 @@ CREATE TABLE ingested_files (
     size  INTEGER NOT NULL
 );
 
+-- Analyze-run metadata: analyzed_at (RFC3339 UTC), projects_dir, config_dir.
+-- Freshness reporting reads analyzed_at; auto-analyze on read commands re-runs
+-- the analysis against the same recorded roots (cli.md).
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- A clean read view over tool_error events for ad-hoc SQL (the `sql` command).
 -- The friction signal is overloaded onto generic event columns; the view names
 -- it and joins the project so a query need not know the encoding.
@@ -104,19 +114,21 @@ resolves to nothing; the event's counts remain.)
 
 ## Surface identity, scope, and the effective join
 
-`surfaces` is keyed `(kind, id, scope)` because the same logical surface can be
-installed both globally and project-locally (e.g. a `git-commit` skill in both
-`~/.claude/skills/` and `<project>/.claude/skills/`). Events, however, carry only
-`(surface_kind, surface_id)` — the transcript does not reveal which scope was
-actually loaded, and Claude Code's own resolution makes the **project** copy
-shadow the global one.
+`surfaces` is keyed `(kind, id, scope, project)` because the same logical
+surface can be installed globally and in **any number of projects** (e.g. a
+`git-commit` skill in `~/.claude/skills/` and in two projects'
+`.claude/skills/`). Events carry only `(surface_kind, surface_id)` — the
+transcript does not reveal which copy was loaded — but they *do* join a session
+whose `project` is known, and Claude Code's own resolution makes a project's
+copy shadow the global one **inside that project only**.
 
-So the catalog×usage join is defined against the **effective surface**: for each
-`(kind, id)`, the project-scope row when present, else the global row. The join
-is `events (surface_kind, surface_id) → effective surface (kind, id)`, strictly
-1:N-safe (one event never matches two surface rows). `scope` is retained as an
-attribute for drill-down and to report a shadowed global surface, but it is not
-part of the join key. `surfaces.md` and `config-format.md` describe the same
+So the catalog×usage join is defined per session project: an event from project
+P joins P's project row for that `(kind, id)` when one exists, else the global
+row. The join stays strictly 1:N-safe — one event never matches two surface
+rows, and one project's usage never inflates another project's copy
+(`Store::effective_catalog`). Scope and project are retained on every catalog
+row so reports can route a finding to the config layer that owns the fix
+(`cli.md` `--scope`). `surfaces.md` and `config-format.md` describe the same
 contract.
 
 ## Timestamps are stored in UTC

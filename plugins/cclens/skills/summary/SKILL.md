@@ -26,19 +26,23 @@ one-screen health check. Everything runs locally and read-only over
 
   and pass `--db "$DB"` to every command below.
 
-## 2. Refresh and report
+## 2. Report
 
 ```sh
-cclens analyze --db "$DB"       # incremental; fast when current
 cclens summary --db "$DB"
 ```
 
-(`summary` has no `--format` flag; the individual views do.)
+`summary` refreshes the store automatically (incremental; fast when current)
+and prints a freshness line on stderr. If the user asked about one layer, add
+`--scope global` or `--scope project:<slug>`. (`summary` has no `--format`
+flag; the individual views do.)
 
 ## 3. Present
 
-Relay the report's findings in the conversation language, keeping its ranking —
-it is already ordered by what is most actionable. Preserve the caveats it
+Relay the report's findings in the conversation language, keeping its structure
+— it is split into a global section (fix in `~/.claude`) and per-project
+sections (fix in each project's own config) precisely because those are
+different tasks; do not merge them back together. Preserve the caveats it
 prints (estimated tokens, evaluation windows); they exist so numbers are not
 over-trusted. Do not pad it with generic advice.
 

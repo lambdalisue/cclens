@@ -39,9 +39,13 @@ flowchart LR
 - **The read commands** — the curated views and the arbitrary-query `sql` —
   query the store and render. See `cli.md`.
 
-The stages are decoupled *only* by the store. The read commands never read raw
-input; `analyze` never renders. Consumers read the same store. Two were anticipated,
-and shape what `analyze` must capture:
+The stages are decoupled *only* by the store. The read commands' **rendering**
+never reads raw input; `analyze` never renders. But the stages **compose**: a
+view runs the incremental `analyze` stage first by default (`cli.md`
+`--frozen`), the way `optimize` always has — otherwise the store silently goes
+stale and the user cannot notice. Composition is stage-before-stage, not a leak:
+the view's queries still see only the store. Consumers read the same store. Two
+were anticipated, and shape what `analyze` must capture:
 
 - **Optimization proposals** — turning the findings into concrete advice. This
   is realized by `optimize` (`cli.md`): it composes the headline findings with a

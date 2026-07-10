@@ -31,8 +31,12 @@ advisor prompt. This skill runs the same analysis but adopts that prompt in the
 ```sh
 cclens analyze --db "$DB"
 PROMPT="$(mktemp)"
-cclens optimize --skip-analyze --print --db "$DB" > "$PROMPT"
+cclens optimize --frozen --print --db "$DB" > "$PROMPT"
 ```
+
+If the user asked to optimize their global setup or one specific project, add
+`--scope global` or `--scope project:<slug>` to the `optimize` command — the
+prompt then pins the work to that config layer.
 
 `--print` writes the full advisor prompt — the prescribed instructions plus the
 complete findings briefing — to stdout. It goes through a temp file (`mktemp`

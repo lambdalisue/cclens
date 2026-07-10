@@ -9,16 +9,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::adapter::config::{
-    read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_rule_surfaces,
-    read_skill_surfaces,
+    read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_project_surfaces,
+    read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
-    parse_session, subagent_prompt_id,
+    parse_session, session_cwd, subagent_prompt_id,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
+use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
@@ -57,24 +58,39 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Join the skill catalog against usage — installed skills, their cost, and
     /// what is unused.
     Surfaces {
+        /// Restrict to a config layer: global | project | project:<slug>.
+        #[arg(long)]
+        scope: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// List optimization opportunities (unused, always-on heavy, costly+rare),
     /// ranked, with a suggested action.
     Wedges {
+        /// Restrict to a config layer: global | project | project:<slug>.
+        #[arg(long)]
+        scope: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
@@ -85,6 +101,9 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
@@ -94,19 +113,26 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// Where the work stumbles: recurring tool failures by category, ranked,
     /// with what each suggests fixing.
     Friction {
-        /// Restrict to one project (its cwd slug) — see which project owns the
-        /// friction so its config can carry the fix.
+        /// Restrict to a config layer: global (failures spread across projects),
+        /// project (each project's majority-owned failures), or project:<slug>
+        /// (every failure in that one project).
         #[arg(long)]
-        project: Option<String>,
+        scope: Option<String>,
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
@@ -116,12 +142,21 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
     /// One-screen health check: the few most actionable findings across every
-    /// view, prioritised. Start here.
+    /// view, split by the config layer that owns each fix. Start here.
     Summary {
+        /// Restrict to a config layer: global | project | project:<slug>.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
     },
@@ -147,9 +182,12 @@ enum Command {
         /// Store to analyze into / read from.
         #[arg(long, default_value = "cclens.db")]
         db: PathBuf,
+        /// Optimize one config layer: global | project | project:<slug>.
+        #[arg(long)]
+        scope: Option<String>,
         /// Use the existing store as-is; skip the analyze step.
         #[arg(long)]
-        skip_analyze: bool,
+        frozen: bool,
         /// Print the composed prompt instead of launching `claude`.
         #[arg(long)]
         print: bool,
@@ -159,29 +197,81 @@ enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Analyze { projects, db } => analyze(projects, &db),
-        Command::Usage { by, format, db } => {
-            usage(by.as_deref(), parse_format(format.as_deref())?, &db)
-        }
-        Command::Surfaces { format, db } => surfaces(parse_format(format.as_deref())?, &db),
-        Command::Wedges { format, db } => wedges(parse_format(format.as_deref())?, &db),
-        Command::Baseline { format, db } => baseline(parse_format(format.as_deref())?, &db),
-        Command::Prompts { format, db } => prompts(parse_format(format.as_deref())?, &db),
-        Command::Friction {
-            project,
+        Command::Usage {
+            by,
             format,
+            frozen,
             db,
-        } => friction(project.as_deref(), parse_format(format.as_deref())?, &db),
-        Command::Thrash { format, db } => thrash(parse_format(format.as_deref())?, &db),
-        Command::Summary { db } => summary(&db),
+        } => usage(by.as_deref(), parse_format(format.as_deref())?, frozen, &db),
+        Command::Surfaces {
+            scope,
+            format,
+            frozen,
+            db,
+        } => surfaces(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &db,
+        ),
+        Command::Wedges {
+            scope,
+            format,
+            frozen,
+            db,
+        } => wedges(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &db,
+        ),
+        Command::Baseline { format, frozen, db } => {
+            baseline(parse_format(format.as_deref())?, frozen, &db)
+        }
+        Command::Prompts { format, frozen, db } => {
+            prompts(parse_format(format.as_deref())?, frozen, &db)
+        }
+        Command::Friction {
+            scope,
+            format,
+            frozen,
+            db,
+        } => friction(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &db,
+        ),
+        Command::Thrash { format, frozen, db } => {
+            thrash(parse_format(format.as_deref())?, frozen, &db)
+        }
+        Command::Summary { scope, frozen, db } => {
+            summary(&parse_scope(scope.as_deref())?, frozen, &db)
+        }
         Command::Sql { query, format, db } => {
             sql(query.as_deref(), parse_format(format.as_deref())?, &db)
         }
         Command::Optimize {
             projects,
             db,
-            skip_analyze,
+            scope,
+            frozen,
             print,
-        } => optimize(projects, &db, skip_analyze, print),
+        } => optimize(
+            projects,
+            &db,
+            &parse_scope(scope.as_deref())?,
+            frozen,
+            print,
+        ),
+    }
+}
+
+fn parse_scope(value: Option<&str>) -> Result<ScopeFilter> {
+    match value {
+        None => Ok(ScopeFilter::All),
+        Some(v) => ScopeFilter::parse(v)
+            .with_context(|| format!("unknown --scope '{v}' (global | project | project:<slug>)")),
     }
 }
 
@@ -195,9 +285,19 @@ pub fn run() -> Result<()> {
 /// on argv — never the data, which `ps` would otherwise expose. The file is
 /// removed as soon as the session ends. `--print` instead writes the full prompt
 /// (briefing inline) to stdout for piping / inspection.
-fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: bool) -> Result<()> {
-    if !skip_analyze {
-        analyze(projects, db)?;
+fn optimize(
+    projects: Option<PathBuf>,
+    db: &Path,
+    filter: &ScopeFilter,
+    frozen: bool,
+    print: bool,
+) -> Result<()> {
+    if !frozen {
+        let stats = run_analyze(projects, db)?;
+        eprintln!(
+            "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
+            stats.sessions, stats.skipped
+        );
     }
     let store = Store::open(db).context("open store")?;
     let findings = collect_findings(&store)?;
@@ -209,14 +309,17 @@ fn optimize(projects: Option<PathBuf>, db: &Path, skip_analyze: bool, print: boo
         .unwrap_or_else(|_| db.to_string_lossy().into_owned());
 
     if print {
-        println!("{}", optimize_mod::compose_prompt(&findings, &db_display));
+        println!(
+            "{}",
+            optimize_mod::compose_prompt(&findings, &db_display, filter)
+        );
         return Ok(());
     }
 
     // Sensitive briefing → private temp file; only a data-free pointer on argv.
-    let briefing = optimize_mod::render_briefing(&findings);
+    let briefing = optimize_mod::render_briefing(&findings, filter);
     let briefing_path = write_private_tempfile(&briefing).context("write briefing temp file")?;
-    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display);
+    let prompt = optimize_mod::launch_prompt(&briefing_path.to_string_lossy(), &db_display, filter);
 
     // Hand over the terminal: `claude <prompt>` starts an interactive session,
     // inheriting our stdio so the user takes over. Clean up the briefing file
@@ -280,47 +383,49 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
             .push((tool, n));
     }
 
-    // Actionable friction grouped by project, busiest project first — the
-    // session fixes each in that project's own config.
-    let mut by_project: std::collections::HashMap<String, Vec<(String, i64)>> =
-        std::collections::HashMap::new();
-    for (proj, label, n) in store.error_counts_by_project()? {
-        if ErrorCategory::from_label(&label).is_actionable() {
-            by_project.entry(proj).or_default().push((label, n));
-        }
-    }
-    let mut friction_by_project: Vec<optimize_mod::ProjectFriction> = by_project
+    // Route actionable friction to the layer that owns each fix (core::scope):
+    // majority-owned categories to their project, the spread rest to global.
+    let cells: Vec<(String, String, i64)> = store
+        .error_counts_by_project()?
         .into_iter()
-        .map(|(project, mut categories)| {
-            categories.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let categories = categories
-                .into_iter()
-                .map(|(label, count)| optimize_mod::FrictionCat {
-                    by_tool: by_tool
-                        .get(&(project.clone(), label.clone()))
-                        .cloned()
-                        .unwrap_or_default(),
-                    examples: examples
-                        .get(&(project.clone(), label.clone()))
-                        .cloned()
-                        .unwrap_or_default(),
-                    label,
-                    count,
-                })
-                .collect();
-            optimize_mod::ProjectFriction {
-                project,
-                categories,
+        .filter(|(_, label, _)| ErrorCategory::from_label(label).is_actionable())
+        .collect();
+    let split = split_friction(&cells);
+
+    // A global category aggregates its tool split across projects and pools a
+    // few examples; a project-owned one uses its own (project, category) detail.
+    const EXAMPLES_PER_GLOBAL_CATEGORY: usize = 3;
+    let friction_global: Vec<optimize_mod::FrictionCat> = split
+        .global
+        .iter()
+        .map(|g| {
+            let mut tools: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut pooled = Vec::new();
+            for (project, label, _) in &cells {
+                if label != &g.category {
+                    continue;
+                }
+                let key = (project.clone(), label.clone());
+                for (tool, n) in by_tool.get(&key).into_iter().flatten() {
+                    *tools.entry(tool.clone()).or_default() += n;
+                }
+                pooled.extend(examples.get(&key).into_iter().flatten().cloned());
+            }
+            let mut by_tool: Vec<(String, i64)> = tools.into_iter().collect();
+            by_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            pooled.truncate(EXAMPLES_PER_GLOBAL_CATEGORY);
+            optimize_mod::FrictionCat {
+                label: g.category.clone(),
+                count: g.total,
+                projects: g.projects,
+                by_tool,
+                examples: pooled,
             }
         })
         .collect();
-    friction_by_project.sort_by(|a, b| {
-        b.total()
-            .cmp(&a.total())
-            .then_with(|| a.project.cmp(&b.project))
-    });
 
-    // Workflow: Bash mix + cd share, most-edited files, thrash bursts.
+    // Workflow: Bash mix + cd share, most-edited files (global signals).
     let bash = store.work_counts("bash_cmd")?;
     let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
     let cd_pct = (bash_total > 0).then(|| {
@@ -333,18 +438,98 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         .into_iter()
         .take(15)
         .collect();
-    let edits = store.work_event_rows("file_edit")?;
-    let thrash: Vec<optimize_mod::ThrashLine> = detect_thrash(&edits, 5 * 60, 4)
+
+    // Thrash per project — a burst belongs to the project it happened in.
+    let mut edits_by_project: std::collections::HashMap<String, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (project, file, epoch) in store.work_event_rows_by_project("file_edit")? {
+        edits_by_project
+            .entry(project)
+            .or_default()
+            .push((file, epoch));
+    }
+    let mut thrash_by_project: std::collections::HashMap<String, Vec<optimize_mod::ThrashLine>> =
+        edits_by_project
+            .into_iter()
+            .map(|(project, edits)| {
+                let lines = detect_thrash(&edits, 5 * 60, 4)
+                    .into_iter()
+                    .take(5)
+                    .map(|w| optimize_mod::ThrashLine {
+                        span_secs: w.span_secs(),
+                        file: w.file,
+                        edits: w.edits,
+                    })
+                    .collect();
+                (project, lines)
+            })
+            .collect();
+
+    // Config wedges, split by the surface's own scope.
+    let scoped = config_wedges(store)?;
+
+    // Assemble per-project findings: any project owning friction, thrash, or
+    // project-scoped wedges gets a section, busiest first.
+    let roots: std::collections::HashMap<String, String> = store
+        .session_roots()?
         .into_iter()
-        .take(10)
-        .map(|w| optimize_mod::ThrashLine {
-            span_secs: w.span_secs(),
-            file: w.file,
-            edits: w.edits,
+        .map(|(root, project)| (project, root))
+        .collect();
+    let mut owned_friction: std::collections::HashMap<String, Vec<(String, i64)>> =
+        split.per_project.into_iter().collect();
+    let mut project_names: Vec<String> = owned_friction
+        .keys()
+        .chain(thrash_by_project.keys())
+        .chain(scoped.projects.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut projects: Vec<optimize_mod::ProjectFindings> = project_names
+        .drain(..)
+        .map(|project| {
+            let friction = owned_friction
+                .remove(&project)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(label, count)| {
+                    let key = (project.clone(), label.clone());
+                    optimize_mod::FrictionCat {
+                        by_tool: by_tool.get(&key).cloned().unwrap_or_default(),
+                        examples: examples.get(&key).cloned().unwrap_or_default(),
+                        label,
+                        count,
+                        projects: 1,
+                    }
+                })
+                .collect();
+            let wedges = scoped.projects.get(&project);
+            optimize_mod::ProjectFindings {
+                friction,
+                thrash: thrash_by_project.remove(&project).unwrap_or_default(),
+                unused: wedges.map(|w| w.unused.clone()).unwrap_or_default(),
+                always_on_heavy: wedges
+                    .map(|w| w.always_on_heavy.clone())
+                    .unwrap_or_default(),
+                root: roots.get(&project).cloned().unwrap_or_default(),
+                project,
+            }
         })
         .collect();
-
-    let (unused, always_on_heavy) = config_wedges(store)?;
+    // Busiest first: owned friction, then config wedges, then thrash — so a
+    // friction-free but config-heavy project still outranks thrash-only noise.
+    projects.sort_by(|a, b| {
+        let weight = |p: &optimize_mod::ProjectFindings| {
+            (
+                p.total_friction(),
+                p.unused.len() + p.always_on_heavy.len(),
+                p.thrash.len(),
+            )
+        };
+        weight(b)
+            .cmp(&weight(a))
+            .then_with(|| a.project.cmp(&b.project))
+    });
 
     let pcounts = store.prompt_behavior_counts()?;
     let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
@@ -372,50 +557,57 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         } else {
             0
         },
-        friction_by_project,
+        friction_global,
         cd_pct,
         top_commands,
         hotspots,
-        thrash,
-        unused,
-        always_on_heavy,
+        unused: scoped.global.unused,
+        always_on_heavy: scoped.global.always_on_heavy,
         steer_pct,
         correct_pct,
+        projects,
     })
 }
 
-/// The surfaces `wedges` would flag: unused-but-measurable and always-on heavy,
-/// as concrete lists. `summary` reads their lengths; `optimize` embeds the items.
-fn config_wedges(
-    store: &Store,
-) -> Result<(Vec<optimize_mod::SurfaceRef>, Vec<optimize_mod::SurfaceRef>)> {
-    let counts: std::collections::HashMap<(String, String), i64> = store
-        .usage_counts()?
-        .into_iter()
-        .map(|(k, i, c)| ((k, i), c))
-        .collect();
+/// Wedge-flagged surfaces (unused-but-measurable, always-on heavy) grouped by
+/// the config layer that owns them — the routing key for summary and briefing.
+#[derive(Default)]
+struct WedgeRefs {
+    unused: Vec<optimize_mod::SurfaceRef>,
+    always_on_heavy: Vec<optimize_mod::SurfaceRef>,
+}
+
+struct ScopedWedges {
+    global: WedgeRefs,
+    projects: std::collections::HashMap<String, WedgeRefs>,
+}
+
+fn config_wedges(store: &Store) -> Result<ScopedWedges> {
     let surface_ref = |e: &crate::store::CatalogEntry| optimize_mod::SurfaceRef {
         kind: e.kind.clone(),
         id: e.id.clone(),
         static_tokens: e.static_tokens,
     };
-    let mut unused = Vec::new();
-    let mut always_on_heavy = Vec::new();
-    for entry in store.catalog()? {
-        let uses = counts
-            .get(&(entry.kind.clone(), entry.id.clone()))
-            .copied()
-            .unwrap_or(0);
+    let mut scoped = ScopedWedges {
+        global: WedgeRefs::default(),
+        projects: std::collections::HashMap::new(),
+    };
+    for entry in store.effective_catalog()? {
+        let refs = if entry.scope == "global" {
+            &mut scoped.global
+        } else {
+            scoped.projects.entry(entry.project.clone()).or_default()
+        };
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|t| t as u64);
-        if is_usage_measurable(&entry.kind) && uses == 0 {
-            unused.push(surface_ref(&entry));
+        if is_usage_measurable(&entry.kind) && entry.uses == 0 {
+            refs.unused.push(surface_ref(&entry));
         }
         if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
-            always_on_heavy.push(surface_ref(&entry));
+            refs.always_on_heavy.push(surface_ref(&entry));
         }
     }
-    Ok((unused, always_on_heavy))
+    Ok(scoped)
 }
 
 /// Run a read-only SQL query against the store and print the result. The query
@@ -441,6 +633,12 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
 
     let store = Store::open_readonly(db)
         .with_context(|| format!("open store {} (run `analyze` first?)", db.display()))?;
+    // `sql` never mutates the store, so it cannot auto-refresh — surface the
+    // store's age instead so a stale read is at least visible. An old db whose
+    // schema predates `meta` just skips the header.
+    if let Ok(analyzed_at) = store.meta("analyzed_at") {
+        eprintln!("{}", freshness_line(analyzed_at.as_deref()));
+    }
     let (columns, rows) = store.query(query)?;
     let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
     let aligns = vec![Align::Left; columns.len()];
@@ -449,120 +647,165 @@ fn sql(query: Option<&str>, format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One-screen health check: pull the few most actionable findings from every
-/// view into one prioritised report, so the tool answers "what should I do"
-/// without running ten commands.
-fn summary(db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
+/// One-screen health check: the few most actionable findings from every view,
+/// split by the config layer that owns each fix — the global picture first,
+/// then each project's own findings ("optimize my global setup" and "optimize
+/// this project" are different tasks). `--scope` narrows to one layer.
+fn summary(filter: &ScopeFilter, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let f = collect_findings(&store)?;
 
-    // Where tokens go.
-    let main_out: i64 = store.skill_usage()?.iter().map(|r| r.out_tokens).sum();
-    let (sub_tokens, sub_agents) = store.subagent_totals()?;
-    println!("== tokens ==");
-    println!("  main-thread skill output  {main_out}");
-    println!("  subagents                 {sub_tokens} ({sub_agents} agents)");
-
-    // Always-on cost picture.
-    let floor = store.baseline_floor()?;
-    if floor > 0 {
-        let config = store.always_on_config_tokens()?;
-        let residual = (floor - config).max(0);
-        println!("\n== always-on context per session ==");
+    if filter.includes_global() {
+        println!("== global — fix in ~/.claude ==");
         println!(
-            "  ~{floor} tokens (your config {config}, the rest {residual} is system+tools+MCP)"
+            "  tokens      main-thread skill output {} · subagents {} ({} agents)",
+            f.main_out, f.sub_tokens, f.sub_agents
         );
-    }
-
-    // Top fixable friction (exclude non-actionable noise).
-    let friction: Vec<_> = store
-        .error_counts()?
-        .into_iter()
-        .filter(|(label, _)| ErrorCategory::from_label(label).is_actionable())
-        .collect();
-    if !friction.is_empty() {
-        // Per-category project breakdown, so each line can name the project that
-        // owns the friction when it concentrates there.
-        let mut by_cat: std::collections::HashMap<String, Vec<(String, i64)>> =
-            std::collections::HashMap::new();
-        for (proj, label, n) in store.error_counts_by_project()? {
-            by_cat.entry(label).or_default().push((proj, n));
-        }
-        let dominant = |label: &str, total: i64| -> Option<String> {
-            let (proj, n) = by_cat.get(label)?.iter().max_by_key(|(_, n)| *n)?;
-            // Only call it out when one project owns the clear majority.
-            (*n * 2 > total).then(|| format!(" — mostly in `{proj}`"))
-        };
-        println!("\n== top fixable friction ==");
-        for (label, n) in friction.iter().take(3) {
+        if f.floor > 0 {
+            let residual = (f.floor - f.config_tokens).max(0);
             println!(
-                "  {n:>4}  {label} — {}{}",
-                ErrorCategory::from_label(label).suggestion(),
-                dominant(label, *n).unwrap_or_default()
+                "  always-on   ~{} tok/session = your global config {} + system/tools/MCP {}",
+                f.floor, f.config_tokens, residual
             );
         }
-    }
-
-    // Workflow inefficiency: cd overhead + worst thrash.
-    println!("\n== workflow ==");
-    let bash = store.work_counts("bash_cmd")?;
-    let bash_total: i64 = bash.iter().map(|(_, n)| n).sum();
-    if bash_total > 0 {
-        let cd = bash.iter().find(|(c, _)| c == "cd").map_or(0, |(_, n)| *n);
-        let cd_pct = (cd as f64 * 100.0 / bash_total as f64).round() as i64;
-        println!("  cd is {cd_pct}% of Bash calls — a working-dir convention would cut the churn");
-    }
-    let edits = store.work_event_rows("file_edit")?;
-    if let Some(worst) = detect_thrash(&edits, 5 * 60, 4).first() {
-        let span = worst.span_secs();
+        if let Some(cd_pct) = f.cd_pct {
+            println!(
+                "  workflow    cd is {cd_pct}% of Bash calls — a working-dir convention would cut the churn"
+            );
+        }
         println!(
-            "  worst thrash: {} edited {}x within {}m{}s — likely got stuck there",
-            worst.file,
-            worst.edits,
-            span / 60,
-            span % 60
+            "  config      {} → `wedges --scope global`",
+            count_summary(f.unused.len(), f.always_on_heavy.len())
         );
-    }
-
-    // Config worth cutting: count what `wedges` would flag with real savings.
-    let (unused, always_on_heavy_list) = config_wedges(&store)?;
-    let (unused_measurable, always_on_heavy) = (unused.len(), always_on_heavy_list.len());
-    println!("\n== config ==");
-    println!(
-        "  {unused_measurable} unused surface(s), {always_on_heavy} always-on heavy — see `wedges`"
-    );
-
-    // Prompting verdict.
-    let pcounts = store.prompt_behavior_counts()?;
-    let ptotal: i64 = pcounts.iter().map(|(_, n)| n).sum();
-    if ptotal > 0 {
-        let share = |name: &str| {
-            let n = pcounts
-                .iter()
-                .find(|(b, _)| b == name)
-                .map_or(0, |(_, n)| *n);
-            (n as f64 * 100.0 / ptotal as f64).round() as i64
-        };
-        println!("\n== prompting ==");
-        println!(
-            "  {}% steering, {}% corrections — {}",
-            share("steer"),
-            share("correct"),
-            if share("correct") >= 10 || share("steer") >= 25 {
-                "see `prompts`"
-            } else {
-                "healthy mix"
+        if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct) {
+            println!(
+                "  prompting   {steer}% steering, {correct}% corrections — {}",
+                if correct >= 10 || steer >= 25 {
+                    "see `prompts`"
+                } else {
+                    "healthy mix"
+                }
+            );
+        }
+        if !f.friction_global.is_empty() {
+            println!("\n  friction spread across projects (no single owner — a global habit):");
+            for cat in f.friction_global.iter().take(3) {
+                println!(
+                    "  {:>5}  {} ({} projects) — {}",
+                    cat.count,
+                    cat.label,
+                    cat.projects,
+                    ErrorCategory::from_label(&cat.label).suggestion()
+                );
             }
-        );
+        }
+    }
+
+    // A project block earns its screen space with friction or config wedges;
+    // thrash-only projects fold into the trailing count instead of five
+    // near-empty blocks.
+    const PROJECTS_SHOWN: usize = 5;
+    let visible: Vec<_> = f
+        .projects
+        .iter()
+        .filter(|p| filter.includes_project(&p.project))
+        .collect();
+    let shown: Vec<_> = if *filter == ScopeFilter::All {
+        visible
+            .iter()
+            .filter(|p| {
+                p.total_friction() > 0 || !p.unused.is_empty() || !p.always_on_heavy.is_empty()
+            })
+            .take(PROJECTS_SHOWN)
+            .copied()
+            .collect()
+    } else {
+        // An explicit project scope means the user asked for everything.
+        visible.clone()
+    };
+    if !visible.is_empty() {
+        if filter.includes_global() {
+            println!("\n== projects — fix each in its own .claude / CLAUDE.md ==");
+        }
+        for p in &shown {
+            let heading = if p.root.is_empty() {
+                p.project.clone()
+            } else {
+                tilde_path(&p.root)
+            };
+            match p.total_friction() {
+                0 => println!("\n  {heading}"),
+                n => println!("\n  {heading} — owns {n} failure(s)"),
+            }
+            for cat in p.friction.iter().take(3) {
+                println!(
+                    "  {:>5}  {} — {}",
+                    cat.count,
+                    cat.label,
+                    ErrorCategory::from_label(&cat.label).suggestion()
+                );
+            }
+            if let Some(worst) = p.thrash.first() {
+                println!(
+                    "         thrash: {} edited {}x in {}m{}s",
+                    worst.file,
+                    worst.edits,
+                    worst.span_secs / 60,
+                    worst.span_secs % 60
+                );
+            }
+            if !p.unused.is_empty() || !p.always_on_heavy.is_empty() {
+                println!(
+                    "         config: {} → `wedges --scope project:{}`",
+                    count_summary(p.unused.len(), p.always_on_heavy.len()),
+                    p.project
+                );
+            }
+        }
+        if visible.len() > shown.len() {
+            println!(
+                "\n  … and {} more project(s) with minor findings — see `summary --scope project`",
+                visible.len() - shown.len()
+            );
+        }
     }
     Ok(())
 }
 
+/// `"N unused, M always-on heavy"` with zero parts dropped (never both zero at
+/// a call site that prints it).
+fn count_summary(unused: usize, always_on_heavy: usize) -> String {
+    let mut parts = Vec::new();
+    if unused > 0 {
+        parts.push(format!("{unused} unused"));
+    }
+    if always_on_heavy > 0 {
+        parts.push(format!("{always_on_heavy} always-on heavy"));
+    }
+    if parts.is_empty() {
+        return "nothing flagged".to_string();
+    }
+    parts.join(", ")
+}
+
+/// Shorten an absolute path under $HOME to `~/…` for display.
+fn tilde_path(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => match path.strip_prefix(&home) {
+            Some("") => "~".to_string(),
+            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
+}
+
 /// Thrash bursts: a file edited many times in a short window — where Claude got
 /// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
-fn thrash(format: Format, db: &Path) -> Result<()> {
+fn thrash(format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
-    let store = Store::open(db).context("open store")?;
+    let store = open_for_read(db, frozen)?;
     let edits = store.work_event_rows("file_edit")?;
     let episodes = detect_thrash(&edits, GAP_SECS, MIN_EDITS);
     if episodes.is_empty() {
@@ -597,44 +840,91 @@ fn thrash(format: Format, db: &Path) -> Result<()> {
 /// Where the work stumbles: recurring tool failures by category, ranked, each
 /// with what it suggests fixing. This is about the work, not the config —
 /// recurring failures are fixable friction that wastes turns and tokens.
-fn friction(project: Option<&str>, format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
-    // With --project, fold the per-project breakdown down to one project's
-    // categories; without it, the global per-category counts.
-    let counts: Vec<(String, i64)> = match project {
-        Some(name) => store
-            .error_counts_by_project()?
-            .into_iter()
-            .filter(|(proj, _, _)| proj == name)
-            .map(|(_, label, n)| (label, n))
-            .collect(),
-        None => store.error_counts()?,
+/// `--scope` routes by ownership (`core::scope`): `global` shows the failures
+/// no project owns, `project` each project's majority-owned failures, and
+/// `project:<slug>` everything that happened in that one project.
+fn friction(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let cells = store.error_counts_by_project()?;
+
+    // (project column shown?, rows)
+    let (with_project, counts): (bool, Vec<(String, String, i64)>) = match filter {
+        ScopeFilter::All => (
+            false,
+            store
+                .error_counts()?
+                .into_iter()
+                .map(|(label, n)| (String::new(), label, n))
+                .collect(),
+        ),
+        ScopeFilter::Global => (
+            false,
+            split_friction(&cells)
+                .global
+                .into_iter()
+                .map(|g| {
+                    (
+                        String::new(),
+                        format!("{} (across {} projects)", g.category, g.projects),
+                        g.total,
+                    )
+                })
+                .collect(),
+        ),
+        ScopeFilter::Project(None) => (
+            true,
+            split_friction(&cells)
+                .per_project
+                .into_iter()
+                .flat_map(|(project, cats)| {
+                    cats.into_iter()
+                        .map(move |(label, n)| (project.clone(), label, n))
+                })
+                .collect(),
+        ),
+        ScopeFilter::Project(Some(slug)) => (
+            false,
+            cells
+                .into_iter()
+                .filter(|(project, _, _)| project == slug)
+                .map(|(_, label, n)| (String::new(), label, n))
+                .collect(),
+        ),
     };
-    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    let total: i64 = counts.iter().map(|(_, _, n)| n).sum();
     if total == 0 {
-        match project {
-            Some(name) => println!("no tool failures found for project `{name}`"),
-            None => println!("no tool failures found — run `cclens analyze` first"),
-        }
+        println!("no tool failures found for this scope — run `cclens analyze` first?");
         return Ok(());
     }
 
     let rows: Vec<Vec<String>> = counts
         .iter()
-        .map(|(label, n)| {
-            vec![
+        .map(|(project, label, n)| {
+            let mut row = Vec::new();
+            if with_project {
+                row.push(project.clone());
+            }
+            let category = label.split(' ').next().unwrap_or(label);
+            row.extend([
                 label.clone(),
                 n.to_string(),
-                ErrorCategory::from_label(label).suggestion().to_string(),
-            ]
+                ErrorCategory::from_label(category).suggestion().to_string(),
+            ]);
+            row
         })
         .collect();
-    render(
-        &["error", "count", "suggestion"],
-        &[Align::Left, Align::Right, Align::Left],
-        &rows,
-        format,
-    );
+    let (headers, aligns): (Vec<&str>, Vec<Align>) = if with_project {
+        (
+            vec!["project", "error", "count", "suggestion"],
+            vec![Align::Left, Align::Left, Align::Right, Align::Left],
+        )
+    } else {
+        (
+            vec!["error", "count", "suggestion"],
+            vec![Align::Left, Align::Right, Align::Left],
+        )
+    };
+    render(&headers, &aligns, &rows, format);
     println!("\n{total} tool failures (categories are lexical heuristics)");
     Ok(())
 }
@@ -642,8 +932,8 @@ fn friction(project: Option<&str>, format: Format, db: &Path) -> Result<()> {
 /// Show the mix of how the user steers the session, and what it suggests. Heavy
 /// steering points to room for more autonomy; frequent corrections point to
 /// clearer upfront specs. The classes are lexical heuristics (`core::prompt`).
-fn prompts(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
+fn prompts(format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
     let counts = store.prompt_behavior_counts()?;
     let total: i64 = counts.iter().map(|(_, n)| n).sum();
     if total == 0 {
@@ -702,8 +992,8 @@ fn prompts(format: Format, db: &Path) -> Result<()> {
 /// leaves the residual — system prompt, built-in tools, and MCP tool schemas the
 /// catalog cannot weigh. The per-project floors let you infer an MCP server's
 /// real cost by comparing a project that enables it against one that does not.
-fn baseline(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
+fn baseline(format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
     let floor = store.baseline_floor()?;
     if floor == 0 {
         println!("no data — run `cclens analyze` first");
@@ -739,14 +1029,56 @@ fn baseline(format: Format, db: &Path) -> Result<()> {
 /// as "heavy" — a tuning knob, not a hard rule.
 const HEAVY_TOKENS: u64 = 800;
 
+/// Counters from one analyze run, for the command's summary line and the
+/// freshness header on auto-refreshing reads.
+struct AnalyzeStats {
+    sessions: usize,
+    skipped: usize,
+    spans_total: usize,
+    surface_count: usize,
+    denials: usize,
+}
+
 fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
+    let stats = run_analyze(projects, db)?;
+    let store = Store::open(db).context("open store")?;
+    let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    println!(
+        "analyzed {} session(s) ({} unchanged), {} skill invocation(s), \
+         {} surface(s) catalogued, \
+         {sub_tokens} subagent tokens across {sub_agents} subagent(s), \
+         {} permission denial(s) -> {}",
+        stats.sessions,
+        stats.skipped,
+        stats.spans_total,
+        stats.surface_count,
+        stats.denials,
+        db.display()
+    );
+    Ok(())
+}
+
+fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
     let mut store = Store::open(db).context("open store")?;
 
     let mut sessions = 0;
+    let mut skipped = 0;
     let mut spans_total = 0;
     let mut denials = 0;
     for transcript in main_transcripts(&projects)? {
+        let path_str = transcript.display().to_string();
+        // Incremental skip: an unchanged (mtime, size) was already ingested.
+        // The stat is taken before the read so a file that grows concurrently
+        // is guaranteed a mismatch — and a re-ingest — next run
+        // (`docs/specs/storage.md`).
+        let fingerprint = file_fingerprint(&transcript);
+        if let Some((mtime, size)) = fingerprint
+            && store.is_ingested(&path_str, mtime, size)?
+        {
+            skipped += 1;
+            continue;
+        }
         let text = fs::read_to_string(&transcript)
             .with_context(|| format!("read {}", transcript.display()))?;
         denials += count_permission_denials(&text);
@@ -756,7 +1088,13 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         let subagents = subagent_costs(&transcript);
         attribute_subagents(&mut spans, &subagents);
         let sub_tokens: i64 = subagents.iter().map(|(_, tokens)| *tokens as i64).sum();
-        let meta = session_meta(&transcript, sub_tokens, subagents.len() as i64);
+        let root = session_cwd(&text).map(|cwd| normalize_root(&cwd));
+        let meta = session_meta(
+            &transcript,
+            root.unwrap_or_default(),
+            sub_tokens,
+            subagents.len() as i64,
+        );
         store.ingest_session(&meta, &spans, &usage)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
             .into_iter()
@@ -780,25 +1118,119 @@ fn analyze(projects: Option<PathBuf>, db: &Path) -> Result<()> {
         store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         let work = extract_work_events(&text);
         store.ingest_work_events(&meta.id, &meta.source_path, &work)?;
+        if let Some((mtime, _)) = fingerprint {
+            // Record the size actually consumed, so a tail appended after the
+            // read shows a mismatch next run instead of being skipped forever.
+            store.record_ingested_file(&path_str, mtime, text.len() as i64)?;
+        }
         sessions += 1;
         spans_total += spans.len();
     }
 
-    // Catalog the installed config (global scope) so usage can be joined against
-    // what is actually installed. Project-scoped config is a later refinement.
-    let surfaces = read_global_surfaces()?;
+    // Catalog the installed config — global scope plus every known project root
+    // that still exists on disk — so usage joins against what is installed.
+    let config_dir = claude_home()?;
+    let mut surfaces = read_global_surfaces()?;
+    for (root, project) in store.session_roots()? {
+        if Path::new(&root).is_dir() {
+            surfaces.extend(read_project_surfaces(Path::new(&root), &project));
+        }
+    }
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
-    let (sub_tokens, sub_agents) = store.subagent_totals()?;
-    println!(
-        "analyzed {sessions} session(s), {spans_total} skill invocation(s), \
-         {surface_count} surface(s) catalogued, \
-         {sub_tokens} subagent tokens across {sub_agents} subagent(s), \
-         {denials} permission denial(s) -> {}",
-        db.display()
-    );
-    Ok(())
+    store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
+    store.set_meta("projects_dir", &projects.display().to_string())?;
+    store.set_meta("config_dir", &config_dir.display().to_string())?;
+
+    Ok(AnalyzeStats {
+        sessions,
+        skipped,
+        spans_total,
+        surface_count,
+        denials,
+    })
+}
+
+/// Open the store for a read command. Unless `--frozen`, the analysis is
+/// refreshed first — incremental, so an up-to-date store costs one stat per
+/// transcript — which makes stale reads structurally impossible (`optimize` has
+/// always worked this way; the views now compose the same stage). A one-line
+/// freshness header goes to **stderr** so piped stdout stays clean.
+fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
+    if !frozen {
+        // Re-analyze against the roots the store was built from (recorded in
+        // meta); a fresh db falls back to the defaults.
+        let projects = match db.exists() {
+            true => Store::open(db)
+                .context("open store")?
+                .meta("projects_dir")?
+                .map(PathBuf::from),
+            false => None,
+        };
+        let stats = run_analyze(projects, db)?;
+        eprintln!(
+            "store: refreshed just now ({} transcript(s) re-analyzed, {} unchanged)",
+            stats.sessions, stats.skipped
+        );
+        return Store::open(db).context("open store");
+    }
+
+    let store = Store::open(db).context("open store")?;
+    eprintln!("{}", freshness_line(store.meta("analyzed_at")?.as_deref()));
+    Ok(store)
+}
+
+/// The `--frozen` freshness header: how old the store is, with a refresh hint
+/// once it is older than a day. This is what lets the user *notice* staleness.
+fn freshness_line(analyzed_at: Option<&str>) -> String {
+    let Some(parsed) = analyzed_at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    else {
+        return "store: freshness unknown (no analyze recorded) — run `cclens analyze`".to_string();
+    };
+    let age_secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    let hint = if age_secs >= 24 * 3600 {
+        " — run `cclens analyze` (or drop --frozen) to refresh"
+    } else {
+        ""
+    };
+    format!(
+        "store: analyzed {} ago (--frozen){hint}",
+        humanize_age(age_secs)
+    )
+}
+
+fn humanize_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// A file's `(mtime epoch secs, size)` — the cheap change detector for
+/// incremental ingest. `None` when the file cannot be stat'ed (it is then
+/// ingested unconditionally and not recorded).
+fn file_fingerprint(path: &Path) -> Option<(i64, i64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((mtime, meta.len() as i64))
+}
+
+/// Fold a worktree checkout's path onto its parent repository, mirroring
+/// `normalize_project`'s slug rule at path level: `/repo/.wt/feat-x` → `/repo`.
+fn normalize_root(cwd: &str) -> String {
+    match cwd.split_once("/.wt/") {
+        Some((parent, _)) => parent.to_string(),
+        None => cwd.to_string(),
+    }
 }
 
 /// The `(prompt_id, output_tokens)` of each of a session's subagent transcripts,
@@ -824,8 +1256,8 @@ fn subagent_costs(transcript: &Path) -> Vec<(String, u64)> {
     costs
 }
 
-fn usage(by: Option<&str>, format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
+fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
 
     if let Some(by) = by {
         let bucket = Bucket::parse(by)
@@ -925,16 +1357,12 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
 /// Read all installed config (global scope) into one surface list.
 fn read_global_surfaces() -> Result<Vec<Surface>> {
     let home = claude_home()?;
-    let mut surfaces = read_skill_surfaces(&home.join("skills"), Scope::Global);
-    surfaces.extend(read_rule_surfaces(&home.join("rules"), Scope::Global));
-    surfaces.extend(read_agent_surfaces(&home.join("agents"), Scope::Global));
-    surfaces.extend(read_mcp_server_surfaces(
-        &home.join("mcp.json"),
-        Scope::Global,
-    ));
-    if let Some(claude_md) =
-        read_claude_md_surface(&home.join("CLAUDE.md"), "global", Scope::Global)
-    {
+    let scope = Scope::Global;
+    let mut surfaces = read_skill_surfaces(&home.join("skills"), &scope);
+    surfaces.extend(read_rule_surfaces(&home.join("rules"), &scope));
+    surfaces.extend(read_agent_surfaces(&home.join("agents"), &scope));
+    surfaces.extend(read_mcp_server_surfaces(&home.join("mcp.json"), &scope));
+    if let Some(claude_md) = read_claude_md_surface(&home.join("CLAUDE.md"), "global", &scope) {
         surfaces.push(claude_md);
     }
     Ok(surfaces)
@@ -943,9 +1371,13 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// Join the catalogued surfaces against usage: each installed surface with its
 /// static cost and (for usage-measurable kinds) invocation count, unused ones
 /// flagged. Usage with no matching surface is shown as orphaned.
-fn surfaces(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
-    let catalog = store.catalog()?;
+fn surfaces(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let catalog: Vec<_> = store
+        .effective_catalog()?
+        .into_iter()
+        .filter(|e| in_scope(filter, &e.scope, &e.project))
+        .collect();
     let usage = store.usage_counts()?;
 
     if catalog.is_empty() && usage.is_empty() {
@@ -953,23 +1385,16 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Usage keyed by (kind, id) so every surface kind joins, not just skills.
-    let counts: std::collections::HashMap<(&str, &str), i64> = usage
-        .iter()
-        .map(|(kind, id, count)| ((kind.as_str(), id.as_str()), *count))
-        .collect();
-
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
-        let uses = counts
-            .get(&(entry.kind.as_str(), entry.id.as_str()))
-            .copied()
-            .unwrap_or(0);
         // "unused" is only meaningful for usage-measurable kinds; catalog-only
         // kinds (rules, hooks, CLAUDE.md) emit no events, so 0 means nothing.
         let (uses_cell, status) = if measurable {
-            (uses.to_string(), if uses == 0 { "UNUSED" } else { "" })
+            (
+                entry.uses.to_string(),
+                if entry.uses == 0 { "UNUSED" } else { "" },
+            )
         } else {
             ("-".to_string(), "(catalog-only)")
         };
@@ -979,6 +1404,7 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
         rows.push(vec![
             entry.kind.clone(),
             entry.id.clone(),
+            scope_cell(&entry.scope, &entry.project),
             static_tokens,
             uses_cell,
             entry.load_mode.clone(),
@@ -986,15 +1412,20 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
         ]);
     }
 
+    // Orphaned usage has no scope to filter on; it appears in the full view only.
     let catalogued: std::collections::HashSet<(&str, &str)> = catalog
         .iter()
         .map(|e| (e.kind.as_str(), e.id.as_str()))
         .collect();
     for (kind, id, count) in &usage {
+        if *filter != ScopeFilter::All {
+            break;
+        }
         if !catalogued.contains(&(kind.as_str(), id.as_str())) {
             rows.push(vec![
                 kind.clone(),
                 id.clone(),
+                "-".to_string(),
                 "-".to_string(),
                 count.to_string(),
                 "-".to_string(),
@@ -1004,8 +1435,9 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
     }
 
     render(
-        &["kind", "id", "static", "uses", "load", "status"],
+        &["kind", "id", "scope", "static", "uses", "load", "status"],
         &[
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Right,
@@ -1019,23 +1451,42 @@ fn surfaces(format: Format, db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a catalog row's `(scope, project)` passes the `--scope` filter.
+fn in_scope(filter: &ScopeFilter, scope: &str, project: &str) -> bool {
+    if scope == "global" {
+        filter.includes_global()
+    } else {
+        filter.includes_project(project)
+    }
+}
+
+/// A human-readable scope cell: `global`, or `project:<slug>`.
+fn scope_cell(scope: &str, project: &str) -> String {
+    if scope == "project" {
+        format!("project:{project}")
+    } else {
+        scope.to_string()
+    }
+}
+
 /// List optimization wedges, ranked by what removing each surface actually saves
 /// at session start — real always-on tokens first, then MCP schemas, then
 /// declutter-only (skills/agents, whose body is on-demand). This is the "where
 /// and how to optimize" view, honest about which removals save context.
-fn wedges(format: Format, db: &Path) -> Result<()> {
-    let store = Store::open(db).context("open store")?;
-    let catalog = store.catalog()?;
-    let counts: std::collections::HashMap<(String, String), i64> = store
-        .usage_counts()?
+fn wedges(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let catalog: Vec<_> = store
+        .effective_catalog()?
         .into_iter()
-        .map(|(kind, id, count)| ((kind, id), count))
+        .filter(|e| in_scope(filter, &e.scope, &e.project))
         .collect();
 
     struct Row<'a> {
         wedge: Wedge,
         kind: &'a str,
         id: &'a str,
+        scope: &'a str,
+        project: &'a str,
         uses: i64,
         savings: StartupSavings,
     }
@@ -1044,19 +1495,21 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
     for entry in &catalog {
         let measurable = is_usage_measurable(&entry.kind);
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
-        let uses = counts
-            .get(&(entry.kind.clone(), entry.id.clone()))
-            .copied()
-            .unwrap_or(0);
         let static_tokens = entry.static_tokens.map(|tokens| tokens as u64);
-        if let Some(wedge) =
-            classify_wedge(measurable, load_mode, static_tokens, uses, HEAVY_TOKENS)
-        {
+        if let Some(wedge) = classify_wedge(
+            measurable,
+            load_mode,
+            static_tokens,
+            entry.uses,
+            HEAVY_TOKENS,
+        ) {
             found.push(Row {
                 wedge,
                 kind: &entry.kind,
                 id: &entry.id,
-                uses,
+                scope: &entry.scope,
+                project: &entry.project,
+                uses: entry.uses,
                 savings: startup_savings(load_mode, static_tokens),
             });
         }
@@ -1082,6 +1535,7 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
             vec![
                 row.wedge.label().to_string(),
                 format!("{}/{}", row.kind, row.id),
+                scope_cell(row.scope, row.project),
                 savings_cell(row.savings),
                 uses_cell,
                 savings_suggestion(row.wedge, row.savings),
@@ -1089,8 +1543,16 @@ fn wedges(format: Format, db: &Path) -> Result<()> {
         })
         .collect();
     render(
-        &["wedge", "surface", "saves@start", "uses", "suggestion"],
         &[
+            "wedge",
+            "surface",
+            "scope",
+            "saves@start",
+            "uses",
+            "suggestion",
+        ],
+        &[
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Right,
@@ -1156,7 +1618,12 @@ fn main_transcripts(projects: &Path) -> Result<Vec<PathBuf>> {
     Ok(transcripts)
 }
 
-fn session_meta(transcript: &Path, sub_tokens: i64, sub_agent_count: i64) -> SessionMeta {
+fn session_meta(
+    transcript: &Path,
+    root: String,
+    sub_tokens: i64,
+    sub_agent_count: i64,
+) -> SessionMeta {
     let id = transcript
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -1172,6 +1639,7 @@ fn session_meta(transcript: &Path, sub_tokens: i64, sub_agent_count: i64) -> Ses
         project: normalize_project(&slug),
         slug,
         id,
+        root,
         source_path: transcript.display().to_string(),
         sub_tokens,
         sub_agent_count,
@@ -1261,5 +1729,20 @@ fn pad(text: &str, width: usize, align: Align) -> String {
     match align {
         Align::Left => format!("{text}{fill}"),
         Align::Right => format!("{fill}{text}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_root_folds_a_worktree_path_onto_its_repo() {
+        assert_eq!(
+            normalize_root("/tmp/example/repo/.wt/feat-x"),
+            "/tmp/example/repo"
+        );
+        // Idempotent: an already-folded root stays put.
+        assert_eq!(normalize_root("/tmp/example/repo"), "/tmp/example/repo");
     }
 }

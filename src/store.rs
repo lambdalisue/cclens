@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     project         TEXT NOT NULL,
     slug            TEXT NOT NULL,
+    root            TEXT NOT NULL DEFAULT '',
     source_path     TEXT NOT NULL,
     started_at      TEXT NOT NULL,
     sub_tokens      INTEGER NOT NULL DEFAULT 0,
@@ -50,10 +51,24 @@ CREATE TABLE IF NOT EXISTS surfaces (
     kind          TEXT NOT NULL,
     id            TEXT NOT NULL,
     scope         TEXT NOT NULL,
+    project       TEXT NOT NULL DEFAULT '',
     config_path   TEXT,
     static_tokens INTEGER,
     load_mode     TEXT NOT NULL,
-    PRIMARY KEY (kind, id, scope)
+    PRIMARY KEY (kind, id, scope, project)
+);
+-- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
+-- commands can report freshness and re-run the analysis with the same roots.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- Incremental-ingest fingerprints: a transcript whose (mtime, size) matches is
+-- skipped on re-analyze (see docs/specs/storage.md).
+CREATE TABLE IF NOT EXISTS ingested_files (
+    path  TEXT PRIMARY KEY,
+    mtime INTEGER NOT NULL,
+    size  INTEGER NOT NULL
 );
 -- A clean read view over tool_error events: the friction columns are overloaded
 -- onto generic event columns (category in surface_id, excerpt in source, tool in
@@ -77,6 +92,10 @@ pub struct SessionMeta {
     pub id: String,
     pub project: String,
     pub slug: String,
+    /// The real directory the session started in (from the transcript's `cwd`,
+    /// worktree folded) — empty when no record carried one. This is what
+    /// project-config scanning walks; the slug is too lossy to reconstruct it.
+    pub root: String,
     pub source_path: String,
     /// Total output tokens across this session's subagent transcripts, and how
     /// many subagents it spawned.
@@ -98,13 +117,21 @@ pub struct SkillUsage {
     pub duration_sec: f64,
 }
 
-/// One catalogued surface (effective scope already resolved).
+/// One catalogued surface row with its **effective** usage: the invocations
+/// attributed to this row under per-project shadowing (a project row absorbs
+/// its own project's events; the global row keeps everyone else's). See
+/// `docs/specs/surfaces.md`.
 #[derive(Debug, PartialEq)]
 pub struct CatalogEntry {
     pub kind: String,
     pub id: String,
+    /// `global` | `project`.
+    pub scope: String,
+    /// The owning project's normalized slug; empty for global rows.
+    pub project: String,
     pub static_tokens: Option<i64>,
     pub load_mode: String,
+    pub uses: i64,
 }
 
 /// One skill event's cost, with its UTC start, for time bucketing.
@@ -162,6 +189,18 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
+        // A db written by an older cclens lacks columns the queries below rely
+        // on (`CREATE TABLE IF NOT EXISTS` will not add them). The store is a
+        // regenerable cache, so refuse it with the fix instead of failing on
+        // some later query.
+        for (table, column) in [("sessions", "root"), ("surfaces", "project")] {
+            if table_exists(&conn, table)? && !column_exists(&conn, table, column)? {
+                anyhow::bail!(
+                    "the store's schema is from an older cclens — delete the db file \
+                     and re-run `cclens analyze` to regenerate it"
+                );
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -186,12 +225,13 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO sessions
-               (id, project, slug, source_path, started_at, sub_tokens, sub_agent_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (id, project, slug, root, source_path, started_at, sub_tokens, sub_agent_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &session.id,
                 &session.project,
                 &session.slug,
+                &session.root,
                 &session.source_path,
                 &started_at,
                 session.sub_tokens,
@@ -351,6 +391,21 @@ impl Store {
         Ok(())
     }
 
+    /// Raw work events of a kind as `(project, id, started_epoch)`, time-ordered
+    /// — burst/thrash detection per project, so a burst is reported under the
+    /// project it happened in.
+    pub fn work_event_rows_by_project(&self, kind: &str) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, e.surface_id, e.started_epoch
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.kind = ?1 ORDER BY e.started_epoch",
+        )?;
+        let rows = stmt
+            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Raw work events of a kind as `(id, started_epoch)`, time-ordered — for
     /// burst/thrash detection where individual timestamps matter.
     pub fn work_event_rows(&self, kind: &str) -> Result<Vec<(String, i64)>> {
@@ -495,11 +550,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Total tokens of always-on (startup_full) config read from files — what a
-    /// session pays unconditionally from CLAUDE.md and non-conditional rules.
+    /// Total tokens of **global** always-on (startup_full) config — what every
+    /// session pays unconditionally from `~/.claude` regardless of project.
+    /// Project config is always-on only for its own sessions
+    /// (`always_on_config_tokens_for`).
     pub fn always_on_config_tokens(&self) -> Result<i64> {
         let total = self.conn.query_row(
-            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces WHERE load_mode = 'startup_full'",
+            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces
+             WHERE load_mode = 'startup_full' AND scope = 'global'",
             [],
             |row| row.get(0),
         )?;
@@ -581,6 +639,44 @@ impl Store {
         Ok(rows)
     }
 
+    /// An analyze-run metadata value, if recorded.
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query_map([key], |row| row.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Record an analyze-run metadata value, superseding any previous one.
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            (key, value),
+        )?;
+        Ok(())
+    }
+
+    /// Whether a source file's `(mtime, size)` matches its recorded ingest
+    /// fingerprint — if so, re-analyzing may skip it (`docs/specs/storage.md`).
+    pub fn is_ingested(&self, path: &str, mtime: i64, size: i64) -> Result<bool> {
+        let matched = self.conn.query_row(
+            "SELECT COUNT(*) FROM ingested_files WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+            (path, mtime, size),
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(matched > 0)
+    }
+
+    /// Record a source file's ingest fingerprint. Call **after** the read
+    /// completes, with the pre-read stat — a file that grew mid-read then shows
+    /// a changed fingerprint next run and is re-ingested (`docs/specs/storage.md`).
+    pub fn record_ingested_file(&mut self, path: &str, mtime: i64, size: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ingested_files (path, mtime, size) VALUES (?1, ?2, ?3)",
+            (path, mtime, size),
+        )?;
+        Ok(())
+    }
+
     /// Rebuild the surface catalog wholesale — it is a snapshot of current
     /// config, not an accumulation (see `docs/specs/storage.md`).
     pub fn replace_surfaces(&mut self, surfaces: &[Surface]) -> Result<()> {
@@ -589,12 +685,13 @@ impl Store {
         for surface in surfaces {
             tx.execute(
                 "INSERT OR REPLACE INTO surfaces
-                   (kind, id, scope, config_path, static_tokens, load_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                   (kind, id, scope, project, config_path, static_tokens, load_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (
                     &surface.kind,
                     &surface.id,
                     surface.scope.label(),
+                    surface.scope.project(),
                     &surface.config_path,
                     surface.static_tokens,
                     surface.load_mode.label(),
@@ -605,31 +702,86 @@ impl Store {
         Ok(())
     }
 
-    /// The whole catalog, one row per `(kind, id)` with the **effective** scope
-    /// resolved — a project surface shadows a global one of the same id (see
-    /// `docs/specs/storage.md`).
-    pub fn catalog(&self) -> Result<Vec<CatalogEntry>> {
-        // MAX(scope): 'project' > 'global' lexically, so the project row wins.
-        // SQLite gives the bare columns (static_tokens, load_mode) the values
-        // from the same row the MAX picked.
+    /// The whole catalog — every `(kind, id, scope, project)` row — with each
+    /// row's **effective** usage. Shadowing is per project: an event from
+    /// project P joins P's project row when one exists for that `(kind, id)`,
+    /// else the global row. One event therefore counts on exactly one row
+    /// (`docs/specs/surfaces.md`).
+    pub fn effective_catalog(&self) -> Result<Vec<CatalogEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, id, static_tokens, load_mode, MAX(scope)
-             FROM surfaces
-             GROUP BY kind, id
-             ORDER BY kind, id",
+            "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens, f.load_mode,
+                    COUNT(u.event_id)
+             FROM surfaces f
+             LEFT JOIN (SELECT e.id AS event_id, e.surface_kind, e.surface_id,
+                               s.project AS session_project
+                        FROM events e JOIN sessions s ON e.session_id = s.id
+                        WHERE e.surface_kind IS NOT NULL) u
+               ON u.surface_kind = f.kind AND u.surface_id = f.id
+              AND ((f.scope = 'project' AND u.session_project = f.project)
+                OR (f.scope = 'global' AND u.session_project NOT IN (
+                      SELECT p.project FROM surfaces p
+                      WHERE p.kind = f.kind AND p.id = f.id AND p.scope = 'project')))
+             GROUP BY f.kind, f.id, f.scope, f.project
+             ORDER BY f.kind, f.id, f.scope, f.project",
         )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(CatalogEntry {
                     kind: row.get(0)?,
                     id: row.get(1)?,
-                    static_tokens: row.get(2)?,
-                    load_mode: row.get(3)?,
+                    scope: row.get(2)?,
+                    project: row.get(3)?,
+                    static_tokens: row.get(4)?,
+                    load_mode: row.get(5)?,
+                    uses: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Distinct known `(root, project)` pairs — the directories project-config
+    /// scanning walks, each with the normalized project slug its surfaces get
+    /// scoped to. Sessions whose transcript carried no cwd are skipped.
+    pub fn session_roots(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT root, project FROM sessions WHERE root <> '' ORDER BY root",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total always-on config tokens for a session in `project`: the global
+    /// figure plus that project's own startup-full config.
+    pub fn always_on_config_tokens_for(&self, project: &str) -> Result<i64> {
+        let total = self.conn.query_row(
+            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces
+             WHERE load_mode = 'startup_full'
+               AND (scope = 'global' OR (scope = 'project' AND project = ?1))",
+            [project],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
 }
 
 fn source_label(source: Source) -> &'static str {
@@ -686,6 +838,7 @@ mod tests {
             id: id.to_string(),
             project: "demo".to_string(),
             slug: "demo".to_string(),
+            root: String::new(),
             source_path: format!("/tmp/{id}.jsonl"),
             sub_tokens: 0,
             sub_agent_count: 0,
@@ -761,21 +914,91 @@ mod tests {
     }
 
     #[test]
-    fn surface_catalog_resolves_project_over_global() {
+    fn a_project_surface_shadows_global_only_for_its_own_sessions() {
+        // skill/git-commit is installed globally AND in project alpha; alpha and
+        // beta each invoke it once. Alpha's use lands on alpha's project row,
+        // beta's on the global row — two uses total, never double-counted, and
+        // beta's usage never inflates alpha's copy.
         let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        let mut beta = session("b1");
+        beta.project = "beta".to_string();
+        store
+            .ingest_session(&alpha, &[span("git-commit", 1, 1, 1.0)], &[])
+            .unwrap();
+        store
+            .ingest_session(&beta, &[span("git-commit", 1, 1, 1.0)], &[])
+            .unwrap();
         store
             .replace_surfaces(&[
                 surface("git-commit", Scope::Global, 100),
-                surface("git-commit", Scope::Project, 250), // shadows global
-                surface("pr-create", Scope::Global, 40),
+                surface("git-commit", Scope::Project("alpha".to_string()), 250),
             ])
             .unwrap();
 
-        let catalog = store.catalog().unwrap();
+        let catalog = store.effective_catalog().unwrap();
 
         assert_eq!(catalog.len(), 2);
-        let git = catalog.iter().find(|e| e.id == "git-commit").unwrap();
-        assert_eq!(git.static_tokens, Some(250)); // the project row won
+        let global = catalog.iter().find(|e| e.scope == "global").unwrap();
+        let project = catalog.iter().find(|e| e.scope == "project").unwrap();
+        assert_eq!(project.project, "alpha");
+        assert_eq!(project.static_tokens, Some(250));
+        assert_eq!(project.uses, 1); // alpha's invocation only
+        assert_eq!(global.uses, 1); // beta's invocation only
+    }
+
+    #[test]
+    fn an_unshadowed_global_surface_counts_usage_from_every_project() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        let mut beta = session("b1");
+        beta.project = "beta".to_string();
+        store
+            .ingest_session(&alpha, &[span("pr-create", 1, 1, 1.0)], &[])
+            .unwrap();
+        store
+            .ingest_session(&beta, &[span("pr-create", 1, 1, 1.0)], &[])
+            .unwrap();
+        store
+            .replace_surfaces(&[surface("pr-create", Scope::Global, 40)])
+            .unwrap();
+
+        let catalog = store.effective_catalog().unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].uses, 2);
+    }
+
+    #[test]
+    fn session_roots_are_distinct_pairs_and_skip_unknown() {
+        let mut store = Store::in_memory().unwrap();
+        let mut a = session("a1");
+        a.root = "/tmp/example/app".to_string();
+        a.project = "alpha".to_string();
+        let mut b = session("b1");
+        b.root = "/tmp/example/app".to_string(); // duplicate root
+        b.project = "alpha".to_string();
+        let c = session("c1"); // root unknown (empty)
+        store.ingest_session(&a, &[], &[]).unwrap();
+        store.ingest_session(&b, &[], &[]).unwrap();
+        store.ingest_session(&c, &[], &[]).unwrap();
+
+        assert_eq!(
+            store.session_roots().unwrap(),
+            vec![("/tmp/example/app".to_string(), "alpha".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_outdated_store_schema_is_rejected_with_guidance() {
+        // A db created by an older cclens (no sessions.root / surfaces.project)
+        // must be refused with a re-analyze hint, not fail mid-query.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, project TEXT NOT NULL);")
+            .unwrap();
+        let err = Store::from_connection(conn).err().expect("must be refused");
+        assert!(err.to_string().contains("cclens analyze"));
     }
 
     fn span_at_ctx(skill: &str, ctx_start: u64) -> Span {
@@ -849,10 +1072,22 @@ mod tests {
                 },
                 // A skill is startup_description — must NOT count.
                 surface("git-commit", Scope::Global, 1000),
+                // Another project's CLAUDE.md is always-on *there*, not globally.
+                Surface {
+                    kind: "claude_md".to_string(),
+                    id: "project".to_string(),
+                    scope: Scope::Project("alpha".to_string()),
+                    config_path: "/tmp/example/CLAUDE.md".to_string(),
+                    static_tokens: Some(400),
+                    load_mode: LoadMode::StartupFull,
+                },
             ])
             .unwrap();
 
+        // The global figure excludes project config; a session in alpha pays
+        // the global floor plus alpha's own always-on config.
         assert_eq!(store.always_on_config_tokens().unwrap(), 1500);
+        assert_eq!(store.always_on_config_tokens_for("alpha").unwrap(), 1900);
     }
 
     #[test]
@@ -865,9 +1100,40 @@ mod tests {
             .replace_surfaces(&[surface("new", Scope::Global, 1)])
             .unwrap();
 
-        let catalog = store.catalog().unwrap();
+        let catalog = store.effective_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].id, "new");
+    }
+
+    #[test]
+    fn meta_round_trips_and_overwrites() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.meta("analyzed_at").unwrap(), None);
+        store
+            .set_meta("analyzed_at", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .set_meta("analyzed_at", "2026-01-02T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            store.meta("analyzed_at").unwrap().as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn an_unchanged_fingerprint_marks_a_file_ingested() {
+        let mut store = Store::in_memory().unwrap();
+        // Never seen: needs ingest.
+        assert!(!store.is_ingested("/tmp/a.jsonl", 100, 5).unwrap());
+        store.record_ingested_file("/tmp/a.jsonl", 100, 5).unwrap();
+        // Same (mtime, size): skip. Any change: re-ingest.
+        assert!(store.is_ingested("/tmp/a.jsonl", 100, 5).unwrap());
+        assert!(!store.is_ingested("/tmp/a.jsonl", 101, 5).unwrap());
+        assert!(!store.is_ingested("/tmp/a.jsonl", 100, 6).unwrap());
+        // A new fingerprint supersedes the old one.
+        store.record_ingested_file("/tmp/a.jsonl", 101, 6).unwrap();
+        assert!(store.is_ingested("/tmp/a.jsonl", 101, 6).unwrap());
     }
 
     #[test]
@@ -944,6 +1210,26 @@ mod tests {
                     "missing /b".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn work_event_rows_carry_their_project() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_work_events(
+                "a1",
+                &alpha.source_path,
+                &[(1_000, "file_edit", "x.rs".to_string())],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.work_event_rows_by_project("file_edit").unwrap(),
+            vec![("alpha".to_string(), "x.rs".to_string(), 1)]
         );
     }
 

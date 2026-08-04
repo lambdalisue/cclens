@@ -14,14 +14,14 @@ jobs:
     name: lint + format (rustfmt, clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
       # Pull prebuilt toolchain/deps and push what this run builds. Pushing needs
       # the auth token; forks/PRs without the secret fall back to pull-only.
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         with:
           name: cclens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -32,31 +32,54 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         with:
           name: cclens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix develop -c just test
 
+  # One job per system the flake advertises, because the cache only helps the
+  # systems it actually holds: a build pushed from Linux does nothing for a mac
+  # user, who would compile from source — the exact thing the substituter in
+  # flake.nix exists to prevent. x86_64-darwin is the gap, and it stays one until
+  # this needs an Intel macOS runner badly enough to pay for the wait.
   build:
-    name: build + push package
-    runs-on: ubuntu-latest
+    name: nix build + cachix push (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { system: x86_64-linux, os: ubuntu-latest }
+          - { system: aarch64-linux, os: ubuntu-24.04-arm }
+          - { system: aarch64-darwin, os: macos-latest }
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@v17
         with:
           name: cclens
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       # Realize the package (and its cargo deps) in the Nix store so cachix-action
       # pushes them. Without this only the devShell is cached and
       # `nix run github:lambdalisue/cclens` still compiles from source.
+      # `nix build` resolves the system from the runner, so the matrix needs no
+      # flag — the `system` column only names the job.
       - run: nix build .#default
+
+  # The same matrix the release publishes, so a target that stops compiling
+  # fails here rather than at the moment a release is cut. Archives are uploaded
+  # as run artifacts, which also makes a PR build downloadable for a quick check.
+  targets:
+    name: cross-platform build
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: dev

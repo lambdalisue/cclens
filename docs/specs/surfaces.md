@@ -129,11 +129,19 @@ always-on wedge is confirmed empirically, not asserted:
 
 `static_tokens` is a config-side estimate, never a measured runtime component
 (`config-format.md`). To claim "your always-on config costs ~X every session"
-honestly, reconcile it against observed context: the **floor of `ctx_start`
-across sessions** is an empirical lower bound on the always-on context every
-session starts with. Comparing `sum(static_tokens WHERE load_mode = startup_full)`
-against that observed floor is the only evidence-backed form of the always-on
-claim.
+honestly, reconcile it against observed context: the **floor of the session-start
+context across sessions** is an empirical lower bound on the always-on context
+every session starts with. Comparing
+`sum(static_tokens WHERE load_mode = startup_full)` against that observed floor
+is the only evidence-backed form of the always-on claim.
+
+The floor must come from an actual session start (the `session_start` event —
+`events.md`), never from a skill span's `ctx_start`. A span's `ctx_start` is the
+prompt size wherever that skill happened to run; in a long or resumed session
+that is far above what the session started with, so a project whose only skill
+invocations came late reported a mid-session size as its startup cost — inverting
+the advice this section exists to give. A project with no observed session start
+contributes no floor rather than a substitute.
 
 This is implemented as the `overhead` command (`cli.md`): it reports the observed
 floor, the readable config that accounts for part of it, and the **residual** —

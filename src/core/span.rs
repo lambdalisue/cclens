@@ -107,6 +107,36 @@ pub fn span_end(records: &[Record], start: usize, idle_gap_ms: i64) -> usize {
     records.len()
 }
 
+/// When a session began and the context it began with — one always-on floor
+/// observation. The timestamp travels with the size because an observation
+/// nobody can place in time cannot be audited against the session it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStart {
+    pub timestamp_ms: i64,
+    /// The prompt size of the session's first assistant request, before any work
+    /// grew it.
+    pub ctx: u64,
+}
+
+/// The session's start: its first assistant request.
+///
+/// This is the only honest observation of the always-on floor (system prompt +
+/// tool/MCP schemas + always-on config). A skill span's `ctx_start` is *not* a
+/// substitute: it is the prompt size wherever that skill happened to run, which
+/// in a long or resumed session is far above the session's own start.
+///
+/// `None` when the transcript carries no assistant record — the session then
+/// contributes no floor observation rather than a fabricated one.
+pub fn session_start(records: &[Record]) -> Option<SessionStart> {
+    records.iter().find_map(|record| match record.kind {
+        RecordKind::Assistant { prompt_size, .. } => Some(SessionStart {
+            timestamp_ms: record.timestamp_ms,
+            ctx: prompt_size,
+        }),
+        _ => None,
+    })
+}
+
 /// Extract one `Span` per skill invocation in `records`, in order.
 ///
 /// Each span runs from its invocation to `span_end` (using `idle_gap_ms`); its
@@ -187,6 +217,53 @@ mod tests {
 
     fn at(timestamp_ms: i64, kind: RecordKind) -> Record {
         Record { timestamp_ms, kind }
+    }
+
+    #[test]
+    fn session_start_ctx_is_the_first_assistant_prompt_size() {
+        let records = [
+            at(0, RecordKind::HumanTurn),
+            at(1, assistant(52_000, 10, "opus")),
+            at(2, assistant(90_000, 10, "opus")),
+        ];
+        assert_eq!(
+            session_start(&records),
+            Some(SessionStart {
+                timestamp_ms: 1,
+                ctx: 52_000
+            })
+        );
+    }
+
+    #[test]
+    fn session_start_carries_when_the_session_began() {
+        // The observation is worthless without its timestamp: an event stamped
+        // at the epoch would place every session start in 1970.
+        let records = [at(1_700_000_000_000, assistant(52_000, 10, "opus"))];
+        assert_eq!(
+            session_start(&records).unwrap().timestamp_ms,
+            1_700_000_000_000
+        );
+    }
+
+    #[test]
+    fn session_start_ctx_ignores_a_skill_that_runs_later_in_the_session() {
+        // The old floor took the first prompt size *inside a skill span*, so a
+        // session that only invoked a skill after a long conversation reported
+        // that late, inflated size as its start.
+        let records = [
+            at(0, assistant(52_000, 10, "opus")),
+            at(1, assistant(300_000, 10, "opus")),
+            at(2, skill("git-commit")),
+            at(3, assistant(310_000, 10, "opus")),
+        ];
+        assert_eq!(session_start(&records).map(|s| s.ctx), Some(52_000));
+    }
+
+    #[test]
+    fn session_start_ctx_is_absent_without_an_assistant_record() {
+        let records = [at(0, RecordKind::HumanTurn)];
+        assert_eq!(session_start(&records), None);
     }
 
     fn skill(name: &str) -> RecordKind {

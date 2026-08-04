@@ -8,7 +8,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::core::span::{Source, Span};
+use crate::core::span::{SessionStart, Source, Span};
 use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
@@ -102,6 +102,12 @@ pub struct SessionMeta {
     /// many subagents it spawned.
     pub sub_tokens: i64,
     pub sub_agent_count: i64,
+    /// When this session started and the context it started with, when the
+    /// transcript carried an assistant record to read it from — the only honest
+    /// always-on-floor observation (`core::span::session_start`). Stored as a
+    /// `session_start` event so `overhead` can distinguish "no observation" from
+    /// a fabricated zero.
+    pub start: Option<SessionStart>,
 }
 
 /// One row of the per-skill usage rollup. Subagent cost is deliberately not
@@ -234,10 +240,16 @@ impl Store {
         spans: &[Span],
         usage: &[UsageEvent],
     ) -> Result<()> {
-        let started_at = spans
-            .iter()
-            .map(|span| span.started_epoch_ms)
-            .min()
+        // The session's first assistant record precedes any span, so it is the
+        // better start when present; the earliest span is the fallback for a
+        // transcript that carried no assistant record.
+        let started_epoch_ms = session
+            .start
+            .map(|start| start.timestamp_ms)
+            .into_iter()
+            .chain(spans.iter().map(|span| span.started_epoch_ms))
+            .min();
+        let started_at = started_epoch_ms
             .map(epoch_ms_to_rfc3339)
             .unwrap_or_default();
 
@@ -261,6 +273,25 @@ impl Store {
             "DELETE FROM events WHERE source_path = ?1",
             (&session.source_path,),
         )?;
+        // One `session_start` event per session that carried an observable
+        // start context — the always-on floor `overhead` reports. It is stamped
+        // with when the session began, not left at the epoch: `sql` exposes raw
+        // event rows, and a 1970 timestamp there is worse than no row at all.
+        if let Some(start) = session.start {
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, started_at, started_epoch,
+                    duration_sec, out_tokens, ctx_growth, ctx_start, ctx_peak)
+                 VALUES (?1, ?2, 'session_start', ?3, ?4, 0, 0, 0, ?5, ?5)",
+                (
+                    &session.id,
+                    &session.source_path,
+                    epoch_ms_to_rfc3339(start.timestamp_ms),
+                    start.timestamp_ms / 1000,
+                    start.ctx,
+                ),
+            )?;
+        }
         for span in spans {
             tx.execute(
                 "INSERT INTO events
@@ -590,30 +621,38 @@ impl Store {
         Ok(total)
     }
 
-    /// Empirical always-on context floor per project: the smallest non-trivial
-    /// prompt size any skill started with. The leanest such moment is closest to
-    /// a fresh session's baseline (system prompt + tool/MCP schemas + always-on
-    /// config), so it is a lower bound on what every session in that project
-    /// actually loads — including the MCP schema cost the catalog cannot read.
-    pub fn baseline_floor_per_project(&self) -> Result<Vec<(String, i64)>> {
+    /// Empirical always-on context floor per project as `(project, floor,
+    /// sessions)`: the leanest context any of that project's sessions *started*
+    /// with, and how many starts back the figure.
+    ///
+    /// Only `session_start` events qualify. A skill span's `ctx_start` is the
+    /// prompt size wherever that skill ran, which in a long or resumed session
+    /// sits far above the session's own start — reading floors from spans
+    /// reported startup costs that were really mid-session sizes. The session
+    /// count is part of the answer because the floor is a minimum over
+    /// observations: one resumed session alone still overstates it, and the
+    /// count is what makes that visible.
+    pub fn baseline_floor_per_project(&self) -> Result<Vec<(String, i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.project, MIN(e.ctx_start)
+            "SELECT s.project, MIN(e.ctx_start), COUNT(*)
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.ctx_start > 0
+             WHERE e.kind = 'session_start' AND e.ctx_start > 0
              GROUP BY s.project
              ORDER BY MIN(e.ctx_start) DESC",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// The global empirical always-on floor — the smallest non-trivial prompt
-    /// size observed anywhere.
-    pub fn baseline_floor(&self) -> Result<i64> {
+    /// The global empirical always-on floor — the leanest session start observed
+    /// anywhere. `None` when no session start was observed at all, so callers
+    /// report the metric as unavailable instead of inventing a zero.
+    pub fn baseline_floor(&self) -> Result<Option<i64>> {
         let floor = self.conn.query_row(
-            "SELECT COALESCE(MIN(ctx_start), 0) FROM events WHERE ctx_start > 0",
+            "SELECT MIN(ctx_start) FROM events
+             WHERE kind = 'session_start' AND ctx_start > 0",
             [],
             |row| row.get(0),
         )?;
@@ -891,6 +930,7 @@ mod tests {
             source_path: format!("/tmp/{id}.jsonl"),
             sub_tokens: 0,
             sub_agent_count: 0,
+            start: None,
         }
     }
 
@@ -1070,32 +1110,106 @@ mod tests {
     }
 
     #[test]
-    fn baseline_floor_is_the_smallest_nonzero_ctx_start_per_project() {
+    fn baseline_floor_is_the_leanest_session_start_per_project() {
         let mut store = Store::in_memory().unwrap();
-        // Project "alpha": floor 12000; project "beta": floor 40000.
-        let mut alpha = session("a1");
-        alpha.project = "alpha".to_string();
-        store
-            .ingest_session(
-                &alpha,
-                &[
-                    span_at_ctx("git-commit", 30000),
-                    span_at_ctx("pr-create", 12000),
-                ],
-                &[],
-            )
-            .unwrap();
+        // Project "alpha" started two sessions at 30000 and 12000; "beta" one
+        // at 40000.
+        let mut alpha1 = session("a1");
+        alpha1.project = "alpha".to_string();
+        alpha1.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 30000,
+        });
+        store.ingest_session(&alpha1, &[], &[]).unwrap();
+        let mut alpha2 = session("a2");
+        alpha2.project = "alpha".to_string();
+        alpha2.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 12000,
+        });
+        store.ingest_session(&alpha2, &[], &[]).unwrap();
         let mut beta = session("b1");
         beta.project = "beta".to_string();
-        store
-            .ingest_session(&beta, &[span_at_ctx("git-commit", 40000)], &[])
-            .unwrap();
+        beta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 40000,
+        });
+        store.ingest_session(&beta, &[], &[]).unwrap();
 
-        assert_eq!(store.baseline_floor().unwrap(), 12000);
+        assert_eq!(store.baseline_floor().unwrap(), Some(12000));
         assert_eq!(
             store.baseline_floor_per_project().unwrap(),
-            vec![("beta".to_string(), 40000), ("alpha".to_string(), 12000)]
+            vec![
+                ("beta".to_string(), 40000, 1),
+                ("alpha".to_string(), 12000, 2)
+            ]
         );
+    }
+
+    #[test]
+    fn baseline_floor_ignores_the_context_a_skill_happened_to_run_at() {
+        let mut store = Store::in_memory().unwrap();
+        // A session that started lean but only invoked a skill deep into a long
+        // conversation. The span's ctx_start is not a floor observation.
+        let mut meta = session("s1");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
+        store
+            .ingest_session(&meta, &[span_at_ctx("git-commit", 430000)], &[])
+            .unwrap();
+
+        assert_eq!(store.baseline_floor().unwrap(), Some(50000));
+    }
+
+    #[test]
+    fn a_session_start_event_is_stamped_with_when_the_session_began() {
+        // `sql` exposes raw event rows, so an unstamped row would place every
+        // session start in 1970.
+        let mut store = Store::in_memory().unwrap();
+        let mut meta = session("s1");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
+        store.ingest_session(&meta, &[], &[]).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT started_epoch, started_at FROM events WHERE kind = 'session_start'")
+            .unwrap();
+        assert_eq!(rows[0][0], "1700000000");
+        assert!(!rows[0][1].is_empty());
+    }
+
+    #[test]
+    fn a_session_without_spans_still_records_when_it_started() {
+        // started_at was derived only from spans, so a session that invoked no
+        // skill was stored with an empty start.
+        let mut store = Store::in_memory().unwrap();
+        let mut meta = session("s1");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
+        store.ingest_session(&meta, &[], &[]).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT started_at FROM sessions WHERE id = 's1'")
+            .unwrap();
+        assert!(!rows[0][0].is_empty());
+    }
+
+    #[test]
+    fn baseline_floor_is_absent_when_no_session_start_was_observed() {
+        let mut store = Store::in_memory().unwrap();
+        let meta = session("s1");
+        store
+            .ingest_session(&meta, &[span_at_ctx("git-commit", 430000)], &[])
+            .unwrap();
+
+        assert_eq!(store.baseline_floor().unwrap(), None);
+        assert_eq!(store.baseline_floor_per_project().unwrap(), vec![]);
     }
 
     #[test]

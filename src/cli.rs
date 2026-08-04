@@ -20,7 +20,7 @@ use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
-use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans};
+use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     startup_savings,
@@ -389,7 +389,9 @@ fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
 /// the briefing and need not re-run the tool. Lists are capped where a long tail
 /// adds nothing for ranking.
 fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
-    let floor = store.baseline_floor()?;
+    // The briefing's "unknown floor" sentinel is 0 — no session start observed
+    // means the always-on section is omitted rather than guessed at.
+    let floor = store.baseline_floor()?.unwrap_or(0);
 
     // A few concrete examples per (project, category) — the actual failing
     // paths/files behind each count, so the fix is obvious from the briefing.
@@ -1333,13 +1335,19 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
     let floor = store.baseline_floor()?;
     let config = store.always_on_config_tokens()?;
-    let residual = (floor - config).max(0);
+    let residual = floor.map(|floor| (floor - config).max(0));
     let per_project = store.baseline_floor_per_project()?;
 
     if format == Format::Json {
         let per_project: Vec<serde_json::Value> = per_project
             .iter()
-            .map(|(project, floor)| serde_json::json!({ "project": project, "floor": floor }))
+            .map(|(project, floor, sessions)| {
+                serde_json::json!({
+                    "project": project,
+                    "floor": floor,
+                    "sessions": sessions,
+                })
+            })
             .collect();
         return emit_json(&serde_json::json!({
             "floor": floor,
@@ -1348,10 +1356,23 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
             "per_project": per_project,
         }));
     }
-    if floor == 0 {
-        println!("no data — run `cclens analyze` first");
+    // No session start observed — say so rather than substituting a mid-session
+    // context that would read as a startup cost.
+    let Some(floor) = floor else {
+        let (sessions, _) = store.session_stats()?;
+        if sessions == 0 {
+            println!("no data — run `cclens analyze` first");
+        } else {
+            println!(
+                "always-on floor unavailable — none of the {sessions} analyzed session(s)\n\
+                 carries an observable session start. A store written before session-start\n\
+                 tracking keeps its old rows (analyze never re-reads a closed session), so\n\
+                 delete the store and re-analyze."
+            );
+        }
         return Ok(());
-    }
+    };
+    let residual = (floor - config).max(0);
 
     preamble(
         format,
@@ -1376,13 +1397,17 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
 
     let rows: Vec<Vec<String>> = per_project
         .into_iter()
-        .map(|(project, floor)| vec![project, floor.to_string()])
+        .map(|(project, floor, sessions)| vec![project, floor.to_string(), sessions.to_string()])
         .collect();
     render(
-        &["project", "floor_tokens"],
-        &[Align::Left, Align::Right],
+        &["project", "floor_tokens", "sessions"],
+        &[Align::Left, Align::Right, Align::Right],
         &rows,
         format,
+    );
+    note(
+        "each floor is the leanest start across that project's sessions — a project with\n\
+         few sessions may not have caught a fresh one, so compare like counts.",
     );
     Ok(())
 }
@@ -1468,6 +1493,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             root.unwrap_or_default(),
             sub_tokens,
             subagents.len() as i64,
+            session_start(&records),
         );
         store.ingest_session(&meta, &spans, &usage)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
@@ -2131,6 +2157,7 @@ fn session_meta(
     root: String,
     sub_tokens: i64,
     sub_agent_count: i64,
+    start: Option<SessionStart>,
 ) -> SessionMeta {
     let id = transcript
         .file_stem()
@@ -2151,6 +2178,7 @@ fn session_meta(
         source_path: transcript.display().to_string(),
         sub_tokens,
         sub_agent_count,
+        start,
     }
 }
 

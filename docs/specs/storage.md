@@ -40,7 +40,7 @@ CREATE TABLE events (
     session_id           TEXT NOT NULL REFERENCES sessions(id),
     source_path          TEXT NOT NULL,   -- file this event came from (ingest delete key)
     source_line          INTEGER,         -- 0-based line index in source_path; recovers the raw record (prompt text for goal-3 clustering) without storing it
-    kind                 TEXT NOT NULL,   -- skill_invocation | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
+    kind                 TEXT NOT NULL,   -- skill_invocation | session_start | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
     surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL); for file_edit: the basename hotspots group on (the full path is in target)
     source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); NULL otherwise
@@ -50,7 +50,7 @@ CREATE TABLE events (
     is_trailing          INTEGER NOT NULL,-- 1 when closed only by session end (duration is a lower bound)
     out_tokens           INTEGER NOT NULL,
     ctx_growth           INTEGER NOT NULL,
-    ctx_start            INTEGER NOT NULL,
+    ctx_start            INTEGER NOT NULL,-- for session_start: the context the session began with (the always-on floor)
     ctx_peak             INTEGER NOT NULL,
     sub_tokens           INTEGER NOT NULL,
     sub_agent_count      INTEGER NOT NULL,
@@ -168,13 +168,22 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
 
 The fingerprint is keyed on the *file*, not on what cclens knew how to extract
 from it, so a store built by an older cclens keeps skipping transcripts that have
-since stopped changing — a closed session never re-ingests, and any field added
-after it was written stays NULL for that session. There is no schema version and
-no invalidation. The contract is that a reader **drops** such rows rather than
-substituting something plausible: `file_edit` rows with no `target` are excluded
-from thrash detection (`events.md`) instead of falling back to the basename,
-because a fallback would silently reproduce the merge the path exists to prevent.
-An emptied report is the signal to delete the store and re-analyze.
+since stopped changing — a closed session never re-ingests, so any event kind
+added after it was written stays missing for that session, and any field added
+after it stays NULL. There is no schema version and no invalidation.
+
+The contract is that a reader **reports the gap or drops the row**, never
+substitutes something plausible:
+
+- `overhead` reports the always-on floor as unavailable when no `session_start`
+  was observed, rather than falling back to a skill span's `ctx_start`
+  (`surfaces.md`).
+- Thrash detection excludes `file_edit` rows with no `target`, rather than
+  falling back to the basename in `surface_id` (`events.md`).
+
+Both fallbacks would have looked like working output while silently restoring the
+bug the field exists to prevent, which is worse than an empty report. An empty or
+unavailable result is the signal to delete the store and re-analyze.
 
 `(mtime, size)` is a cheap change detector, not a content hash; a touch that
 changes mtime without changing bytes triggers a harmless idempotent replace, and

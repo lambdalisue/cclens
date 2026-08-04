@@ -128,7 +128,7 @@ Each metric is computed from the records strictly within the event/span.
 | --- | --- |
 | `out_tokens` | Sum of `output_tokens` over the span's `assistant` records. |
 | `ctx_growth` | **Compaction-safe** context consumption: the sum of *positive* differences in prompt size between consecutive `assistant` records. Decreases (compaction, cache eviction) are clipped to zero. |
-| `ctx_start` | Prompt size at the first `assistant` record. |
+| `ctx_start` | Prompt size at the span's first `assistant` record — *where this skill ran*, not where the session began. See "The session-start context is its own event" below. |
 | `ctx_peak` | Maximum prompt size across the span's `assistant` records. |
 | `duration_sec` | Last minus first record `timestamp` within the span. Zero when fewer than two timestamped records. |
 | `sub_tokens` | Tokens from subagents attributed to this span (below). |
@@ -149,6 +149,28 @@ to the running context and is robust to mid-span compaction. `ctx_start` and
 `ctx_growth` is auditable rather than opaque. The `compact_boundary` markers may
 additionally be used to split or annotate a span; at minimum the metric must not
 assume monotonic prompt size.
+
+### The session-start context is its own event
+
+A span's `ctx_start` answers "how much context was loaded when this skill ran",
+which is a *span* property. The always-on floor (`surfaces.md`) needs a different
+question answered — "how much context did this session begin with" — and the two
+diverge sharply: a session that only invokes a skill after a long conversation
+has a span `ctx_start` in the hundreds of thousands while having started lean.
+Minimising span `ctx_start` therefore does not converge on the floor; it converges
+on whichever session happened to invoke a skill early.
+
+So the session start is extracted separately, as one `session_start` event per
+session carrying the prompt size of the session's **first** `assistant` record
+(`core::span::session_start_ctx`). A transcript with no `assistant` record yields
+no event — the session contributes no observation rather than a zero that would
+sink every minimum it entered.
+
+This remains a *lower bound* per observation: a resumed session's first record
+already carries the restored context, so its start overstates a fresh one. Taking
+the minimum across a project's sessions is what filters those out, which is why
+the session count travels with the floor in reports — one observation cannot be
+distinguished from one resumed session.
 
 ## Subagent attribution
 

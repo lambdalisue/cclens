@@ -1,0 +1,72 @@
+name: Build
+
+# The distributable binaries, built once and called from two places: CI runs it
+# on every pull request, the release workflow runs it when a release is
+# published. Keeping one definition is the point — when the matrix lived only in
+# the release workflow, a target that no longer compiled stayed invisible until
+# a tag was pushed, which is the most expensive moment to find out.
+#
+# Every target passes an explicit `--target`, so the arm64 macOS runner can also
+# produce the Intel macOS binary; the rest build natively on a matching runner.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          Version string embedded in the archive names. The release workflow
+          passes the tag; CI passes a placeholder, since its archives are only
+          ever downloaded by a human checking a pull request.
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on the oldest supported runner so the binaries link
+          # against an older glibc and stay usable on distros that a newer runner
+          # image would have left behind.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          # Cross-compiled from the arm64 runner rather than built on an Intel
+          # image, which is on its way out. `cc` passes `-arch x86_64` for this
+          # triple, which is all bundled SQLite needs.
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # No Windows targets. `~/.claude` is resolved through the HOME
+          # environment variable, which Windows does not set, so every default
+          # invocation would fail before it found a transcript. Shipping a
+          # binary that cannot start is worse than shipping none.
+    # The tag reaches the steps through the environment rather than being
+    # interpolated into a script, so its text can never be read as shell.
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # rusqlite is built with `bundled`, so SQLite compiles from C against each
+      # runner's native toolchain — no extra setup.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The archive name carries the tag and the triple so the Homebrew formula
+      # can address it by URL without consulting the releases API.
+      - name: Package
+        run: |
+          tar -C "target/${{ matrix.target }}/release" -czf \
+            "cclens-${TAG}-${{ matrix.target }}.tar.gz" cclens
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cclens-${{ matrix.target }}
+          path: cclens-*.tar.gz
+          if-no-files-found: error

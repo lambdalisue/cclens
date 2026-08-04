@@ -10,6 +10,7 @@ use rusqlite::Connection;
 
 use crate::core::span::{Source, Span};
 use crate::core::surface::Surface;
+use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
 
 const SCHEMA: &str = "
@@ -388,50 +389,57 @@ impl Store {
 
     /// Insert work events `(epoch_ms, kind, id)` — Bash leading words and edited
     /// file basenames — kept out of the catalog join (`surface_kind` NULL).
+    /// Persist work events as `(epoch_ms, kind, id, path)`. A file edit's full
+    /// path goes to `target` — the generic detail column
+    /// (`docs/specs/storage.md`) — while `surface_id` keeps the basename that
+    /// hotspot rankings group on.
     pub fn ingest_work_events(
         &mut self,
         session_id: &str,
         source_path: &str,
-        events: &[(i64, &str, String)],
+        events: &[(i64, &str, &str, Option<&str>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (epoch_ms, kind, id) in events {
+        for (epoch_ms, kind, id, path) in events {
             tx.execute(
                 "INSERT INTO events
-                   (session_id, source_path, kind, surface_id,
+                   (session_id, source_path, kind, surface_id, target,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak)
-                 VALUES (?1, ?2, ?3, ?4, '', ?5, 0, 0, 0, 0, 0)",
-                (session_id, source_path, *kind, id, epoch_ms / 1000),
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 0, 0, 0, 0, 0)",
+                (session_id, source_path, kind, id, path, epoch_ms / 1000),
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Raw work events of a kind as `(project, id, started_epoch)`, time-ordered
-    /// — burst/thrash detection per project, so a burst is reported under the
-    /// project it happened in.
-    pub fn work_event_rows_by_project(&self, kind: &str) -> Result<Vec<(String, String, i64)>> {
+    /// Every file edit as a `FileEdit`, time-ordered — the input to thrash
+    /// detection, which needs the session and full path to tell one agent's
+    /// retries apart from parallel work on a same-named file (`core::thrash`).
+    ///
+    /// Rows without a recorded path are **excluded**, not fallen back to the
+    /// basename in `surface_id`: grouping same-named files together is the bug
+    /// this query exists to avoid, and a silent fallback would reproduce it for
+    /// every store written before paths were recorded — invisibly, since the
+    /// output would look normal. An empty result surfaces as "no thrash
+    /// episodes", which tells the user to re-analyze.
+    pub fn file_edits(&self) -> Result<Vec<FileEdit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.project, e.surface_id, e.started_epoch
+            "SELECT s.project, e.session_id, e.target, e.started_epoch
              FROM events e JOIN sessions s ON e.session_id = s.id
-             WHERE e.kind = ?1 ORDER BY e.started_epoch",
+             WHERE e.kind = 'file_edit' AND e.target IS NOT NULL
+             ORDER BY e.started_epoch",
         )?;
         let rows = stmt
-            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    /// Raw work events of a kind as `(id, started_epoch)`, time-ordered — for
-    /// burst/thrash detection where individual timestamps matter.
-    pub fn work_event_rows(&self, kind: &str) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT surface_id, started_epoch FROM events WHERE kind = ?1 ORDER BY started_epoch",
-        )?;
-        let rows = stmt
-            .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| {
+                Ok(FileEdit {
+                    project: row.get(0)?,
+                    session_id: row.get(1)?,
+                    path: row.get(2)?,
+                    epoch: row.get(3)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1271,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn work_event_rows_carry_their_project() {
+    fn file_edits_carry_their_project_session_and_full_path() {
         let mut store = Store::in_memory().unwrap();
         let mut alpha = session("a1");
         alpha.project = "alpha".to_string();
@@ -1280,14 +1288,38 @@ mod tests {
             .ingest_work_events(
                 "a1",
                 &alpha.source_path,
-                &[(1_000, "file_edit", "x.rs".to_string())],
+                &[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))],
             )
             .unwrap();
 
         assert_eq!(
-            store.work_event_rows_by_project("file_edit").unwrap(),
-            vec![("alpha".to_string(), "x.rs".to_string(), 1)]
+            store.file_edits().unwrap(),
+            vec![FileEdit {
+                project: "alpha".to_string(),
+                session_id: "a1".to_string(),
+                path: "/repo/src/x.rs".to_string(),
+                epoch: 1,
+            }]
         );
+    }
+
+    #[test]
+    fn a_file_edit_without_a_recorded_path_is_excluded() {
+        // Falling back to the basename would silently regroup same-named files —
+        // the very merge this query exists to prevent — for every store written
+        // before paths were recorded.
+        let mut store = Store::in_memory().unwrap();
+        let alpha = session("a1");
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store
+            .ingest_work_events(
+                "a1",
+                &alpha.source_path,
+                &[(1_000, "file_edit", "x.rs", None)],
+            )
+            .unwrap();
+
+        assert_eq!(store.file_edits().unwrap(), vec![]);
     }
 
     #[test]

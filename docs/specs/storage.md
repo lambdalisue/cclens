@@ -42,7 +42,7 @@ CREATE TABLE events (
     source_line          INTEGER,         -- 0-based line index in source_path; recovers the raw record (prompt text for goal-3 clustering) without storing it
     kind                 TEXT NOT NULL,   -- skill_invocation | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
-    surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL)
+    surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL); for file_edit: the basename hotspots group on (the full path is in target)
     source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); NULL otherwise
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
@@ -56,7 +56,7 @@ CREATE TABLE events (
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
     model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error)
-    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error)
+    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit)
     attrs_json           TEXT
 );
 
@@ -165,6 +165,16 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
 - `surfaces` is rebuilt wholesale on each run from current config — the catalog
   is a snapshot of *now*, not an accumulation. (Usage is historical; catalog is
   current — `surfaces.md`.)
+
+The fingerprint is keyed on the *file*, not on what cclens knew how to extract
+from it, so a store built by an older cclens keeps skipping transcripts that have
+since stopped changing — a closed session never re-ingests, and any field added
+after it was written stays NULL for that session. There is no schema version and
+no invalidation. The contract is that a reader **drops** such rows rather than
+substituting something plausible: `file_edit` rows with no `target` are excluded
+from thrash detection (`events.md`) instead of falling back to the basename,
+because a fallback would silently reproduce the merge the path exists to prevent.
+An emptied report is the signal to delete the store and re-analyze.
 
 `(mtime, size)` is a cheap change detector, not a content hash; a touch that
 changes mtime without changing bytes triggers a harmless idempotent replace, and

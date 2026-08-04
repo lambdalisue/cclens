@@ -349,11 +349,24 @@ fn error_excerpt(content: &Value) -> String {
     clean_truncate(&raw)
 }
 
-/// Extract work events `(epoch_ms, kind, id)` from a transcript: the leading
-/// word of each Bash command (`kind = "bash_cmd"`) and the basename of each
-/// Edit/Write target (`kind = "file_edit"`). These drive the command-mix and
-/// file-hotspot views — where effort (and churn) concentrates.
-pub fn extract_work_events(jsonl: &str) -> Vec<(i64, &'static str, String)> {
+/// One unit of work Claude performed: a Bash command or a file edit.
+pub struct WorkEvent {
+    pub epoch_ms: i64,
+    pub kind: &'static str,
+    /// The ranking identity: the command's leading word, or the edited file's
+    /// basename. Deliberately lossy — it is what groups a hotspot list.
+    pub id: String,
+    /// The edited file's full path (`file_edit` only). The basename cannot tell
+    /// two same-named files apart, which matters for thrash detection
+    /// (`core::thrash`) even though it does not for a hotspot ranking.
+    pub path: Option<String>,
+}
+
+/// Extract work events from a transcript: the leading word of each Bash command
+/// (`kind = "bash_cmd"`) and each Edit/Write target (`kind = "file_edit"`). These
+/// drive the command-mix and file-hotspot views — where effort (and churn)
+/// concentrates.
+pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
     let mut events = Vec::new();
     for line in jsonl.lines() {
         let Ok(raw) = serde_json::from_str::<Raw>(line) else {
@@ -386,7 +399,12 @@ pub fn extract_work_events(jsonl: &str) -> Vec<(i64, &'static str, String)> {
                         .and_then(|v| v.as_str())
                         .and_then(|c| c.split_whitespace().next())
                     {
-                        events.push((ts, "bash_cmd", cmd.to_string()));
+                        events.push(WorkEvent {
+                            epoch_ms: ts,
+                            kind: "bash_cmd",
+                            id: cmd.to_string(),
+                            path: None,
+                        });
                     }
                 }
                 "Edit" | "Write" | "NotebookEdit" => {
@@ -394,8 +412,12 @@ pub fn extract_work_events(jsonl: &str) -> Vec<(i64, &'static str, String)> {
                         .and_then(|i| i.get("file_path"))
                         .and_then(|v| v.as_str())
                     {
-                        let base = path.rsplit('/').next().unwrap_or(path).to_string();
-                        events.push((ts, "file_edit", base));
+                        events.push(WorkEvent {
+                            epoch_ms: ts,
+                            kind: "file_edit",
+                            id: path.rsplit('/').next().unwrap_or(path).to_string(),
+                            path: Some(path.to_string()),
+                        });
                     }
                 }
                 _ => {}
@@ -573,10 +595,14 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/cli.rs"}}]}}"#,
         );
         let events = extract_work_events(jsonl);
-        assert_eq!(events[0].1, "bash_cmd");
-        assert_eq!(events[0].2, "cd"); // leading word only
-        assert_eq!(events[1].1, "file_edit");
-        assert_eq!(events[1].2, "cli.rs"); // basename
+        assert_eq!(events[0].kind, "bash_cmd");
+        assert_eq!(events[0].id, "cd"); // leading word only
+        assert_eq!(events[0].path, None);
+        assert_eq!(events[1].kind, "file_edit");
+        assert_eq!(events[1].id, "cli.rs"); // basename, for hotspot ranking
+        // The full path rides along so thrash detection can tell two same-named
+        // files apart.
+        assert_eq!(events[1].path.as_deref(), Some("/a/b/cli.rs"));
     }
 
     #[test]

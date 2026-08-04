@@ -22,6 +22,8 @@ identifying the configuration surface it exercises (the join key into
 | `tool_use` | `mcp_tool` / `mcp_server` / built-in tool | point event |
 | `prompt` | — (user input; raw material for skill extraction) | point event; text referenced, not stored |
 | `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model`, the call's target (file_path / command) in `target` |
+| `file_edit` | — (an Edit/Write target) | point event; the file's **basename** in `surface_id`, its **full path** in `target` |
+| `bash_cmd` | — (a Bash invocation) | point event; the command's leading word in `surface_id` |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — heuristic source |
 
@@ -48,6 +50,19 @@ Two kinds carry caveats that downstream reports must honour:
   concrete instance* (the actual failing path), which a report shows directly.
   It lives only in the local store (gitignored, never committed), so the privacy
   rule — no real data in the repo — still holds.
+
+- **`file_edit`** stores the basename *and* the full path because the two answer
+  different questions. A hotspot ranking wants the basename — it is the name a
+  human recognises, and collapsing every `route.ts` into one row is the point.
+  Thrash detection wants the opposite: an episode claims *one agent kept retrying
+  this one file*, so it must distinguish two same-named files, and two sessions
+  editing one file in parallel. Keeping only the basename made those
+  indistinguishable and let `stuck` report parallel work as an agent stuck in a
+  loop. Detection therefore groups on `(session_id, path)` — the session implies
+  the project, and the path is unique within it (`core::thrash`). The deliberate
+  cost: thrash continuing across a resume or `/clear` splits into one episode per
+  session. A split under-reports a real burst; a merge invents one that never
+  happened, and the merge is what makes the report untrustworthy.
 
 Surfaces that emit no event at all — `rule`, `hook`, `claude_md` — never produce
 rows here. That is expected, not missing data; `surfaces.md` classifies them as

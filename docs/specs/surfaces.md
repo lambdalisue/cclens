@@ -136,12 +136,19 @@ every session starts with. Comparing
 is the only evidence-backed form of the always-on claim.
 
 The floor must come from an actual session start (the `session_start` event —
-`events.md`), never from a skill span's `ctx_start`. A span's `ctx_start` is the
-prompt size wherever that skill happened to run; in a long or resumed session
-that is far above what the session started with, so a project whose only skill
-invocations came late reported a mid-session size as its startup cost — inverting
-the advice this section exists to give. A project with no observed session start
-contributes no floor rather than a substitute.
+`events.md`), never from a skill span's `ctx_start`. Spans were the original
+source and are a rejected alternative, not a supported one: a span's `ctx_start`
+is the prompt size wherever that skill happened to run, which in a long or
+resumed session is far above what the session started with, so a project whose
+only skill invocations came late reported a mid-session size as its startup cost
+— inverting the advice this section exists to give.
+
+What still bounds the figure is the observation set, not the source: a start is a
+lower bound only for a *fresh* session, since a resumed one begins with its
+context already restored. The minimum across a project's sessions filters those
+out when there are enough of them, so reports carry the session count alongside
+the floor, and a project with no observed session start contributes no floor
+rather than a substitute.
 
 This is implemented as the `overhead` command (`cli.md`): it reports the observed
 floor, the readable config that accounts for part of it, and the **residual** —

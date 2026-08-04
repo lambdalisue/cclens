@@ -8,7 +8,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::core::span::{Source, Span};
+use crate::core::span::{SessionStart, Source, Span};
 use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
@@ -102,12 +102,12 @@ pub struct SessionMeta {
     /// many subagents it spawned.
     pub sub_tokens: i64,
     pub sub_agent_count: i64,
-    /// The context this session actually started with, when the transcript
-    /// carried an assistant record to read it from — the only honest
-    /// always-on-floor observation (`core::span::session_start_ctx`). Stored as
-    /// a `session_start` event so `overhead` can distinguish "no observation"
-    /// from a fabricated zero.
-    pub start_ctx: Option<u64>,
+    /// When this session started and the context it started with, when the
+    /// transcript carried an assistant record to read it from — the only honest
+    /// always-on-floor observation (`core::span::session_start`). Stored as a
+    /// `session_start` event so `overhead` can distinguish "no observation" from
+    /// a fabricated zero.
+    pub start: Option<SessionStart>,
 }
 
 /// One row of the per-skill usage rollup. Subagent cost is deliberately not
@@ -240,10 +240,16 @@ impl Store {
         spans: &[Span],
         usage: &[UsageEvent],
     ) -> Result<()> {
-        let started_at = spans
-            .iter()
-            .map(|span| span.started_epoch_ms)
-            .min()
+        // The session's first assistant record precedes any span, so it is the
+        // better start when present; the earliest span is the fallback for a
+        // transcript that carried no assistant record.
+        let started_epoch_ms = session
+            .start
+            .map(|start| start.timestamp_ms)
+            .into_iter()
+            .chain(spans.iter().map(|span| span.started_epoch_ms))
+            .min();
+        let started_at = started_epoch_ms
             .map(epoch_ms_to_rfc3339)
             .unwrap_or_default();
 
@@ -268,14 +274,22 @@ impl Store {
             (&session.source_path,),
         )?;
         // One `session_start` event per session that carried an observable
-        // start context — the always-on floor `overhead` reports.
-        if let Some(start_ctx) = session.start_ctx {
+        // start context — the always-on floor `overhead` reports. It is stamped
+        // with when the session began, not left at the epoch: `sql` exposes raw
+        // event rows, and a 1970 timestamp there is worse than no row at all.
+        if let Some(start) = session.start {
             tx.execute(
                 "INSERT INTO events
                    (session_id, source_path, kind, started_at, started_epoch,
                     duration_sec, out_tokens, ctx_growth, ctx_start, ctx_peak)
-                 VALUES (?1, ?2, 'session_start', ?3, 0, 0, 0, 0, ?4, ?4)",
-                (&session.id, &session.source_path, &started_at, start_ctx),
+                 VALUES (?1, ?2, 'session_start', ?3, ?4, 0, 0, 0, ?5, ?5)",
+                (
+                    &session.id,
+                    &session.source_path,
+                    epoch_ms_to_rfc3339(start.timestamp_ms),
+                    start.timestamp_ms / 1000,
+                    start.ctx,
+                ),
             )?;
         }
         for span in spans {
@@ -916,7 +930,7 @@ mod tests {
             source_path: format!("/tmp/{id}.jsonl"),
             sub_tokens: 0,
             sub_agent_count: 0,
-            start_ctx: None,
+            start: None,
         }
     }
 
@@ -1102,15 +1116,24 @@ mod tests {
         // at 40000.
         let mut alpha1 = session("a1");
         alpha1.project = "alpha".to_string();
-        alpha1.start_ctx = Some(30000);
+        alpha1.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 30000,
+        });
         store.ingest_session(&alpha1, &[], &[]).unwrap();
         let mut alpha2 = session("a2");
         alpha2.project = "alpha".to_string();
-        alpha2.start_ctx = Some(12000);
+        alpha2.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 12000,
+        });
         store.ingest_session(&alpha2, &[], &[]).unwrap();
         let mut beta = session("b1");
         beta.project = "beta".to_string();
-        beta.start_ctx = Some(40000);
+        beta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 40000,
+        });
         store.ingest_session(&beta, &[], &[]).unwrap();
 
         assert_eq!(store.baseline_floor().unwrap(), Some(12000));
@@ -1129,12 +1152,52 @@ mod tests {
         // A session that started lean but only invoked a skill deep into a long
         // conversation. The span's ctx_start is not a floor observation.
         let mut meta = session("s1");
-        meta.start_ctx = Some(50000);
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
         store
             .ingest_session(&meta, &[span_at_ctx("git-commit", 430000)], &[])
             .unwrap();
 
         assert_eq!(store.baseline_floor().unwrap(), Some(50000));
+    }
+
+    #[test]
+    fn a_session_start_event_is_stamped_with_when_the_session_began() {
+        // `sql` exposes raw event rows, so an unstamped row would place every
+        // session start in 1970.
+        let mut store = Store::in_memory().unwrap();
+        let mut meta = session("s1");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
+        store.ingest_session(&meta, &[], &[]).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT started_epoch, started_at FROM events WHERE kind = 'session_start'")
+            .unwrap();
+        assert_eq!(rows[0][0], "1700000000");
+        assert!(!rows[0][1].is_empty());
+    }
+
+    #[test]
+    fn a_session_without_spans_still_records_when_it_started() {
+        // started_at was derived only from spans, so a session that invoked no
+        // skill was stored with an empty start.
+        let mut store = Store::in_memory().unwrap();
+        let mut meta = session("s1");
+        meta.start = Some(SessionStart {
+            timestamp_ms: 1_700_000_000_000,
+            ctx: 50000,
+        });
+        store.ingest_session(&meta, &[], &[]).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT started_at FROM sessions WHERE id = 's1'")
+            .unwrap();
+        assert!(!rows[0][0].is_empty());
     }
 
     #[test]

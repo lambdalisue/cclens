@@ -20,7 +20,7 @@ use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
-use crate::core::span::{DEFAULT_IDLE_GAP_MS, extract_spans, session_start_ctx};
+use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     startup_savings,
@@ -1359,11 +1359,17 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
     // No session start observed — say so rather than substituting a mid-session
     // context that would read as a startup cost.
     let Some(floor) = floor else {
-        println!(
-            "always-on floor unavailable — no session start was observed.\n\
-             run `cclens analyze` first; if the store predates session-start\n\
-             tracking, delete it and re-analyze."
-        );
+        let (sessions, _) = store.session_stats()?;
+        if sessions == 0 {
+            println!("no data — run `cclens analyze` first");
+        } else {
+            println!(
+                "always-on floor unavailable — none of the {sessions} analyzed session(s)\n\
+                 carries an observable session start. A store written before session-start\n\
+                 tracking keeps its old rows (analyze never re-reads a closed session), so\n\
+                 delete the store and re-analyze."
+            );
+        }
         return Ok(());
     };
     let residual = (floor - config).max(0);
@@ -1487,7 +1493,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             root.unwrap_or_default(),
             sub_tokens,
             subagents.len() as i64,
-            session_start_ctx(&records),
+            session_start(&records),
         );
         store.ingest_session(&meta, &spans, &usage)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
@@ -2151,7 +2157,7 @@ fn session_meta(
     root: String,
     sub_tokens: i64,
     sub_agent_count: i64,
-    start_ctx: Option<u64>,
+    start: Option<SessionStart>,
 ) -> SessionMeta {
     let id = transcript
         .file_stem()
@@ -2172,7 +2178,7 @@ fn session_meta(
         source_path: transcript.display().to_string(),
         sub_tokens,
         sub_agent_count,
-        start_ctx,
+        start,
     }
 }
 

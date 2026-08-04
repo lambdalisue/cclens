@@ -59,8 +59,9 @@ routed (`core::scope`):
 - **Friction categories** route by concentration: a strict-majority project owns
   the category (fix in that project's config); a spread category is global (a
   cross-project habit).
-- **Thrash** routes to the project it happened in; **cd% / prompting / token
-  totals** are behavioral, hence global.
+- **Thrash** routes to the project it happened in — carried on the episode
+  itself, since an episode is scoped to one session and therefore to one project
+  (`events.md`); **cd% / prompting / token totals** are behavioral, hence global.
 
 `--scope` narrows a report to one layer: `global`, `project` (all projects), or
 `project:<slug>` (one). `doctor`, the optimize briefing, and (by default) the
@@ -76,7 +77,7 @@ ranking.
 | `overhead` | Reconcile the empirical always-on floor (min observed `ctx_start`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh (`surfaces.md`). Includes a per-project floor table (confounded by session depth — read the global figure as authoritative). |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
 | `failures` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Lexical heuristics. |
-| `stuck` | Bursts of rapid re-edits to one file (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. |
+| `stuck` | Bursts of rapid re-edits to one file by one session (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. The table carries the project; `--format json` adds the session id and full path, which is what makes an episode investigable. |
 
 ### Output formats — human vs machine
 

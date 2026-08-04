@@ -470,31 +470,22 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         .take(15)
         .collect();
 
-    // Thrash per project — a burst belongs to the project it happened in.
-    let mut edits_by_project: std::collections::HashMap<String, Vec<(String, i64)>> =
-        std::collections::HashMap::new();
-    for (project, file, epoch) in store.work_event_rows_by_project("file_edit")? {
-        edits_by_project
-            .entry(project)
-            .or_default()
-            .push((file, epoch));
-    }
+    // Thrash per project — a burst belongs to the project it happened in. Each
+    // episode already knows its project, so detection runs once over everything.
     let mut thrash_by_project: std::collections::HashMap<String, Vec<optimize_mod::ThrashLine>> =
-        edits_by_project
-            .into_iter()
-            .map(|(project, edits)| {
-                let lines = detect_thrash(&edits, 5 * 60, 4)
-                    .into_iter()
-                    .take(5)
-                    .map(|w| optimize_mod::ThrashLine {
-                        span_secs: w.span_secs(),
-                        file: w.file,
-                        edits: w.edits,
-                    })
-                    .collect();
-                (project, lines)
-            })
-            .collect();
+        std::collections::HashMap::new();
+    for episode in detect_thrash(&store.file_edits()?, 5 * 60, 4) {
+        let lines = thrash_by_project
+            .entry(episode.project.clone())
+            .or_default();
+        if lines.len() < 5 {
+            lines.push(optimize_mod::ThrashLine {
+                span_secs: episode.span_secs(),
+                file: episode.file().to_string(),
+                edits: episode.edits,
+            });
+        }
+    }
 
     // Config wedges, split by the surface's own scope.
     let scoped = config_wedges(store)?;
@@ -1030,18 +1021,22 @@ fn tilde_path(path: &str) -> String {
 
 /// Thrash bursts: a file edited many times in a short window — where Claude got
 /// stuck and kept retrying, as opposed to a hotspot's healthy spread-out edits.
+/// An episode is one session's edits to one path, so parallel work on a
+/// same-named file is never presented as one agent looping (`core::thrash`).
 fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     const GAP_SECS: i64 = 5 * 60;
     const MIN_EDITS: u32 = 4;
     let store = open_for_read(db, frozen)?;
-    let edits = store.work_event_rows("file_edit")?;
-    let episodes = detect_thrash(&edits, GAP_SECS, MIN_EDITS);
+    let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
             .iter()
             .map(|e| {
                 serde_json::json!({
-                    "file": e.file,
+                    "project": e.project,
+                    "session_id": e.session_id,
+                    "file": e.file(),
+                    "path": e.path,
                     "edits": e.edits,
                     "span_secs": e.span_secs(),
                 })
@@ -1064,20 +1059,23 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
         .map(|e| {
             let span = e.span_secs();
             vec![
-                e.file.clone(),
+                e.project.clone(),
+                e.file().to_string(),
                 e.edits.to_string(),
                 format!("{}m{}s", span / 60, span % 60),
             ]
         })
         .collect();
     render(
-        &["file", "edits", "within"],
-        &[Align::Left, Align::Right, Align::Right],
+        &["project", "file", "edits", "within"],
+        &[Align::Left, Align::Left, Align::Right, Align::Right],
         &rows,
         format,
     );
     note(&format!(
-        "bursts of >= {MIN_EDITS} edits to one file within {}m — likely where Claude got stuck.",
+        "bursts of >= {MIN_EDITS} edits to one file within {}m by a single session —\n\
+         likely where Claude got stuck. `--format json` carries the session id and\n\
+         full path to investigate with.",
         GAP_SECS / 60
     ));
     Ok(())
@@ -1492,8 +1490,13 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             })
             .collect();
         store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
+        // `work` owns the strings; the rows borrow them.
         let work = extract_work_events(&text);
-        store.ingest_work_events(&meta.id, &meta.source_path, &work)?;
+        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+            .iter()
+            .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
+            .collect();
+        store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.

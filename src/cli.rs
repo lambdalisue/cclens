@@ -366,20 +366,25 @@ fn optimize(
 }
 
 /// Write `contents` to a uniquely-named file in the temp dir, readable only by
-/// the current user (`0600`). Used for the optimization briefing, which may hold
-/// sensitive paths/excerpts and must not sit on argv or be world-readable.
+/// the current user (`0600` on Unix). Used for the optimization briefing, which
+/// may hold sensitive paths/excerpts and must not sit on argv or be
+/// world-readable. Windows' per-user temp dir already enforces that ACL, so the
+/// file permission bits apply on Unix only.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let mut path = std::env::temp_dir();
     path.push(format!("cclens-briefing-{}.md", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
+    #[cfg(unix)]
+    let mut opts = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.mode(0o600);
+        opts
+    };
+    #[cfg(not(unix))]
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    let mut file = opts.open(&path)?;
     file.write_all(contents.as_bytes())?;
     Ok(path)
 }
@@ -2196,7 +2201,10 @@ fn default_projects_dir() -> Result<PathBuf> {
 }
 
 fn claude_home() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
+    // Windows does not set HOME; USERPROFILE is its standard home variable.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME (or USERPROFILE) is not set")?;
     Ok(PathBuf::from(home).join(".claude"))
 }
 

@@ -42,9 +42,11 @@ macOS (x86_64 and arm64 each), attaches them to that release with `.sha256`
 files, and points the
 [`lambdalisue/homebrew-cclens`](https://github.com/lambdalisue/homebrew-cclens)
 tap at the new archives. The release is published before its assets are built,
-so the notes are visible for a few minutes with nothing attached yet. Windows is
-not supported: `~/.claude` is located through the `HOME` environment variable,
-which Windows does not set.
+so the notes are visible for a few minutes with nothing attached yet. The
+release pipeline does not build Windows binaries yet, but the tool itself runs
+on Windows: `~/.claude` resolves through `HOME`, falling back to `USERPROFILE`
+(which Windows sets natively). A double-click installer is built from
+[`packaging/windows/installer.iss`](packaging/windows/installer.iss).
 
 ## Claude Code plugin
 

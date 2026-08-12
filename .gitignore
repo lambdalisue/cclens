@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Generated Windows installer output
+/dist
+
 # Nix build symlink
 /result
 

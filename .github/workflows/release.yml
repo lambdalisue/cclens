@@ -79,7 +79,8 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          for f in cclens-*.tar.gz; do
+          for f in cclens-*.tar.gz cclens-setup-*.exe; do
+            [ -f "$f" ] || continue
             sha256sum "$f" > "$f.sha256"
           done
           cat ./*.sha256

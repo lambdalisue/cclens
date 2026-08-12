@@ -43,10 +43,12 @@ files, and points the
 [`lambdalisue/homebrew-cclens`](https://github.com/lambdalisue/homebrew-cclens)
 tap at the new archives. The release is published before its assets are built,
 so the notes are visible for a few minutes with nothing attached yet. The
-release pipeline does not build Windows binaries yet, but the tool itself runs
-on Windows: `~/.claude` resolves through `HOME`, falling back to `USERPROFILE`
-(which Windows sets natively). A double-click installer is built from
-[`packaging/windows/installer.iss`](packaging/windows/installer.iss).
+release pipeline also builds a Windows installer
+(`cclens-setup-<version>.exe`, compiled from
+[`packaging/windows/installer.iss`](packaging/windows/installer.iss)) and
+attaches it alongside the Linux/macOS archives. On Windows, `~/.claude`
+resolves through `HOME`, falling back to `USERPROFILE` (which Windows sets
+natively).
 
 ## Claude Code plugin
 

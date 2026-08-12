@@ -12,7 +12,11 @@
 ; installer compiles without extra setup.
 
 #define MyAppName "cclens"
-#define MyAppVersion "0.1.0"
+// 版本默认取 Cargo 里的当前值；CI/发布流水线用 /DMyAppVersion=<ver> 覆盖
+// （ISCC 命令行的 /D 定义优先于脚本内 #define，故此处用 #ifndef 守卫）。
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "cclens"
 #define MyAppExeName "cclens.exe"
 

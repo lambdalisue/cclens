@@ -37,10 +37,10 @@ jobs:
           # image, which is on its way out. `cc` passes `-arch x86_64` for this
           # triple, which is all bundled SQLite needs.
           - { target: x86_64-apple-darwin, os: macos-latest }
-          # No Windows targets. `~/.claude` is resolved through the HOME
-          # environment variable, which Windows does not set, so every default
-          # invocation would fail before it found a transcript. Shipping a
-          # binary that cannot start is worse than shipping none.
+          # Windows builds on the native MSVC runner; ~/.claude resolves through
+          # USERPROFILE when HOME is unset (see src/cli.rs). This target also
+          # compiles the Inno Setup installer, the primary Windows deliverable.
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
     # The tag reaches the steps through the environment rather than being
     # interpolated into a script, so its text can never be read as shell.
     env:
@@ -60,13 +60,36 @@ jobs:
 
       # The archive name carries the tag and the triple so the Homebrew formula
       # can address it by URL without consulting the releases API.
-      - name: Package
+      - name: Package (unix archives)
+        if: runner.os != 'Windows'
         run: |
           tar -C "target/${{ matrix.target }}/release" -czf \
             "cclens-${TAG}-${{ matrix.target }}.tar.gz" cclens
 
+      # Windows ships an installer rather than a raw binary. Inno Setup is
+      # installed per-user into %LOCALAPPDATA%, and the installer version is
+      # overridden from the tag — CI passes a placeholder (`dev`), the release
+      # workflow the real one (e.g. `v0.1.2`).
+      - name: Package (Windows installer)
+        if: runner.os == 'Windows'
+        run: |
+          $version = "$env:TAG".TrimStart('v')
+          $innoDir = Join-Path $env:LOCALAPPDATA 'Inno Setup 6'
+          $iscc = Join-Path $innoDir 'ISCC.exe'
+          curl.exe -L -o "$env:TEMP\is.exe" 'https://jrsoftware.org/download.php/is.exe'
+          & "$env:TEMP\is.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$innoDir"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed ($LASTEXITCODE)" }
+          # 杀软可能短暂延迟文件释放，最多等 30s。
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $iscc); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "packaging\windows\installer.iss" "/DMyAppVersion=$version"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Copy-Item "dist\cclens-setup-$version.exe" -Destination "cclens-setup-$version.exe" -Force
+
       - uses: actions/upload-artifact@v7
         with:
           name: cclens-${{ matrix.target }}
-          path: cclens-*.tar.gz
+          path: |
+            cclens-*.tar.gz
+            cclens-setup-*.exe
           if-no-files-found: error

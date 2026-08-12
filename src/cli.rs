@@ -372,8 +372,20 @@ fn optimize(
 /// file permission bits apply on Unix only.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
     use std::io::Write;
+    // Exclusive creation (`create_new`) is the actual guard: a same-user process
+    // cannot pre-create the path or swap in a symlink, because the open fails
+    // instead of following it. The name mixes pid + a clock + a stack address so
+    // it is not trivially guessable, without adding a randomness dependency.
     let mut path = std::env::temp_dir();
-    path.push(format!("cclens-briefing-{}.md", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let addr = std::ptr::addr_of!(nanos) as usize as u64;
+    path.push(format!(
+        "cclens-briefing-{}-{nanos:016x}{addr:016x}.md",
+        std::process::id()
+    ));
     #[cfg(unix)]
     let mut opts = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -383,7 +395,7 @@ fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
     };
     #[cfg(not(unix))]
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     let mut file = opts.open(&path)?;
     file.write_all(contents.as_bytes())?;
     Ok(path)

@@ -11,6 +11,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::core::span::{SessionStart, Source, Span};
+use crate::core::subagent::SubagentRun;
 use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
@@ -23,7 +24,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "1";
+const ANALYZER_VERSION: &str = "2";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -59,6 +60,27 @@ CREATE TABLE IF NOT EXISTS events (
     sub_tokens_estimated INTEGER NOT NULL DEFAULT 0,
     is_trailing          INTEGER NOT NULL DEFAULT 0
 );
+-- One row per subagent execution: which agent type ran, and what its own output
+-- cost. The session total says how much subagent work cost; this says *whose*.
+-- `source_path` is the parent session's transcript — the ingest delete key, as
+-- for events — while `run_path` points at the subagent's own transcript.
+CREATE TABLE IF NOT EXISTS subagent_runs (
+    id                INTEGER PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    source_path       TEXT NOT NULL,
+    run_path          TEXT NOT NULL,
+    agent             TEXT,
+    agent_id          TEXT NOT NULL,
+    tool_use_id       TEXT,
+    root_tool_use_id  TEXT,
+    parent_agent_id   TEXT,
+    spawn_depth       INTEGER NOT NULL DEFAULT 1,
+    model             TEXT,
+    prompt_id         TEXT,
+    out_tokens        INTEGER NOT NULL DEFAULT 0,
+    started_at        TEXT NOT NULL,
+    started_epoch     INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS surfaces (
     kind          TEXT NOT NULL,
     id            TEXT NOT NULL,
@@ -92,6 +114,8 @@ CREATE TABLE IF NOT EXISTS ingested_files (
 /// the missing column, and take the whole migration down with it.
 const INDEX_SCHEMA: &str = "
 CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
+CREATE INDEX subagent_runs_by_agent ON subagent_runs(agent);
+CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
 ";
 
 /// Views are pure definitions over the tables, declared apart from them for the
@@ -187,6 +211,15 @@ pub struct CatalogEntry {
     pub startup_tokens: Option<i64>,
     pub load_mode: String,
     pub uses: i64,
+}
+
+/// What one agent type cost: how many times it ran and the output tokens those
+/// runs wrote. `agent` is `None` for runs whose type could not be read.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct AgentCost {
+    pub agent: Option<String>,
+    pub runs: i64,
+    pub out_tokens: i64,
 }
 
 /// One skill event's cost, with its UTC start, for time bucketing.
@@ -362,12 +395,14 @@ impl Store {
             } else {
                 "tool_use"
             };
+            // An agent spawn keeps its call id in `target` — the join key to the
+            // subagent run it started (`ingest_subagent_runs`).
             tx.execute(
                 "INSERT INTO events
                    (session_id, source_path, kind, surface_kind, surface_id, source,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
-                    ctx_start, ctx_peak, model)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, 0, 0, 0, 0, NULL)",
+                    ctx_start, ctx_peak, model, target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, 0, 0, 0, 0, NULL, ?8)",
                 (
                     &session.id,
                     &session.source_path,
@@ -376,6 +411,7 @@ impl Store {
                     &event.surface_id,
                     epoch_ms_to_rfc3339(event.started_epoch_ms),
                     event.started_epoch_ms / 1000,
+                    &event.tool_use_id,
                 ),
             )?;
         }
@@ -412,6 +448,77 @@ impl Store {
                 ),
             )?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a session's subagent runs, and settle the cost of the spawns that
+    /// started them.
+    ///
+    /// Two rows describe one subagent from opposite sides: the `agent_spawn`
+    /// event is what the main thread *did*, the run is what it *cost*. They are
+    /// joined by the spawn call's id — kept in the event's `target` — so the
+    /// spawn's own `out_tokens` becomes the run's output and its `sub_tokens`
+    /// the output of everything that run spawned in turn. A spawn whose run is
+    /// missing keeps its zeros rather than borrowing another's figures.
+    ///
+    /// Call after `ingest_session`, which inserted those spawn events.
+    pub fn ingest_subagent_runs(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        runs: &[SubagentRun],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM subagent_runs WHERE source_path = ?1",
+            (source_path,),
+        )?;
+        for run in runs {
+            tx.execute(
+                "INSERT INTO subagent_runs
+                   (session_id, source_path, run_path, agent, agent_id, tool_use_id,
+                    root_tool_use_id, parent_agent_id, spawn_depth, model, prompt_id,
+                    out_tokens, started_at, started_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                (
+                    session_id,
+                    source_path,
+                    &run.run_path,
+                    &run.agent,
+                    &run.agent_id,
+                    &run.tool_use_id,
+                    &run.root_tool_use_id,
+                    &run.parent_agent_id,
+                    run.spawn_depth,
+                    &run.model,
+                    &run.prompt_id,
+                    run.out_tokens,
+                    epoch_ms_to_rfc3339(run.started_epoch_ms),
+                    run.started_epoch_ms / 1000,
+                ),
+            )?;
+        }
+        tx.execute(
+            // Every subquery is scoped to this transcript. A call id is unique
+            // within a session but nothing guarantees it across sessions, and an
+            // unscoped scalar subquery would silently pick an arbitrary matching
+            // row while the sums added another session's runs on top.
+            "UPDATE events
+                SET out_tokens = COALESCE((SELECT r.out_tokens FROM subagent_runs r
+                                            WHERE r.source_path = events.source_path
+                                              AND r.tool_use_id = events.target), 0),
+                    sub_tokens = COALESCE((SELECT SUM(r.out_tokens) FROM subagent_runs r
+                                            WHERE r.source_path = events.source_path
+                                              AND r.root_tool_use_id = events.target
+                                              AND r.tool_use_id IS NOT events.target), 0),
+                    sub_agent_count = (SELECT COUNT(*) FROM subagent_runs r
+                                        WHERE r.source_path = events.source_path
+                                          AND r.root_tool_use_id = events.target
+                                          AND r.tool_use_id IS NOT events.target)
+              WHERE kind = 'agent_spawn' AND source_path = ?1 AND target IS NOT NULL",
+            (source_path,),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -717,6 +824,33 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(row)
+    }
+
+    /// Subagent output tokens and run count per agent type, costliest first —
+    /// the breakdown behind the session-level subagent total.
+    ///
+    /// Every run counts once, at its own cost, whatever its depth: a nested run
+    /// is the agent that produced those tokens, and rolling it into its parent's
+    /// type would credit the cost to an agent that only delegated. Runs whose
+    /// type is unknown (no sidecar beside the transcript) group under `None`
+    /// rather than being dropped, so the rows still sum to the total.
+    pub fn subagent_by_agent(&self) -> Result<Vec<AgentCost>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, COUNT(*), COALESCE(SUM(out_tokens), 0)
+             FROM subagent_runs
+             GROUP BY agent
+             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AgentCost {
+                    agent: row.get(0)?,
+                    runs: row.get(1)?,
+                    out_tokens: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Invocation counts per surface `(kind, id)` across all event kinds — the
@@ -1136,7 +1270,7 @@ mod tests {
             ctx_peak: ctx_growth,
             model: Some("claude-opus-4-7".to_string()),
             is_trailing: false,
-            agent_prompt_ids: Vec::new(),
+            spawns: Vec::new(),
             sub_tokens: 0,
             sub_agent_count: 0,
             sub_tokens_estimated: false,
@@ -1154,6 +1288,182 @@ mod tests {
             sub_agent_count: 0,
             start: None,
         }
+    }
+
+    fn agent_spawn(surface_id: &str, tool_use_id: &str) -> UsageEvent {
+        UsageEvent {
+            surface_kind: "agent".to_string(),
+            surface_id: surface_id.to_string(),
+            started_epoch_ms: 1_700_000_000_000,
+            tool_use_id: Some(tool_use_id.to_string()),
+        }
+    }
+
+    fn subagent_run(agent: &str, agent_id: &str, root: &str, out_tokens: u64) -> SubagentRun {
+        SubagentRun {
+            agent: Some(agent.to_string()),
+            agent_id: agent_id.to_string(),
+            run_path: format!("/tmp/example/subagents/agent-{agent_id}.jsonl"),
+            tool_use_id: Some(format!("toolu_{agent_id}")),
+            parent_agent_id: None,
+            spawn_depth: 1,
+            model: Some("sonnet".to_string()),
+            prompt_id: Some("p1".to_string()),
+            out_tokens,
+            started_epoch_ms: 1_700_000_000_000,
+            root_tool_use_id: Some(root.to_string()),
+        }
+    }
+
+    #[test]
+    fn subagent_cost_rolls_up_per_agent_type() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[
+                    subagent_run("Explore", "a1", "toolu_a1", 400),
+                    subagent_run("Explore", "a2", "toolu_a2", 100),
+                    subagent_run("code-writer", "a3", "toolu_a3", 900),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.subagent_by_agent().unwrap(),
+            vec![
+                AgentCost {
+                    agent: Some("code-writer".to_string()),
+                    runs: 1,
+                    out_tokens: 900,
+                },
+                AgentCost {
+                    agent: Some("Explore".to_string()),
+                    runs: 2,
+                    out_tokens: 500,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spawn_event_takes_the_cost_of_the_run_it_started() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store
+            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
+            .unwrap();
+        let mut nested = subagent_run("code-writer", "a2", "toolu_a1", 700);
+        nested.parent_agent_id = Some("a1".to_string());
+        nested.spawn_depth = 2;
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 400), nested],
+            )
+            .unwrap();
+
+        let (out_tokens, sub_tokens, sub_agents) = store
+            .query(
+                "SELECT out_tokens, sub_tokens, sub_agent_count FROM events \
+                 WHERE kind = 'agent_spawn'",
+            )
+            .map(|(_, rows)| (rows[0][0].clone(), rows[0][1].clone(), rows[0][2].clone()))
+            .unwrap();
+
+        // The spawn's own run wrote 400; the run it spawned in turn wrote 700.
+        assert_eq!((out_tokens.as_str(), sub_tokens.as_str()), ("400", "700"));
+        assert_eq!(sub_agents, "1");
+    }
+
+    #[test]
+    fn a_spawn_whose_run_is_missing_keeps_its_zeros() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store
+            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_gone")])
+            .unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            )
+            .unwrap();
+
+        let (_, rows) = store
+            .query("SELECT out_tokens, sub_tokens FROM events WHERE target = 'toolu_gone'")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["0".to_string(), "0".to_string()]]);
+    }
+
+    #[test]
+    fn a_spawn_takes_only_its_own_sessions_run() {
+        // Call ids are unique within a session, not across the store — a resumed
+        // or copied transcript can carry the same id into a second session.
+        let mut store = Store::in_memory().unwrap();
+        let (s1, s2) = (session("s1"), session("s2"));
+        store
+            .ingest_session(&s1, &[], &[agent_spawn("Explore", "toolu_a1")])
+            .unwrap();
+        store
+            .ingest_session(&s2, &[], &[agent_spawn("Explore", "toolu_a1")])
+            .unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            )
+            .unwrap();
+        store
+            .ingest_subagent_runs(
+                &s2.id,
+                &s2.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 900)],
+            )
+            .unwrap();
+
+        let (_, rows) = store
+            .query(
+                "SELECT session_id, out_tokens FROM events \
+                 WHERE kind = 'agent_spawn' ORDER BY session_id",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["s1".to_string(), "400".to_string()],
+                vec!["s2".to_string(), "900".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn re_ingesting_a_session_replaces_its_subagent_runs() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        let runs = [subagent_run("Explore", "a1", "toolu_a1", 400)];
+        store
+            .ingest_subagent_runs(&s1.id, &s1.source_path, &runs)
+            .unwrap();
+        store
+            .ingest_subagent_runs(&s1.id, &s1.source_path, &runs)
+            .unwrap();
+
+        assert_eq!(
+            store.subagent_by_agent().unwrap(),
+            vec![AgentCost {
+                agent: Some("Explore".to_string()),
+                runs: 1,
+                out_tokens: 400,
+            }]
+        );
     }
 
     #[test]
@@ -1643,6 +1953,46 @@ mod tests {
         assert_eq!(store.meta("analyzed_at").unwrap(), None);
     }
 
+    #[test]
+    fn a_store_without_subagent_runs_gains_the_table_and_is_re_extracted() {
+        // An existing store holds the events but not the runs, and its
+        // transcripts have stopped changing — so nothing would ever populate the
+        // new table, silently, since every query still succeeds and returns
+        // nothing. Two mechanisms cover it, and neither alone would: `migrate`
+        // supplies the table, and the analyzer version is what gets the rows
+        // extracted into it.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_ingested_file("/tmp/example/s1.jsonl", 1, 2)
+            .unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE subagent_runs")
+            .unwrap();
+        // Stamped by a build that predates subagent extraction.
+        store.set_meta(ANALYZER_META_KEY, "1").unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        assert!(table_exists(&store.conn, "subagent_runs").unwrap());
+        assert!(!store.is_analyzer_current().unwrap());
+    }
+
+    #[test]
+    fn reopening_a_current_store_keeps_its_fingerprints() {
+        // Migration reconciles shape only. Re-running analyze against a store
+        // the current analyzer already wrote must stay cheap.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_ingested_file("/tmp/example/s1.jsonl", 1, 2)
+            .unwrap();
+        store.record_analyzer_version().unwrap();
+        let store = Store::from_connection(store.conn).unwrap();
+
+        assert!(store.is_analyzer_current().unwrap());
+        assert!(store.is_ingested("/tmp/example/s1.jsonl", 1, 2).unwrap());
+    }
+
     fn span_at_ctx(skill: &str, ctx_start: u64) -> Span {
         Span {
             skill: skill.to_string(),
@@ -1655,7 +2005,7 @@ mod tests {
             ctx_peak: ctx_start,
             model: None,
             is_trailing: false,
-            agent_prompt_ids: Vec::new(),
+            spawns: Vec::new(),
             sub_tokens: 0,
             sub_agent_count: 0,
             sub_tokens_estimated: false,

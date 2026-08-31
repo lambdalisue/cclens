@@ -5,6 +5,8 @@
 //! deserializes defensively: only the needed fields, unknown fields ignored, a
 //! line that fails to parse or lacks a timestamp simply yields no records.
 
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -535,14 +537,69 @@ pub fn session_cwd(jsonl: &str) -> Option<String> {
     })
 }
 
-/// The `promptId` a subagent transcript was spawned under — the join key back to
-/// the spawning span. Read from the first record that carries one.
+/// The `promptId` a subagent transcript was spawned under — the coarse join key
+/// back to the spawning span. Read from the first record that carries one.
 pub fn subagent_prompt_id(jsonl: &str) -> Option<String> {
     jsonl.lines().find_map(|line| {
         serde_json::from_str::<Raw>(line)
             .ok()
             .and_then(|raw| raw.prompt_id)
     })
+}
+
+/// What a subagent transcript's **sidecar** says about the run: which agent type
+/// ran, which `Agent` call spawned it, and where it sits in the spawn tree.
+///
+/// The transcript itself never names the agent type, so without the sidecar a
+/// run's cost cannot be attributed to a type at all. Only the fields the tool
+/// needs are read, and every one is optional — a sidecar from a newer (or
+/// older) Claude Code still yields whatever it does carry, and a missing file
+/// yields `None` rather than a guess (`docs/specs/session-format.md`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct SubagentSidecar {
+    #[serde(rename = "agentType")]
+    pub agent_type: Option<String>,
+    #[serde(rename = "toolUseId")]
+    pub tool_use_id: Option<String>,
+    #[serde(rename = "parentAgentId")]
+    pub parent_agent_id: Option<String>,
+    #[serde(rename = "spawnDepth")]
+    pub spawn_depth: Option<u32>,
+    pub model: Option<String>,
+}
+
+/// Parse a subagent sidecar's JSON. `None` when the text is not readable JSON —
+/// an absent or malformed sidecar leaves the run's type unknown, which every
+/// consumer reports as unknown rather than filling in.
+pub fn parse_subagent_sidecar(json: &str) -> Option<SubagentSidecar> {
+    serde_json::from_str(json).ok()
+}
+
+/// The subagent's own id, from its transcript file name `agent-<agentId>.jsonl`
+/// — the key a nested run's sidecar names as its parent.
+pub fn subagent_id_from_file_name(file_stem: &str) -> String {
+    file_stem
+        .strip_prefix("agent-")
+        .unwrap_or(file_stem)
+        .to_string()
+}
+
+/// Where a session's subagent transcripts live: `<sessionId>/subagents/` beside
+/// the main transcript (`docs/specs/session-format.md`).
+///
+/// A path rule, not a read — the shell still does the walking. It lives here
+/// because the *layout* is Claude Code's, so a release that moves these files
+/// changes this function and nothing downstream
+/// (`.claude/rules/format-isolation.md`).
+pub fn subagents_dir(transcript: &Path) -> PathBuf {
+    transcript.with_extension("").join("subagents")
+}
+
+/// The sidecar beside a subagent transcript: `agent-<id>.jsonl` →
+/// `agent-<id>.meta.json`.
+pub fn subagent_sidecar_path(run_path: &Path) -> PathBuf {
+    run_path.with_extension("meta.json")
 }
 
 fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
@@ -575,9 +632,11 @@ fn tool_use_kind(block: &Value) -> Option<RecordKind> {
                 .as_str()?
                 .to_string();
             // The spawning turn's prompt id is threaded in by parse_session; the
-            // Agent record itself does not carry it.
+            // Agent record itself does not carry it. The block's own id does
+            // identify this call, and the spawned transcript names it back.
             Some(RecordKind::AgentSpawn {
                 agent,
+                tool_use_id: block.get("id").and_then(|id| id.as_str()).map(String::from),
                 prompt_id: None,
             })
         }
@@ -900,6 +959,68 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:04.000Z","toolDenialKind":"some-future-kind","message":{"content":[{"type":"tool_result","is_error":true,"content":"Permission for this action was denied"}]}}"#,
         );
         assert_eq!(count_permission_denials(jsonl), 4);
+    }
+
+    #[test]
+    fn an_agent_spawn_carries_the_call_id_that_names_it() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","promptId":"p1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"subagent_type":"Explore"}}]}}"#;
+        let records = parse_session(jsonl);
+        let RecordKind::AgentSpawn {
+            agent,
+            tool_use_id,
+            prompt_id,
+        } = &records[0].kind
+        else {
+            panic!("expected an agent spawn, got {:?}", records[0].kind);
+        };
+        assert_eq!(agent, "Explore");
+        assert_eq!(tool_use_id.as_deref(), Some("toolu_1"));
+        assert_eq!(prompt_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn a_sidecar_names_the_agent_type_and_the_call_that_spawned_it() {
+        let json = r#"{"agentType":"Explore","description":"look around","toolUseId":"toolu_1","spawnDepth":2,"model":"sonnet","parentAgentId":"a1","newField":"ignored"}"#;
+        assert_eq!(
+            parse_subagent_sidecar(json),
+            Some(SubagentSidecar {
+                agent_type: Some("Explore".into()),
+                tool_use_id: Some("toolu_1".into()),
+                parent_agent_id: Some("a1".into()),
+                spawn_depth: Some(2),
+                model: Some("sonnet".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_sidecar_missing_every_known_field_still_parses() {
+        // Forward compatibility: a renamed or dropped upstream field must not
+        // fail the whole run, only leave that fact unknown.
+        assert_eq!(
+            parse_subagent_sidecar("{}"),
+            Some(SubagentSidecar::default())
+        );
+        assert_eq!(parse_subagent_sidecar("not json"), None);
+    }
+
+    #[test]
+    fn a_subagent_id_comes_from_its_file_name() {
+        assert_eq!(subagent_id_from_file_name("agent-a1b2c3"), "a1b2c3");
+    }
+
+    #[test]
+    fn subagent_files_are_laid_out_beside_the_main_transcript() {
+        let transcript = Path::new("/tmp/example/projects/slug/session.jsonl");
+        let dir = subagents_dir(transcript);
+        assert_eq!(
+            dir,
+            Path::new("/tmp/example/projects/slug/session/subagents")
+        );
+        assert_eq!(
+            subagent_sidecar_path(&dir.join("agent-a1b2c3.jsonl")),
+            dir.join("agent-a1b2c3.meta.json")
+        );
     }
 
     #[test]

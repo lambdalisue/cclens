@@ -1,8 +1,9 @@
 # Storage Specification
 
 The store is the SQLite database `analyze` writes and every consumer reads
-(`architecture.md`). It holds three tables that mirror the catalog×usage model —
-a shared `sessions` dimension, the `surfaces` catalog, the `events` spine — plus
+(`architecture.md`). It holds the tables that mirror the catalog×usage model —
+a shared `sessions` dimension, the `surfaces` catalog, the `events` spine, and
+`subagent_runs` for work that happened in its own transcript — plus
 `ingested_files` for incremental rebuilds. This spec defines the schema and the
 ingest contract; the *meaning* of the columns lives in the specs that own them
 (`events.md`, `surfaces.md`, `config-format.md`).
@@ -12,13 +13,15 @@ ingest contract; the *meaning* of the columns lives in the specs that own them
 ```sql
 -- Shared dimension. One row per analyzed transcript.
 CREATE TABLE sessions (
-    id          TEXT PRIMARY KEY,   -- sessionId
-    project     TEXT NOT NULL,      -- normalized (worktree folded; see below)
-    slug        TEXT NOT NULL,      -- raw cwd-slug
-    root        TEXT NOT NULL,      -- real start directory (records' cwd, worktree folded); '' when unknown
-    source_path TEXT NOT NULL,      -- the main transcript file
-    started_at  TEXT NOT NULL,      -- RFC3339 UTC
-    version     TEXT                -- Claude Code version, when present
+    id              TEXT PRIMARY KEY,   -- sessionId
+    project         TEXT NOT NULL,      -- normalized (worktree folded; see below)
+    slug            TEXT NOT NULL,      -- raw cwd-slug
+    root            TEXT NOT NULL,      -- real start directory (records' cwd, worktree folded); '' when unknown
+    source_path     TEXT NOT NULL,      -- the main transcript file
+    started_at      TEXT NOT NULL,      -- RFC3339 UTC
+    sub_tokens      INTEGER NOT NULL,   -- the session's exact subagent output total (events.md)
+    sub_agent_count INTEGER NOT NULL,   -- subagent runs the session spawned, nested included
+    version         TEXT                -- Claude Code version, when present
 );
 
 -- Catalog: everything installed, with its static cost. Read from live config.
@@ -57,11 +60,35 @@ CREATE TABLE events (
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
     model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error)
-    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit)
+    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit); the Agent call's id (agent_spawn), joining subagent_runs
     attrs_json           TEXT
 );
 
 CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
+
+-- One row per subagent execution, from the subagent's own transcript and its
+-- sidecar (events.md). This is where "which agent types consumed those tokens?"
+-- is answered; the session total answers only "how many".
+CREATE TABLE subagent_runs (
+    id               INTEGER PRIMARY KEY,
+    session_id       TEXT NOT NULL REFERENCES sessions(id),
+    source_path      TEXT NOT NULL,   -- the parent session's transcript (ingest delete key)
+    run_path         TEXT NOT NULL,   -- the subagent's own transcript
+    agent            TEXT,            -- the agent type; NULL when no sidecar recorded it
+    agent_id         TEXT NOT NULL,
+    tool_use_id      TEXT,            -- the Agent call that spawned this run; joins events.target
+    root_tool_use_id TEXT,            -- the main-thread call its spawn tree started at
+    parent_agent_id  TEXT,            -- the run that spawned it, for a nested run
+    spawn_depth      INTEGER NOT NULL,-- 1 main-thread, 2+ nested
+    model            TEXT,
+    prompt_id        TEXT,            -- the spawning turn (the fallback join key)
+    out_tokens       INTEGER NOT NULL,
+    started_at       TEXT NOT NULL,   -- RFC3339 UTC
+    started_epoch    INTEGER NOT NULL
+);
+
+CREATE INDEX subagent_runs_by_agent  ON subagent_runs(agent);
+CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
 
 -- Incremental-ingest fingerprints.
 CREATE TABLE ingested_files (
@@ -89,6 +116,12 @@ SELECT e.session_id, s.project,
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
 ```
+
+The `REFERENCES` annotations above record which column joins which table; they
+are **not declared constraints**. SQLite does not enforce foreign keys unless
+`PRAGMA foreign_keys` is on, and turning it on would constrain ingest ordering
+for what is a regenerable cache — so the schema states the relationship and the
+ingest code maintains it (delete-then-insert per `source_path`, below).
 
 The store is also a **read surface for arbitrary queries** (`cli.md`: `sql`).
 Because it is plain SQLite holding already-extracted facts, the session-analysis
@@ -238,6 +271,19 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
   equals this file, then re-extract from the whole file and insert. This is why
   `events.source_path` exists. Replacing avoids duplicate rows when a still-open
   session is analyzed twice (the second pass simply supersedes the first).
+  `subagent_runs` replaces on the same key — the parent transcript's path, not
+  the subagent's — so one session's runs are rebuilt as a set, and a run whose
+  own transcript vanished does not survive as an orphan. The subagent files
+  themselves are deliberately **not** fingerprinted: a subagent's completion
+  appends its `tool_result` to the *main* transcript, so the parent's own
+  fingerprint already moves when a child finishes, and the next run re-reads the
+  whole directory. Stat-ing every file under `subagents/` on every run would buy
+  only the case of a session killed between the child finishing and that
+  `tool_result` being written — where the session's data is incomplete anyway. Filling an
+  `agent_spawn` row's cost from those runs is scoped to that same key: a call id
+  is unique **within** a session, and nothing guarantees it across sessions
+  (a resumed or copied transcript can carry one over), so an unscoped join would
+  pick an arbitrary row and sum another session's runs on top.
 - `surfaces` is rebuilt wholesale on each run from current config — the catalog
   is a snapshot of *now*, not an accumulation. (Usage is historical; catalog is
   current — `surfaces.md`.)
@@ -288,7 +334,7 @@ actually consumed. A file that grew during the read therefore shows a changed
 the fingerprint before the read would record the post-growth size against
 pre-growth events and permanently skip the tail.
 
-## Why these three tables, not one span table
+## Why a dimension + catalog + spine, not one span table
 
 An earlier design had a single skill-centric `spans` table. It could not hold
 rules, hooks, MCP, or prompts without contortion, and it conflated the catalog
@@ -296,3 +342,10 @@ rules, hooks, MCP, or prompts without contortion, and it conflated the catalog
 + `surfaces` (catalog) + `events` (usage) lets every configuration surface share
 one usage spine and one catalog shape, and makes the optimization analysis a
 join rather than a special case per surface — see `surfaces.md`.
+
+`subagent_runs` sits beside the spine rather than in it because a run is not an
+event *of the session* — it happened in another transcript, on another thread,
+and its cost was measured there. Putting it in `events` with `surface_kind =
+'agent'` would double-count every spawn in the catalog×usage join, which counts
+rows per surface. The spine keeps the main thread's spawn; the run keeps the
+cost; `events.target` joins them.

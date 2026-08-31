@@ -14,13 +14,15 @@ use crate::adapter::config::{
 };
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
-    parse_session, session_cwd, subagent_prompt_id,
+    parse_session, parse_subagent_sidecar, session_cwd, subagent_id_from_file_name,
+    subagent_prompt_id, subagent_sidecar_path, subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
+use crate::core::subagent::{SubagentRun, link_runs};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     on_demand_tokens, startup_savings,
@@ -601,6 +603,15 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         main_out: store.skill_usage()?.iter().map(|r| r.out_tokens).sum(),
         sub_tokens,
         sub_agents,
+        agents: store
+            .subagent_by_agent()?
+            .into_iter()
+            .map(|row| optimize_mod::AgentCost {
+                agent: row.agent,
+                runs: row.runs,
+                out_tokens: row.out_tokens,
+            })
+            .collect(),
         floor,
         config_tokens: if floor > 0 {
             store.always_on_config_tokens()?
@@ -914,6 +925,40 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
             fmt_tokens(f.sub_tokens),
             f.sub_agents
         );
+        warn_missing_agent_split(f.sub_tokens, f.agents.is_empty());
+        // Name the agents behind that second figure — it is usually the larger
+        // one, and "which agent" is the actionable half of it.
+        let top: Vec<String> = f
+            .agents
+            .iter()
+            .take(3)
+            .map(|a| {
+                format!(
+                    "{} {} ({} run{})",
+                    a.label(),
+                    fmt_tokens(a.out_tokens),
+                    a.runs,
+                    if a.runs == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        if !top.is_empty() {
+            println!(
+                "  Most of that subagent output: {}. Full split: {}",
+                top.join(", "),
+                style.command("cclens usage")
+            );
+        }
+        // Never truncate silently (reporting honesty, cli.md).
+        if f.agents.len() > top.len() {
+            println!(
+                "  {}",
+                style.dim(&format!(
+                    "… and {} more agent type(s) not shown",
+                    f.agents.len() - top.len()
+                ))
+            );
+        }
     }
 
     // ---- CONFIG WORTH PRUNING: installed-but-dead weight, by owner. ---------
@@ -1547,18 +1592,19 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
         let records = parse_session(&text);
         let mut spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
         let usage = extract_usage_events(&records);
-        let subagents = subagent_costs(&transcript);
-        attribute_subagents(&mut spans, &subagents);
-        let sub_tokens: i64 = subagents.iter().map(|(_, tokens)| *tokens as i64).sum();
+        let runs = subagent_runs(&transcript);
+        attribute_subagents(&mut spans, &runs);
+        let sub_tokens: i64 = runs.iter().map(|run| run.out_tokens as i64).sum();
         let root = session_cwd(&text).map(|cwd| normalize_root(&cwd));
         let meta = session_meta(
             &transcript,
             root.unwrap_or_default(),
             sub_tokens,
-            subagents.len() as i64,
+            runs.len() as i64,
             session_start(&records),
         );
         store.ingest_session(&meta, &spans, &usage)?;
+        store.ingest_subagent_runs(&meta.id, &meta.source_path, &runs)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
             .into_iter()
             .map(|(line, ts, behavior)| (line, ts, behavior.label()))
@@ -1653,6 +1699,27 @@ fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
     Ok(store)
 }
 
+/// Warn when a report knows a subagent total but not its per-agent split.
+///
+/// A store written before runs were extracted keeps its session totals, and
+/// `--frozen` skips the refresh that would fill the split in — so for that one
+/// read the per-agent rows sum to zero against a nonzero total. Reporting the
+/// gap is the store's contract; printing the total as if nothing were missing
+/// is the substitution it forbids (`docs/specs/storage.md`). It goes to stderr
+/// with the other staleness signals, so piped stdout and `--format json` stay
+/// clean.
+fn warn_missing_agent_split(sub_tokens: i64, agents_empty: bool) {
+    if sub_tokens > 0 && agents_empty {
+        eprintln!(
+            "{}",
+            Style::stderr().warn(
+                "store: per-agent subagent split unavailable (store predates it) \
+                 — run `cclens analyze` (or drop --frozen) to fill it in"
+            )
+        );
+    }
+}
+
 /// Print a freshness line to stderr — dimmed context normally, highlighted
 /// when it carries a staleness hint the user should act on.
 fn eprint_freshness(line: &str) {
@@ -1736,27 +1803,58 @@ fn normalize_root(cwd: &str) -> String {
     cwd.to_string()
 }
 
-/// The `(prompt_id, output_tokens)` of each of a session's subagent transcripts,
-/// found at `<sessionId>/subagents/agent-*.jsonl` beside the main transcript. A
-/// subagent missing a prompt id gets an empty key (it matches no span and stays
-/// in the session total only).
-fn subagent_costs(transcript: &Path) -> Vec<(String, u64)> {
-    let subagents_dir = transcript.with_extension("").join("subagents");
-    let Ok(entries) = fs::read_dir(&subagents_dir) else {
+/// Every subagent run of a session, read from `<sessionId>/subagents/` beside
+/// the main transcript: `agent-<agentId>.jsonl` holds the run's cost, and its
+/// `.meta.json` sidecar names the agent type and the call that spawned it.
+///
+/// Runs come back linked (`link_runs`), so a nested run already knows the
+/// main-thread spawn its tree started at. A run whose sidecar is missing keeps
+/// an unknown agent type and only the turn-level join key — it still counts,
+/// with the gap visible, rather than being guessed at or dropped.
+fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
+    let Ok(entries) = fs::read_dir(subagents_dir(transcript)) else {
         return Vec::new();
     };
-    let mut costs = Vec::new();
+    let mut runs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl")
-            && let Ok(text) = fs::read_to_string(&path)
-        {
-            let prompt_id = subagent_prompt_id(&text).unwrap_or_default();
-            let tokens = output_tokens(&parse_session(&text));
-            costs.push((prompt_id, tokens));
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
         }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let sidecar = fs::read_to_string(subagent_sidecar_path(&path))
+            .ok()
+            .and_then(|json| parse_subagent_sidecar(&json))
+            .unwrap_or_default();
+        let records = parse_session(&text);
+        runs.push(SubagentRun {
+            agent: sidecar.agent_type,
+            agent_id: path
+                .file_stem()
+                .map(|stem| subagent_id_from_file_name(&stem.to_string_lossy()))
+                .unwrap_or_default(),
+            run_path: path.display().to_string(),
+            tool_use_id: sidecar.tool_use_id,
+            parent_agent_id: sidecar.parent_agent_id,
+            spawn_depth: sidecar.spawn_depth.unwrap_or(1),
+            model: sidecar.model,
+            prompt_id: subagent_prompt_id(&text),
+            out_tokens: output_tokens(&records),
+            started_epoch_ms: records.first().map(|r| r.timestamp_ms).unwrap_or_default(),
+            root_tool_use_id: None,
+        });
     }
-    costs
+    // Directory order is filesystem-dependent; spawn order is not. Sorting keeps
+    // one session's ingest byte-identical across machines and re-runs.
+    runs.sort_by(|a, b| {
+        a.started_epoch_ms
+            .cmp(&b.started_epoch_ms)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+    link_runs(&mut runs);
+    runs
 }
 
 fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
@@ -1774,6 +1872,11 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
     // the per-skill table.
     let main_out: i64 = skills.iter().map(|row| row.out_tokens).sum();
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    let agents = store.subagent_by_agent()?;
+    // Ahead of the format branches: a machine consumer reading an empty `agents`
+    // beside a nonzero total needs the reason as much as a human does, and it
+    // goes to stderr precisely so it can be given to both.
+    warn_missing_agent_split(sub_tokens, agents.is_empty());
     if format == Format::Json {
         return emit_json(&serde_json::json!({
             "tokens": {
@@ -1781,22 +1884,54 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
                 "sub_tokens": sub_tokens,
                 "sub_agents": sub_agents,
             },
+            "agents": agents,
             "skills": skills,
         }));
     }
-    if skills.is_empty() {
+    // A subagent total with neither table behind it is not "nothing happened" —
+    // it is a store whose per-agent split has not been extracted yet, and saying
+    // "no usage" there would be false.
+    if skills.is_empty() && agents.is_empty() && sub_tokens == 0 {
         println!("no skill usage found — run `cclens analyze` first");
         return Ok(());
     }
     preamble(
         format,
-        "How often each skill ran and what it cost: output tokens written, context\n\
-         growth while it ran, and wall-clock seconds. Most-invoked first.",
+        "What ran and what it cost. First the subagent bill per agent type\n\
+         (costliest first), then how often each skill ran — output tokens written,\n\
+         context growth while it ran, and wall-clock seconds (most-invoked first).\n\
+         A section with nothing to show is omitted.",
     );
     println!(
         "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)\n"
     );
 
+    // The subagent figure is usually the larger one, so break it down by agent
+    // type before the per-skill table: a spawn count alone cannot tell an
+    // expensive agent from a cheap one that runs often.
+    if !agents.is_empty() {
+        let rows: Vec<Vec<String>> = agents
+            .iter()
+            .map(|row| {
+                vec![
+                    row.agent.clone().unwrap_or_else(|| "(unknown)".to_string()),
+                    row.runs.to_string(),
+                    row.out_tokens.to_string(),
+                ]
+            })
+            .collect();
+        render(
+            &["agent", "runs", "out tokens"],
+            &[Align::Left, Align::Right, Align::Right],
+            &rows,
+            format,
+        );
+        println!();
+    }
+
+    if skills.is_empty() {
+        return Ok(());
+    }
     let rows: Vec<Vec<String>> = skills
         .iter()
         .map(|row| {

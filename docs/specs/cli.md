@@ -70,9 +70,9 @@ ranking.
 
 | View | Answers |
 | --- | --- |
-| `doctor` | The entry point: a one-screen health check **written for someone who has never seen cclens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
+| `doctor` | The entry point: a one-screen health check **written for someone who has never seen cclens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units, naming the agent types behind the subagent figure), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
 | `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): startup cost, static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
-| `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
+| `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table, then splits the subagent half **per agent type** (runs and output tokens, costliest first) — the aggregate is usually the larger number and the split is the part that can be acted on. A section with no rows is omitted rather than rendered as bare headers. |
 | `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
 | `overhead` | Reconcile the empirical always-on floor (the leanest observed **session start**, not the context a skill happened to run at — `surfaces.md`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh. The per-project table carries the session count behind each floor, because the floor is a minimum over observations and a project with few sessions may never have caught a fresh one. Reports the metric as unavailable when no session start was observed at all. |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
@@ -140,6 +140,14 @@ caveats in `events.md` / `surfaces.md`):
   deletion never delivers.
 - "Unused" always carries the window it was evaluated over, so it is not mistaken
   for "never installed".
+- A subagent run whose agent type was never recorded is shown as `(unknown)`,
+  never merged into a named type and never dropped — the per-agent rows must
+  keep summing to the subagent total the same report prints above them.
+- When they *cannot* sum to it — a store predating the per-agent split, read
+  with `--frozen` so the refresh that would fill it never ran — the report says
+  so on stderr instead of letting an absent breakdown pass for a zero one
+  (`storage.md`'s report-the-gap contract). It rides with the freshness line
+  rather than in the table, so piped stdout and `--format json` stay clean.
 
 Meta-skills are not nested (`events.md`): a driver and the skills it ran are
 each their own span, so a child's cost lands on the child and no figure is

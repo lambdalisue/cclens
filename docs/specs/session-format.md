@@ -19,6 +19,7 @@ two specs most likely to change when Claude Code ships a new release.
     <sessionId>.jsonl                          ← main session transcript
     <sessionId>/subagents/
       agent-<agentId>.jsonl                    ← one transcript per spawned subagent
+      agent-<agentId>.meta.json                ← that subagent's sidecar (below)
 ```
 
 - `<cwd-slug>` encodes the working directory (path separators → `-`). Worktree
@@ -150,15 +151,44 @@ duplicates of one event** — empirically a `slash` is not shadowed by a matchin
 ## Subagent linkage
 
 Subagent cost is attributed back to the event that spawned the work, but a
-subagent's tokens live in a separate file. The structural join is **`promptId`**:
+subagent's tokens live in a separate file, and its own transcript never names
+the **agent type** that ran. Both facts come from the sidecar; `promptId` is the
+fallback when there is none.
+
+Each `agent-<agentId>.jsonl` has a sibling `agent-<agentId>.meta.json`:
+
+| Field | Use |
+| --- | --- |
+| `agentType` | The agent that ran (`Explore`, a custom agent's name) — the only place it appears. Without it a run's cost cannot be attributed to a type at all. |
+| `toolUseId` | The `id` of the `Agent` `tool_use` block that spawned this run — an **exact** join to one spawn. |
+| `parentAgentId` | For a subagent spawned by a subagent, the parent's `agentId`. Absent at depth 1. |
+| `spawnDepth` | 1 for a main-thread spawn, 2+ for a nested one. |
+| `model` | The model the run used. |
+
+The transcript side of the same join:
 
 - A subagent transcript's records carry `agentId`, `sessionId`, and `promptId`;
   the file is `agent-<agentId>.jsonl`.
 - The same `promptId` appears on the parent session's records for the spawning
-  turn.
-- There is **no** direct `Agent` `tool_use.id` → `agentId` link, so `promptId`
-  is the only reliable join. Several subagents can share one `promptId` (parallel
-  spawn), making per-event attribution approximate — see `events.md`.
+  turn. It is inherited by the **whole** subagent tree, so a nested run's
+  `promptId` is still the top-level turn's — it identifies the turn, never the
+  spawn.
+- Several subagents share one `promptId` (parallel spawn, and every nested run),
+  so `promptId` alone makes per-event attribution approximate. `toolUseId` does
+  not: it names one call. The adapter therefore keeps the `Agent` block's `id`
+  on the spawn record and prefers that join, falling back to `promptId` only
+  when a sidecar is missing — see `events.md`.
+
+**Nested runs exist only here.** An agent spawned by an agent has no `Agent`
+`tool_use` anywhere in the main transcript, so the main thread's spawn count is
+not the number of subagent runs; the `subagents/` directory is. Observed on a
+real tree: roughly half of all runs were nested, and one agent type ran seven
+times more often than the main transcript alone suggested.
+
+> The sidecar was observed on transcript versions `2.1.220`–`2.1.246`, present
+> for every subagent transcript in the tree. Earlier releases may not write it,
+> so every field is read as optional and an absent sidecar degrades to the
+> `promptId` join with an unknown agent type — never to a guessed one.
 
 ## Subagents do not invoke skills
 

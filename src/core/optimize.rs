@@ -17,6 +17,9 @@ pub struct Findings {
     pub main_out: i64,
     pub sub_tokens: i64,
     pub sub_agents: i64,
+    /// The subagent total broken out per agent type, costliest first — which
+    /// agent configurations that total actually paid for.
+    pub agents: Vec<AgentCost>,
     /// Empirical always-on floor; 0 means unknown (section omitted).
     pub floor: i64,
     /// Global always-on config tokens (project config is per-project).
@@ -76,6 +79,23 @@ pub struct FrictionCat {
     pub projects: usize,
     pub by_tool: Vec<(String, i64)>,
     pub examples: Vec<String>,
+}
+
+/// One agent type's share of the subagent bill: how often it ran and what its
+/// runs wrote. `agent` is the type's name, or `None` for runs whose type the
+/// transcript did not record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentCost {
+    pub agent: Option<String>,
+    pub runs: i64,
+    pub out_tokens: i64,
+}
+
+impl AgentCost {
+    /// The name to print — never a blank cell for an unrecorded type.
+    pub fn label(&self) -> &str {
+        self.agent.as_deref().unwrap_or("(unknown)")
+    }
 }
 
 /// A configuration surface referenced in the config sections. The two costs are
@@ -150,6 +170,15 @@ the failing path/file — including any worktree segment like `/.wt/`, so a work
 split is a `WHERE excerpt LIKE …` away), `tool` = the tool that produced it, `target` = the \
 file_path it edited or command it ran (use this when the error text omits the path, e.g. \
 edit-precondition's \"File has not been read yet\"). `project` = the session's cwd slug.
+    - subagent_runs(session_id, agent, spawn_depth, model, out_tokens, run_path, …): one row per \
+subagent execution. `agent` = the agent type that ran (NULL when the transcript did not record \
+it), `out_tokens` = what that run wrote, `spawn_depth` = 1 for a main-thread spawn and 2+ for an \
+agent spawned by an agent. Group by `agent` to see which agent configurations the subagent bill \
+paid for. To reach the main-thread spawn a run came from, join \
+`events.target = subagent_runs.root_tool_use_id` — that works at every depth, because a nested \
+run's own `tool_use_id` names a call inside its parent subagent's transcript, which has no \
+`events` row at all (only main transcripts produce events). Joining on `tool_use_id` therefore \
+silently drops every nested run.
     - sessions(id, project, slug, source_path, started_at, …) and events(session_id, kind, \
 surface_id, source, model, started_epoch, …) hold everything else (run `cclens sql \
 \"SELECT sql FROM sqlite_master\"` to see all of it). Confirm an encoding by sampling the \
@@ -191,6 +220,16 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
             "- Subagents: {} ({} agents)\n",
             f.sub_tokens, f.sub_agents
         ));
+        // Which agent types that total paid for — the split two agents with
+        // similar spawn counts and very different output can only show here.
+        for agent in &f.agents {
+            out.push_str(&format!(
+                "  - {}: {} over {} run(s)\n",
+                agent.label(),
+                agent.out_tokens,
+                agent.runs
+            ));
+        }
 
         if f.floor > 0 {
             let residual = (f.floor - f.config_tokens).max(0);
@@ -437,6 +476,18 @@ mod tests {
             main_out: 8_000_000,
             sub_tokens: 1_800_000,
             sub_agents: 300,
+            agents: vec![
+                AgentCost {
+                    agent: Some("general-purpose".to_string()),
+                    runs: 220,
+                    out_tokens: 1_500_000,
+                },
+                AgentCost {
+                    agent: None,
+                    runs: 80,
+                    out_tokens: 300_000,
+                },
+            ],
             floor: 35_000,
             config_tokens: 2_000,
             friction_global: vec![FrictionCat {
@@ -644,6 +695,16 @@ mod tests {
         assert!(brief.contains("cd is 53% of Bash calls"));
         assert!(brief.contains("cargo: 80"));
         assert!(brief.contains("SKILL.md edited 25x within 7m40s"));
+    }
+
+    #[test]
+    fn briefing_splits_the_subagent_total_by_agent_type() {
+        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        assert!(brief.contains("- Subagents: 1800000 (300 agents)"));
+        assert!(brief.contains("  - general-purpose: 1500000 over 220 run(s)"));
+        // A run whose agent type was never recorded is shown as unknown, not
+        // dropped — the per-agent rows must still sum to the total.
+        assert!(brief.contains("  - (unknown): 300000 over 80 run(s)"));
     }
 
     #[test]

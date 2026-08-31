@@ -23,7 +23,7 @@ use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
-    startup_savings,
+    on_demand_tokens, startup_savings,
 };
 use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
@@ -633,11 +633,17 @@ struct ScopedWedges {
 }
 
 fn config_wedges(store: &Store) -> Result<ScopedWedges> {
-    let surface_ref = |e: &crate::store::CatalogEntry| optimize_mod::SurfaceRef {
-        kind: e.kind.clone(),
-        id: e.id.clone(),
-        static_tokens: e.static_tokens,
-    };
+    // Carry the cost split, not one figure: a skill's file weight is its
+    // invocation cost, and rendering it as the trim saving promised startup
+    // context that deleting it never frees (`docs/specs/surfaces.md`).
+    let surface_ref =
+        |e: &crate::store::CatalogEntry, load_mode: LoadMode| optimize_mod::SurfaceRef {
+            kind: e.kind.clone(),
+            id: e.id.clone(),
+            startup_tokens: e.startup_tokens,
+            on_demand_tokens: on_demand_tokens(load_mode, e.static_tokens.map(|t| t as u64))
+                .map(|t| t as i64),
+        };
     let mut scoped = ScopedWedges {
         global: WedgeRefs::default(),
         projects: std::collections::HashMap::new(),
@@ -651,10 +657,10 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|t| t as u64);
         if is_usage_measurable(&entry.kind) && entry.uses == 0 {
-            refs.unused.push(surface_ref(&entry));
+            refs.unused.push(surface_ref(&entry, load_mode));
         }
         if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
-            refs.always_on_heavy.push(surface_ref(&entry));
+            refs.always_on_heavy.push(surface_ref(&entry, load_mode));
         }
     }
     Ok(scoped)
@@ -997,7 +1003,10 @@ fn prune_phrase(
         ));
     }
     if !always_on_heavy.is_empty() {
-        let tokens: i64 = always_on_heavy.iter().filter_map(|s| s.static_tokens).sum();
+        let tokens: i64 = always_on_heavy
+            .iter()
+            .filter_map(|s| s.startup_tokens)
+            .sum();
         parts.push(format!(
             "{} loaded every session (~{} tokens each time)",
             plural(always_on_heavy.len(), "heavy file"),
@@ -1428,8 +1437,12 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
         "Observed always-on floor (leanest session-start context): {}",
         style.bold(&format!("{floor} tokens"))
     );
-    println!("  readable config (CLAUDE.md + always-on rules):          {config} tokens");
-    println!("  residual (system prompt + built-in tools + MCP schemas): {residual} tokens");
+    println!(
+        "  readable config (CLAUDE.md, always-on rules, skill/agent descriptions): {config} tokens"
+    );
+    println!(
+        "  residual (system prompt + built-in tools + MCP schemas):                {residual} tokens"
+    );
     println!(
         "{}",
         style.dim(
@@ -1920,6 +1933,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
                     "scope": entry.scope,
                     "project": if entry.project.is_empty() { None } else { Some(&entry.project) },
                     "static_tokens": entry.static_tokens,
+                    "startup_tokens": entry.startup_tokens,
                     "uses": if measurable { Some(entry.uses) } else { None },
                     "load_mode": entry.load_mode,
                     "status": if measurable && entry.uses == 0 { "unused" }
@@ -1932,7 +1946,8 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
                 if !catalogued.contains(&(kind.as_str(), id.as_str())) {
                     items.push(serde_json::json!({
                         "kind": kind, "id": id, "scope": null, "project": null,
-                        "static_tokens": null, "uses": count, "load_mode": null,
+                        "static_tokens": null, "startup_tokens": null,
+                        "uses": count, "load_mode": null,
                         "status": "orphaned",
                     }));
                 }
@@ -1948,9 +1963,11 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
     preamble(
         format,
         "Everything installed in your config — skills, rules, agents, MCP servers,\n\
-         CLAUDE.md — with its static token weight, where it is installed (scope), and\n\
-         whether it was ever used. UNUSED marks delete candidates; rules and CLAUDE.md\n\
-         are catalog-only because using them leaves no trace in transcripts.",
+         CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
+         \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
+         is the whole definition, which for a skill or agent is paid only on invocation.\n\
+         UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
+         using them leaves no trace in transcripts.",
     );
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
@@ -1965,14 +1982,13 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
         } else {
             ("-".to_string(), "(catalog-only)")
         };
-        let static_tokens = entry
-            .static_tokens
-            .map_or_else(|| "?".to_string(), |tokens| tokens.to_string());
+        let tokens = |value: Option<i64>| value.map_or_else(|| "?".to_string(), |t| t.to_string());
         rows.push(vec![
             entry.kind.clone(),
             entry.id.clone(),
             scope_cell(&entry.scope, &entry.project),
-            static_tokens,
+            tokens(entry.startup_tokens),
+            tokens(entry.static_tokens),
             uses_cell,
             entry.load_mode.clone(),
             status.to_string(),
@@ -1994,6 +2010,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
                 id.clone(),
                 "-".to_string(),
                 "-".to_string(),
+                "-".to_string(),
                 count.to_string(),
                 "-".to_string(),
                 "ORPHANED".to_string(),
@@ -2006,6 +2023,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
             "kind",
             "id",
             "scope",
+            "start tok",
             "static tok",
             "uses",
             "load mode",
@@ -2015,6 +2033,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
             Align::Left,
             Align::Left,
             Align::Left,
+            Align::Right,
             Align::Right,
             Align::Right,
             Align::Left,
@@ -2064,6 +2083,10 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
         project: &'a str,
         uses: i64,
         savings: StartupSavings,
+        /// What every session pays for having it installed.
+        startup_tokens: Option<u64>,
+        /// What its body costs when loaded — an invocation cost, never a saving.
+        on_demand_tokens: Option<u64>,
     }
 
     let mut found: Vec<Row> = Vec::new();
@@ -2071,6 +2094,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
         let measurable = is_usage_measurable(&entry.kind);
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|tokens| tokens as u64);
+        let startup_tokens = entry.startup_tokens.map(|tokens| tokens as u64);
         if let Some(wedge) = classify_wedge(
             measurable,
             load_mode,
@@ -2085,7 +2109,9 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                 scope: &entry.scope,
                 project: &entry.project,
                 uses: entry.uses,
-                savings: startup_savings(load_mode, static_tokens),
+                savings: startup_savings(load_mode, startup_tokens),
+                startup_tokens,
+                on_demand_tokens: on_demand_tokens(load_mode, static_tokens),
             });
         }
     }
@@ -2111,8 +2137,10 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                     "project": if row.project.is_empty() { None } else { Some(row.project) },
                     "savings": savings,
                     "savings_tokens": savings_tokens,
+                    "startup_tokens": row.startup_tokens,
+                    "on_demand_tokens": row.on_demand_tokens,
                     "uses": if is_usage_measurable(row.kind) { Some(row.uses) } else { None },
-                    "suggestion": savings_suggestion(row.wedge, row.savings),
+                    "suggestion": savings_suggestion(row.wedge, row.savings, row.on_demand_tokens),
                 })
             })
             .collect();
@@ -2126,8 +2154,8 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
     preamble(
         format,
         "Concrete cleanup opportunities in your config, ranked by what removing each\n\
-         one actually saves at session start. \"~0\" means deleting only declutters —\n\
-         the body loads on demand, so it costs nothing until used.",
+         one actually saves at session start. A \"~\" figure is declutter-only — just\n\
+         the description is loaded at startup; the body costs nothing until invoked.",
     );
     let rows: Vec<Vec<String>> = found
         .iter()
@@ -2141,9 +2169,9 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                 row.wedge.label().to_string(),
                 format!("{}/{}", row.kind, row.id),
                 scope_cell(row.scope, row.project),
-                savings_cell(row.savings),
+                savings_cell(row.savings, row.startup_tokens),
                 uses_cell,
-                savings_suggestion(row.wedge, row.savings),
+                savings_suggestion(row.wedge, row.savings, row.on_demand_tokens),
             ]
         })
         .collect();
@@ -2180,24 +2208,31 @@ fn savings_rank(savings: StartupSavings) -> (u8, std::cmp::Reverse<u64>) {
     }
 }
 
-fn savings_cell(savings: StartupSavings) -> String {
+fn savings_cell(savings: StartupSavings, startup_tokens: Option<u64>) -> String {
     match savings {
         StartupSavings::Tokens(n) => format!("{n}/sess"),
         StartupSavings::UnknownSchema => "schema?".to_string(),
-        StartupSavings::Declutter => "~0".to_string(),
+        // Negligible, but measured: a description-loaded surface still costs its
+        // description every session, and that is all removing it reclaims.
+        StartupSavings::Declutter => format!("~{}/sess", startup_tokens.unwrap_or(0)),
     }
 }
 
-/// A suggestion honest about whether removal saves context or only declutters.
-fn savings_suggestion(wedge: Wedge, savings: StartupSavings) -> String {
+/// A suggestion honest about whether removal saves context or only declutters —
+/// naming the body cost as an invocation cost so it is not read as a saving.
+fn savings_suggestion(wedge: Wedge, savings: StartupSavings, on_demand: Option<u64>) -> String {
+    let body = match on_demand {
+        Some(n) => format!("body is {n} tok when invoked"),
+        None => "body is on-demand".to_string(),
+    };
     match savings {
         StartupSavings::Tokens(n) => format!("removing saves ~{n} tokens every session"),
         StartupSavings::UnknownSchema => {
             "disable: drops its tool schema from every session (real, unmeasured)".to_string()
         }
         StartupSavings::Declutter => match wedge {
-            Wedge::Unused => "declutter only: body is on-demand, ~no startup saving".to_string(),
-            _ => "heavy only when invoked; rarely used".to_string(),
+            Wedge::Unused => format!("declutter only: {body}, ~no startup saving"),
+            _ => format!("heavy only when invoked ({body}); rarely used"),
         },
     }
 }
@@ -2610,5 +2645,26 @@ mod tests {
             normalize_root("/tmp/example/repo/.wt"),
             "/tmp/example/repo/.wt"
         );
+    }
+
+    #[test]
+    fn a_declutter_row_shows_the_description_it_would_reclaim() {
+        // The measured startup cost, not the body — deleting an unused skill
+        // frees its description, and that is what the column promises.
+        assert_eq!(
+            savings_cell(StartupSavings::Declutter, Some(7)),
+            "~7/sess".to_string()
+        );
+        assert_eq!(
+            savings_cell(StartupSavings::Tokens(922), Some(922)),
+            "922/sess".to_string()
+        );
+    }
+
+    #[test]
+    fn an_unused_body_is_suggested_as_an_invocation_cost_not_a_saving() {
+        let suggestion = savings_suggestion(Wedge::Unused, StartupSavings::Declutter, Some(1015));
+        assert!(suggestion.contains("1015 tok when invoked"));
+        assert!(suggestion.contains("declutter only"));
     }
 }

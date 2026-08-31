@@ -50,7 +50,9 @@ sample the data before relying on an encoding:
   path), `target` the file/command when the text omits it, `project` the
   session's cwd slug.
 - `sessions` and `events` hold everything else (skill spans, tokens, models,
-  timestamps); `surfaces` is the config catalog with static token costs.
+  timestamps); `surfaces` is the config catalog, where `startup_tokens` is what a
+  surface costs every session and `static_tokens` its whole definition (a skill's
+  body, paid only when invoked).
 
 ## 3. Present
 

@@ -71,7 +71,7 @@ ranking.
 | View | Answers |
 | --- | --- |
 | `doctor` | The entry point: a one-screen health check **written for someone who has never seen cclens's vocabulary** — every item says what happened, why it costs, and what to do. Sections: `WHAT TO FIX FIRST` (recurring problems as a prioritized to-do list, each routed to the owning config layer with the follow-up command), `COST` (the session-start context and output totals in plain words, humanized units), `CONFIG WORTH PRUNING` (dead or heavy config per owner), `LOOKS HEALTHY` (what explicitly needs no action). `--scope` narrows to one layer; the text form leads with actions, never a stats dump. |
-| `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
+| `inventory` | The catalog×usage join per surface **row** (scope and owning project shown; usage attributed under per-project shadowing — `surfaces.md`): startup cost, static cost, load mode, usage. `--scope` filters to one layer; orphaned usage (no scope to filter on) appears in the unfiltered view only. |
 | `usage` | Skill event rollups: per skill, or per time bucket (`--by`) — frequency, tokens, `ctx_growth`, duration. Leads with a token-destination line (main-thread skill output vs subagent total) so the reader sees where tokens actually go before the table. |
 | `waste` | Just the flagged opportunities (unused, costly+rare, always-on heavy, …) with their evidence and owning scope; `--scope` filters to one layer. |
 | `overhead` | Reconcile the empirical always-on floor (the leanest observed **session start**, not the context a skill happened to run at — `surfaces.md`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh. The per-project table carries the session count behind each floor, because the floor is a minimum over observations and a project with few sessions may never have caught a fresh one. Reports the metric as unavailable when no session start was observed at all. |
@@ -134,6 +134,10 @@ caveats in `events.md` / `surfaces.md`):
   lower bound.
 - Surfaces with unknown `static_tokens` (e.g. `mcp_tool` without an available
   schema) are marked unknown, never reported as zero cost.
+- A surface's startup cost and its on-demand body cost are shown as two figures,
+  never one (`surfaces.md`): a skill's body is what invoking it costs, so
+  printing it alone under a "what to trim" heading reads as a startup saving the
+  deletion never delivers.
 - "Unused" always carries the window it was evaluated over, so it is not mistaken
   for "never installed".
 
@@ -199,7 +203,7 @@ plan, gate only on applying it" shape is the design; if it changes, update
 
 Crucially the briefing is the **complete** analysis, not a headline — every
 project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
-unused / always-on-heavy surface lists with token costs — **routed the same way
+unused / always-on-heavy surface lists with startup-vs-body token costs — **routed the same way
 the views are** (see "Scope"): global sections first, then one section per
 project, so the session fixes each finding in the layer that owns it. `--scope`
 restricts the briefing to one layer and prepends an explicit scope statement

@@ -159,7 +159,8 @@ derived store.
 ## What it covers
 
 - **Every configuration surface** — skills, rules, agents, MCP servers,
-  `CLAUDE.md` — catalogued with its static token cost and load mode, joined
+  `CLAUDE.md` — catalogued with its startup and on-demand token costs and load
+  mode, joined
   against actual usage to flag unused (delete), always-on heavy (slim), and
   costly+rare (trim).
 - **Where the work stumbles** — recurring tool failures by category and

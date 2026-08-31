@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::core::friction::{ErrorCategory, classify_error};
+use crate::core::path::basename;
 use crate::core::prompt::{PromptBehavior, classify_prompt};
 use crate::core::span::{Record, RecordKind, Source};
 
@@ -415,7 +416,7 @@ pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
                         events.push(WorkEvent {
                             epoch_ms: ts,
                             kind: "file_edit",
-                            id: path.rsplit('/').next().unwrap_or(path).to_string(),
+                            id: basename(path).to_string(),
                             path: Some(path.to_string()),
                         });
                     }
@@ -603,6 +604,23 @@ mod tests {
         // The full path rides along so thrash detection can tell two same-named
         // files apart.
         assert_eq!(events[1].path.as_deref(), Some("/a/b/cli.rs"));
+    }
+
+    #[test]
+    fn work_events_take_the_edit_basename_from_a_backslash_path() {
+        // A transcript written on Windows spells the target natively, and the
+        // same file also arrives with forward slashes. Both must land on one id
+        // or the hotspot list ranks spellings instead of files.
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\example\\repo\\cli.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"repo/cli.rs"}}]}}"#,
+        );
+        let events = extract_work_events(jsonl);
+        assert_eq!(events[0].id, "cli.rs");
+        assert_eq!(events[1].id, "cli.rs");
+        // The full path still distinguishes them for thrash detection.
+        assert_eq!(events[0].path.as_deref(), Some(r"C:\example\repo\cli.rs"));
     }
 
     #[test]

@@ -54,6 +54,11 @@ Two kinds carry caveats that downstream reports must honour:
 - **`file_edit`** stores the basename *and* the full path because the two answer
   different questions. A hotspot ranking wants the basename — it is the name a
   human recognises, and collapsing every `route.ts` into one row is the point.
+  The name is taken on **either separator** (`core::path::basename`): a
+  transcript spells paths the way the machine that wrote it does, and the same
+  file arrives both ways within one session. Cutting on `/` alone left a
+  backslash path standing in for the name and let one file compete against
+  itself for a hotspot slot, so the list ranked spellings rather than files.
   Thrash detection wants the opposite: an episode claims *one agent kept retrying
   this one file*, so it must distinguish two same-named files, and two sessions
   editing one file in parallel. Keeping only the basename made those

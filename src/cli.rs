@@ -1686,11 +1686,31 @@ fn file_fingerprint(path: &Path) -> Option<(i64, i64)> {
 
 /// Fold a worktree checkout's path onto its parent repository, mirroring
 /// `normalize_project`'s slug rule at path level: `/repo/.wt/feat-x` → `/repo`.
+///
+/// Either separator delimits the segment, so a cwd recorded on Windows
+/// (`C:\repo\.wt\feat-x`) folds like a unix one. The slug rule keys on `--wt-`
+/// and is separator-free, so without this the two halves of the same
+/// normalization disagreed and a project folded by slug stayed split by root.
 fn normalize_root(cwd: &str) -> String {
-    match cwd.split_once("/.wt/") {
-        Some((parent, _)) => parent.to_string(),
-        None => cwd.to_string(),
+    const SEGMENT: &str = ".wt";
+    for (idx, _) in cwd.match_indices(SEGMENT) {
+        let has_parent = cwd[..idx].ends_with(['/', '\\']);
+        let has_child = cwd[idx + SEGMENT.len()..].starts_with(['/', '\\']);
+        if has_parent && has_child {
+            // `idx` is at least 1 here, and the separator before it is one byte.
+            let parent = &cwd[..idx - 1];
+            // Directly under a filesystem root there is no parent to fold onto:
+            // the separator *is* the root, so dropping it would turn `/.wt/x`
+            // into `""` and `C:\.wt\x` into a drive-relative `C:`. A drive
+            // prefix is exactly two bytes, which keeps an ordinary directory
+            // whose name ends in a colon out of this branch.
+            if parent.is_empty() || (parent.len() == 2 && parent.ends_with(':')) {
+                return cwd[..idx].to_string();
+            }
+            return parent.to_string();
+        }
     }
+    cwd.to_string()
 }
 
 /// The `(prompt_id, output_tokens)` of each of a session's subagent transcripts,
@@ -2545,4 +2565,40 @@ mod tests {
         assert_eq!(normalize_root("/tmp/example/repo"), "/tmp/example/repo");
     }
 
+    #[test]
+    fn normalize_root_folds_a_backslash_worktree_path() {
+        // A cwd recorded on Windows spells the same layout natively; leaving it
+        // unfolded splits a project whose slug already folded.
+        assert_eq!(
+            normalize_root(r"C:\example\repo\.wt\feat-x"),
+            r"C:\example\repo"
+        );
+        assert_eq!(normalize_root(r"C:\example\repo"), r"C:\example\repo");
+    }
+
+    #[test]
+    fn normalize_root_keeps_the_filesystem_root_separator() {
+        // Folding onto the root leaves the separator standing: it *is* the
+        // parent. Dropping it would hand back a relative path — `""` on unix,
+        // the drive-relative `C:` on Windows — and the root then names a
+        // different directory than the one the session ran in.
+        assert_eq!(normalize_root("/.wt/feat-x"), "/");
+        assert_eq!(normalize_root(r"C:\.wt\feat-x"), r"C:\");
+        // A directory whose name merely ends in a colon is not a drive.
+        assert_eq!(normalize_root("/tmp/odd:/.wt/feat-x"), "/tmp/odd:");
+    }
+
+    #[test]
+    fn normalize_root_leaves_a_dot_wt_that_is_not_a_segment_alone() {
+        // Only a whole `.wt` directory is a worktree parent.
+        assert_eq!(
+            normalize_root("/tmp/example/repo/x.wt/feat-x"),
+            "/tmp/example/repo/x.wt/feat-x"
+        );
+        // A trailing `.wt` names no checkout to fold onto.
+        assert_eq!(
+            normalize_root("/tmp/example/repo/.wt"),
+            "/tmp/example/repo/.wt"
+        );
+    }
 }

@@ -16,8 +16,9 @@ pub fn approx_tokens(text: &str) -> u64 {
 }
 
 /// Build a `skill` surface from one `SKILL.md`. Skills load only their
-/// description at startup, so the load mode is `StartupDescription`; the static
-/// cost is the whole file (what is paid on-demand when invoked).
+/// description at startup, so the load mode is `StartupDescription`: the static
+/// cost is the whole file (what is paid on-demand when invoked) and the startup
+/// cost is the frontmatter `description` alone.
 pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
     Surface {
         kind: "skill".to_string(),
@@ -25,8 +26,17 @@ pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: &Scope) 
         scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
+        startup_tokens: Some(description_tokens(content)),
         load_mode: LoadMode::StartupDescription,
     }
+}
+
+/// The startup weight of a description-loaded surface: its frontmatter
+/// `description`, or zero when it declares none. Only the description text is
+/// counted — the listing scaffolding Claude Code wraps it in is not ours to
+/// weigh (`docs/specs/config-format.md`).
+fn description_tokens(content: &str) -> u64 {
+    frontmatter_description(content).map_or(0, |d| approx_tokens(&d))
 }
 
 /// Read every `<name>/SKILL.md` under a skills directory into surfaces. A
@@ -55,17 +65,20 @@ pub fn read_skill_surfaces(skills_dir: &Path, scope: &Scope) -> Vec<Surface> {
 /// only when a matching file is in play (`PathConditional`); one without is
 /// always loaded (`StartupFull`). See `docs/specs/config-format.md`.
 pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
-    let load_mode = if has_paths_frontmatter(content) {
-        LoadMode::PathConditional
+    let tokens = approx_tokens(content);
+    let (load_mode, startup_tokens) = if has_paths_frontmatter(content) {
+        // Nothing until a matching file is in play; then the whole body.
+        (LoadMode::PathConditional, 0)
     } else {
-        LoadMode::StartupFull
+        (LoadMode::StartupFull, tokens)
     };
     Surface {
         kind: "rule".to_string(),
         id: id.to_string(),
         scope: scope.clone(),
         config_path: config_path.to_string(),
-        static_tokens: Some(approx_tokens(content)),
+        static_tokens: Some(tokens),
+        startup_tokens: Some(startup_tokens),
         load_mode,
     }
 }
@@ -78,33 +91,121 @@ pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: &Scope) 
         scope: scope.clone(),
         config_path: config_path.to_string(),
         static_tokens: Some(approx_tokens(content)),
+        startup_tokens: Some(description_tokens(content)),
         load_mode: LoadMode::StartupDescription,
     }
 }
 
-/// Build a `claude_md` surface — always-on context paid every session.
+/// Build a `claude_md` surface — always-on context paid every session, so its
+/// whole text is startup cost.
 pub fn claude_md_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -> Surface {
+    let tokens = approx_tokens(content);
     Surface {
         kind: "claude_md".to_string(),
         id: id.to_string(),
         scope: scope.clone(),
         config_path: config_path.to_string(),
-        static_tokens: Some(approx_tokens(content)),
+        static_tokens: Some(tokens),
+        startup_tokens: Some(tokens),
         load_mode: LoadMode::StartupFull,
     }
 }
 
+/// The YAML frontmatter block of a markdown file, without its `---` fences.
+/// The block ends at the first line that is *only* dashes: a substring search
+/// would also stop at a line merely starting with them, dropping every key
+/// below it — and a lost `paths:` changes a rule's load mode, not just its
+/// weight.
+fn frontmatter(content: &str) -> Option<&str> {
+    let opened = content.trim_start().strip_prefix("---")?;
+    let body = &opened[opened.find('\n')? + 1..];
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim() == "---" {
+            return Some(&body[..end]);
+        }
+        end += line.len();
+    }
+    None
+}
+
 /// Whether a markdown file's YAML frontmatter declares a `paths:` key.
 fn has_paths_frontmatter(content: &str) -> bool {
-    let Some(rest) = content.trim_start().strip_prefix("---") else {
-        return false;
+    frontmatter(content).is_some_and(|block| {
+        block
+            .lines()
+            .any(|line| line.trim_start().starts_with("paths:"))
+    })
+}
+
+/// The frontmatter `description` — the text a skill or agent contributes to
+/// every session's startup listing. Parsed defensively: a plain or quoted
+/// scalar, or a block scalar, in every case folded together with the indented
+/// continuation lines that follow it — YAML wraps a value onto those lines with
+/// or without a `>` / `|` indicator, and reading only the first line would
+/// understate the startup cost. A file with no frontmatter, or none declaring
+/// the key, yields `None`.
+fn frontmatter_description(content: &str) -> Option<String> {
+    let mut lines = frontmatter(content)?.lines();
+    let first = loop {
+        // Only a top-level key is the surface's own description; an indented
+        // `description:` belongs to some nested mapping.
+        match lines.next()?.strip_prefix("description:") {
+            Some(value) => break value.trim(),
+            None => continue,
+        }
     };
-    let Some(end) = rest.find("\n---") else {
-        return false;
-    };
-    rest[..end]
-        .lines()
-        .any(|line| line.trim_start().starts_with("paths:"))
+    // A block indicator is syntax, not text; anything else on the line is the
+    // value's first fragment. Inside a block scalar (or quotes) a `#` is literal
+    // text, so comments are only stripped from a plain scalar.
+    let block = first.starts_with('>') || first.starts_with('|');
+    let mut folded: Vec<&str> = Vec::new();
+    if !(first.is_empty() || block) {
+        folded.push(strip_comment(first, block));
+    }
+    folded.extend(
+        lines
+            .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
+            .map(|line| strip_comment(line.trim(), block))
+            .filter(|line| !line.is_empty()),
+    );
+    if folded.is_empty() {
+        return None;
+    }
+    // Unquote the folded value, not a fragment of it: a quoted scalar's closing
+    // quote may sit on the last continuation line.
+    let value = folded.join(" ");
+    Some(unquote(&value).to_string())
+}
+
+/// Drop a plain scalar's trailing YAML comment — a `#` that opens the value or
+/// follows whitespace is comment syntax, and no session ever loads it. Inside a
+/// block scalar (`block`) or quotes, a `#` is literal text and stays.
+fn strip_comment(value: &str, block: bool) -> &str {
+    if block || value.starts_with(['"', '\'']) {
+        return value;
+    }
+    if value.starts_with('#') {
+        return "";
+    }
+    // Any whitespace opens a comment, not only a space.
+    value
+        .char_indices()
+        .find(|&(at, ch)| ch == '#' && value[..at].ends_with(char::is_whitespace))
+        .map_or(value, |(at, _)| value[..at].trim_end())
+}
+
+/// Strip one layer of matching surrounding quotes, if present.
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
 }
 
 /// Read every `<name>.md` agent file in a directory into surfaces.
@@ -218,6 +319,9 @@ pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: &Scope) -> Vec<Surface> 
             scope: scope.clone(),
             config_path: mcp_json.display().to_string(),
             static_tokens: None,
+            // Its schema is loaded every session, but the weight is unknowable
+            // from local config — unknown, never a false zero.
+            startup_tokens: None,
             load_mode: LoadMode::ToolSchema,
         })
         .collect()
@@ -283,6 +387,153 @@ mod tests {
         assert_eq!(surface.scope, Scope::Global);
         assert_eq!(surface.static_tokens, Some(2));
         assert_eq!(surface.load_mode, LoadMode::StartupDescription);
+    }
+
+    #[test]
+    fn a_skill_pays_only_its_description_at_startup() {
+        // The body is loaded on invocation, so the startup cost is the
+        // description alone — 25 chars, ~7 tokens — not the 1000-char file.
+        let content = format!(
+            "---\nname: repro\ndescription: short startup description\n---\n{}",
+            "x".repeat(1000)
+        );
+        let surface = skill_surface(
+            "repro",
+            "/tmp/skills/repro/SKILL.md",
+            &content,
+            &Scope::Global,
+        );
+
+        assert_eq!(surface.startup_tokens, Some(7));
+        assert_eq!(surface.static_tokens, Some(approx_tokens(&content)));
+    }
+
+    #[test]
+    fn a_description_less_skill_costs_nothing_at_startup() {
+        let surface = skill_surface(
+            "bare",
+            "/tmp/skills/bare/SKILL.md",
+            "# body",
+            &Scope::Global,
+        );
+        assert_eq!(surface.startup_tokens, Some(0));
+    }
+
+    #[test]
+    fn a_quoted_or_folded_description_is_read_like_any_other() {
+        let quoted = "---\ndescription: \"abcdefgh\"\n---\nbody";
+        assert_eq!(frontmatter_description(quoted).as_deref(), Some("abcdefgh"));
+        // A folded block scalar spreads the description over the indented lines
+        // that follow; all of it is startup-loaded text.
+        let folded = "---\ndescription: >-\n  abcd\n  efgh\n---\nbody";
+        assert_eq!(
+            frontmatter_description(folded).as_deref(),
+            Some("abcd efgh")
+        );
+        // No frontmatter at all, and a frontmatter without the key.
+        assert_eq!(frontmatter_description("# body"), None);
+        assert_eq!(frontmatter_description("---\nname: x\n---\nbody"), None);
+    }
+
+    #[test]
+    fn a_wrapped_description_keeps_its_continuation_lines() {
+        // A plain scalar needs no `>` to wrap: YAML folds the indented lines
+        // that follow into one value, and all of it is startup-loaded text.
+        // Reading only the first line would understate the startup cost.
+        let wrapped = "---\ndescription: abcd\n  efgh\n---\nbody";
+        assert_eq!(
+            frontmatter_description(wrapped).as_deref(),
+            Some("abcd efgh")
+        );
+        // A quoted value may span lines too — the quotes belong to the folded
+        // value, not to its first fragment.
+        let quoted = "---\ndescription: \"abcd\n  efgh\"\n---\nbody";
+        assert_eq!(
+            frontmatter_description(quoted).as_deref(),
+            Some("abcd efgh")
+        );
+    }
+
+    #[test]
+    fn only_a_line_that_is_just_dashes_closes_the_frontmatter() {
+        // A value line merely starting with dashes must not end the block:
+        // truncating there drops the keys below it, and for a rule that means
+        // losing `paths:` — which flips its load mode, not just its weight.
+        let content = "---\nname: x\n---nope\ndescription: abcd\n---\nbody";
+        assert_eq!(frontmatter_description(content).as_deref(), Some("abcd"));
+        let ruled = "---\n---nope\npaths:\n  - \"src/**\"\n---\nbody";
+        assert_eq!(
+            rule_surface("r", "/c/r.md", ruled, &Scope::Global).load_mode,
+            LoadMode::PathConditional
+        );
+        // CRLF frontmatter reads the same.
+        let crlf = "---\r\ndescription: abcd\r\n---\r\nbody";
+        assert_eq!(frontmatter_description(crlf).as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn an_inline_comment_is_not_part_of_the_description() {
+        // Claude Code loads what YAML says the value is, and YAML drops a
+        // whitespace-preceded `#` — counting it would weigh text no session
+        // ever sees.
+        let commented = "---\ndescription: Real text # not the description\n---\nbody";
+        assert_eq!(
+            frontmatter_description(commented).as_deref(),
+            Some("Real text")
+        );
+        // Any whitespace opens a comment, not only a space.
+        let tabbed = "---\ndescription: Real text\t# not the description\n---\nbody";
+        assert_eq!(
+            frontmatter_description(tabbed).as_deref(),
+            Some("Real text")
+        );
+        // Inside quotes, and inside a block scalar, a `#` is literal text.
+        let quoted = "---\ndescription: \"a # b\"\n---\nbody";
+        assert_eq!(frontmatter_description(quoted).as_deref(), Some("a # b"));
+        let block = "---\ndescription: |\n  a # b\n---\nbody";
+        assert_eq!(frontmatter_description(block).as_deref(), Some("a # b"));
+    }
+
+    #[test]
+    fn an_agent_pays_only_its_description_at_startup() {
+        let content = "---\ndescription: abcdefgh\n---\nlong body";
+        let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
+        assert_eq!(surface.startup_tokens, Some(2));
+        assert_eq!(surface.static_tokens, Some(approx_tokens(content)));
+    }
+
+    #[test]
+    fn an_always_on_rule_pays_its_whole_text_at_startup() {
+        let surface = rule_surface("convention", "/cfg/convention.md", "abcd", &Scope::Global);
+        assert_eq!(surface.startup_tokens, Some(1));
+        assert_eq!(surface.static_tokens, Some(1));
+    }
+
+    #[test]
+    fn a_path_conditional_rule_pays_nothing_until_it_fires() {
+        let content = "---\npaths:\n  - \"src/**/*.rs\"\n---\n# Rule body";
+        let surface = rule_surface("spec-sync", "/cfg/spec-sync.md", content, &Scope::Global);
+        assert_eq!(surface.startup_tokens, Some(0));
+        assert_eq!(surface.static_tokens, Some(approx_tokens(content)));
+    }
+
+    #[test]
+    fn claude_md_pays_its_whole_text_at_startup() {
+        let surface = claude_md_surface("global", "/c/CLAUDE.md", "abcd", &Scope::Global);
+        assert_eq!(surface.startup_tokens, Some(1));
+    }
+
+    #[test]
+    fn an_mcp_server_startup_cost_is_unknown_not_zero() {
+        let dir = std::env::temp_dir().join(format!("cclens-test-mcp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"playwright":{}}}"#).unwrap();
+
+        let surfaces = read_mcp_server_surfaces(&path, &Scope::Global);
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(surfaces[0].startup_tokens, None);
     }
 
     #[test]

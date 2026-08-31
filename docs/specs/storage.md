@@ -28,7 +28,8 @@ CREATE TABLE surfaces (
     scope         TEXT NOT NULL,    -- global | project
     project       TEXT NOT NULL,    -- owning project's normalized slug; '' for global rows
     config_path   TEXT,
-    static_tokens INTEGER,          -- token weight of the injected definition; NULL if unknown (e.g. mcp_tool)
+    static_tokens INTEGER,          -- token weight of the whole definition (a skill's body = its invocation cost); NULL if unknown (e.g. mcp_tool)
+    startup_tokens INTEGER,         -- weight of the slice loaded into every session (description for a skill/agent); NULL if unknown
     load_mode     TEXT NOT NULL,    -- startup_full | startup_description | path_conditional | on_demand | tool_schema
     attrs_json    TEXT,             -- kind-specific extras (paths glob, hook matcher, …)
     PRIMARY KEY (kind, id, scope, project)

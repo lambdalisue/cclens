@@ -12,10 +12,13 @@ runtime cost* (events, from `events.md`) to expose optimization wedges.
 The adapter reads config into one `surface` per configurable thing, each with:
 
 - a stable `(kind, id)` identity — the join key events also carry;
-- a **static cost**: the token weight of the text it injects, plus its **load
-  mode** (startup-full / startup-description / path-conditional / on-demand /
-  tool-schema — see `config-format.md`). Load mode is what separates always-on
-  tax from per-use cost;
+- two **costs**, because one figure cannot answer both questions: a **static
+  cost** (the whole definition — for a skill or agent, what invoking it costs)
+  and a **startup cost** (the slice loaded into every session, which is all that
+  removing the surface reclaims), plus its **load mode** (startup-full /
+  startup-description / path-conditional / on-demand / tool-schema — see
+  `config-format.md`). Load mode is what separates always-on tax from per-use
+  cost, and which slice of the text each cost covers;
 - its scope (global vs project) and `config_path`.
 
 The catalog is the denominator of every optimization question: you cannot call a
@@ -91,8 +94,10 @@ A wedge is only useful if it says how much *removing the surface saves at
 session start* — and that is not its static token count. Skills and agents load
 only their **description** at startup (their body is on-demand), so deleting an
 unused one is **decluttering**, not a token win, even if its body tokenizes
-large. The `waste` view therefore ranks by `startup_savings` (see
-`core::surface`):
+large. Every view that names a surface therefore ranks by `startup_savings` and
+reports the two costs **apart** — `startup_tokens` (what removal reclaims) beside
+the on-demand body (what invoking it costs), never one figure standing for both.
+The ranking (see `core::surface`):
 
 - **measured tokens** — always-on config (`startup_full`): removing it saves that
   many tokens every session. Ranked first, largest first.
@@ -102,9 +107,12 @@ large. The `waste` view therefore ranks by `startup_savings` (see
   conditional rules): ~no startup cost, so an unused one is namespace hygiene,
   not savings. Ranked last and labelled as such.
 
-This stops the view from headlining an unused skill's body size as if deleting
-it freed that context, and lifts the genuinely paid items (heavy always-on
-rules, unused MCP servers) to the top.
+This stops a view from headlining an unused skill's body size as if deleting it
+freed that context, and lifts the genuinely paid items (heavy always-on rules,
+unused MCP servers) to the top. The rule binds the `optimize` briefing as much as
+the tables: a briefing line reads `skill/x (~7 tok at startup / 1015 tok when
+invoked)`, because the seeded session acts on those figures and a single
+unlabelled number there becomes a fix proposal that frees nothing.
 
 The "Requires" column makes the coverage explicit: **Unused** and **Costly +
 rare** apply only to usage-measurable kinds — never to `rule` / `hook` /
@@ -131,9 +139,14 @@ always-on wedge is confirmed empirically, not asserted:
 (`config-format.md`). To claim "your always-on config costs ~X every session"
 honestly, reconcile it against observed context: the **floor of the session-start
 context across sessions** is an empirical lower bound on the always-on context
-every session starts with. Comparing
-`sum(static_tokens WHERE load_mode = startup_full)` against that observed floor
-is the only evidence-backed form of the always-on claim.
+every session starts with. Comparing `sum(startup_tokens)` against that observed
+floor is the only evidence-backed form of the always-on claim. The sum spans
+every surface, not just the always-on files: a skill's description is paid at
+every session start too, so leaving descriptions out understated the config's
+share of the floor by however many skills had accumulated. Surfaces whose startup
+weight is unknown (an MCP schema) stay out of the sum rather than entering it as
+zero — they land in the unattributed residual, where the report already says the
+figure is an upper bound on system + tools + MCP.
 
 The floor must come from an actual session start (the `session_start` event —
 `events.md`), never from a skill span's `ctx_start`. Spans were the original

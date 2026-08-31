@@ -85,9 +85,18 @@ pub struct Surface {
     pub id: String,
     pub scope: Scope,
     pub config_path: String,
-    /// Token weight of the injected definition; `None` when it cannot be weighed
-    /// (e.g. an MCP tool schema with no available source).
+    /// Token weight of the whole injected definition; `None` when it cannot be
+    /// weighed (e.g. an MCP tool schema with no available source). For a surface
+    /// with an on-demand body this is the *invocation* cost, not the startup one
+    /// — `startup_tokens` is what a session pays for merely having it installed.
     pub static_tokens: Option<u64>,
+    /// Token weight of the part loaded into **every** session's startup context:
+    /// the whole text for always-on surfaces, only the description for skills and
+    /// agents, nothing for a body that waits to be invoked. `None` when unknown
+    /// (an MCP server's tool schema). Keeping this apart from `static_tokens` is
+    /// what stops a body cost from being read as a startup saving
+    /// (`docs/specs/surfaces.md`).
+    pub startup_tokens: Option<u64>,
     pub load_mode: LoadMode,
 }
 
@@ -155,10 +164,24 @@ pub enum StartupSavings {
     Declutter,
 }
 
-/// The startup token saving from removing a surface, by load mode.
-pub fn startup_savings(load_mode: LoadMode, static_tokens: Option<u64>) -> StartupSavings {
+/// What a surface costs when its body is actually loaded — the invocation cost
+/// of a skill or agent, the firing cost of a path-conditional rule. `None` for
+/// surfaces with no separate body: an always-on file is already paid in full at
+/// startup, and a tool schema is not a body at all. Reports pair this with
+/// `startup_tokens` so a body figure is never read as a startup saving.
+pub fn on_demand_tokens(load_mode: LoadMode, static_tokens: Option<u64>) -> Option<u64> {
     match load_mode {
-        LoadMode::StartupFull => StartupSavings::Tokens(static_tokens.unwrap_or(0)),
+        LoadMode::StartupDescription | LoadMode::PathConditional | LoadMode::OnDemand => {
+            static_tokens
+        }
+        LoadMode::StartupFull | LoadMode::ToolSchema => None,
+    }
+}
+
+/// The startup token saving from removing a surface, by load mode.
+pub fn startup_savings(load_mode: LoadMode, startup_tokens: Option<u64>) -> StartupSavings {
+    match load_mode {
+        LoadMode::StartupFull => StartupSavings::Tokens(startup_tokens.unwrap_or(0)),
         LoadMode::ToolSchema => StartupSavings::UnknownSchema,
         LoadMode::StartupDescription | LoadMode::PathConditional | LoadMode::OnDemand => {
             StartupSavings::Declutter
@@ -249,6 +272,23 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_cost_exists_only_for_a_body_that_waits_to_be_loaded() {
+        // A skill's file weight is paid on invocation...
+        assert_eq!(
+            on_demand_tokens(LoadMode::StartupDescription, Some(1015)),
+            Some(1015)
+        );
+        // ...as is a path-conditional rule's, when its glob fires.
+        assert_eq!(
+            on_demand_tokens(LoadMode::PathConditional, Some(500)),
+            Some(500)
+        );
+        // An always-on file has no separate on-demand cost — it is already paid.
+        assert_eq!(on_demand_tokens(LoadMode::StartupFull, Some(900)), None);
+        assert_eq!(on_demand_tokens(LoadMode::ToolSchema, None), None);
+    }
+
+    #[test]
     fn startup_savings_reflects_what_is_actually_paid_at_startup() {
         // An always-on rule: removing it saves real tokens every session.
         assert_eq!(
@@ -260,9 +300,10 @@ mod tests {
             startup_savings(LoadMode::ToolSchema, None),
             StartupSavings::UnknownSchema
         );
-        // A skill: body is on-demand, so removal is decluttering, not a token win.
+        // A skill: only its description is startup-loaded, so removal is
+        // decluttering, not a token win — however large the body.
         assert_eq!(
-            startup_savings(LoadMode::StartupDescription, Some(2000)),
+            startup_savings(LoadMode::StartupDescription, Some(7)),
             StartupSavings::Declutter
         );
     }

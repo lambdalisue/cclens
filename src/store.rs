@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS surfaces (
     project       TEXT NOT NULL DEFAULT '',
     config_path   TEXT,
     static_tokens INTEGER,
+    startup_tokens INTEGER,
     load_mode     TEXT NOT NULL,
     PRIMARY KEY (kind, id, scope, project)
 );
@@ -178,7 +179,12 @@ pub struct CatalogEntry {
     pub scope: String,
     /// The owning project's normalized slug; empty for global rows.
     pub project: String,
+    /// The whole definition's weight — for a skill or agent, what its body
+    /// costs when invoked, not what having it installed costs.
     pub static_tokens: Option<i64>,
+    /// What this surface adds to every session's startup context; `None` when
+    /// unknown (an MCP server's tool schema).
+    pub startup_tokens: Option<i64>,
     pub load_mode: String,
     pub uses: i64,
 }
@@ -637,14 +643,17 @@ impl Store {
         Ok(rows)
     }
 
-    /// Total tokens of **global** always-on (startup_full) config — what every
-    /// session pays unconditionally from `~/.claude` regardless of project.
-    /// Project config is always-on only for its own sessions
-    /// (`always_on_config_tokens_for`).
+    /// Total startup tokens of **global** config — what every session pays
+    /// unconditionally from `~/.claude` regardless of project: always-on files
+    /// in full, plus the descriptions skills and agents contribute to the
+    /// startup listing. Bodies that wait to be invoked weigh nothing here, and a
+    /// surface whose startup weight is unknown (an MCP schema) is left out of
+    /// the sum rather than counted as zero. Project config is always-on only for
+    /// its own sessions (`always_on_config_tokens_for`).
     pub fn always_on_config_tokens(&self) -> Result<i64> {
         let total = self.conn.query_row(
-            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces
-             WHERE load_mode = 'startup_full' AND scope = 'global'",
+            "SELECT COALESCE(SUM(startup_tokens), 0) FROM surfaces
+             WHERE scope = 'global'",
             [],
             |row| row.get(0),
         )?;
@@ -808,8 +817,9 @@ impl Store {
         for surface in surfaces {
             tx.execute(
                 "INSERT OR REPLACE INTO surfaces
-                   (kind, id, scope, project, config_path, static_tokens, load_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                   (kind, id, scope, project, config_path, static_tokens,
+                    startup_tokens, load_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     &surface.kind,
                     &surface.id,
@@ -817,6 +827,7 @@ impl Store {
                     surface.scope.project(),
                     &surface.config_path,
                     surface.static_tokens,
+                    surface.startup_tokens,
                     surface.load_mode.label(),
                 ),
             )?;
@@ -832,8 +843,8 @@ impl Store {
     /// (`docs/specs/surfaces.md`).
     pub fn effective_catalog(&self) -> Result<Vec<CatalogEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens, f.load_mode,
-                    COUNT(u.event_id)
+            "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens,
+                    f.startup_tokens, f.load_mode, COUNT(u.event_id)
              FROM surfaces f
              LEFT JOIN (SELECT e.id AS event_id, e.surface_kind, e.surface_id,
                                s.project AS session_project
@@ -855,8 +866,9 @@ impl Store {
                     scope: row.get(2)?,
                     project: row.get(3)?,
                     static_tokens: row.get(4)?,
-                    load_mode: row.get(5)?,
-                    uses: row.get(6)?,
+                    startup_tokens: row.get(5)?,
+                    load_mode: row.get(6)?,
+                    uses: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -876,13 +888,19 @@ impl Store {
         Ok(rows)
     }
 
-    /// Total always-on config tokens for a session in `project`: the global
-    /// figure plus that project's own startup-full config.
+    /// Total startup config tokens for a session in `project`: the global
+    /// figure plus that project's own startup cost.
+    ///
+    /// A surface installed at both scopes under the same `(kind, id)` is counted
+    /// twice here. Resolving that would mean asserting which copy Claude Code
+    /// actually loads, and the shadowing model this store implements is defined
+    /// for the **usage join** (`effective_catalog`), not for load order — a
+    /// project rule and its global namesake genuinely both reach the context, so
+    /// excluding one would understate the figure instead.
     pub fn always_on_config_tokens_for(&self, project: &str) -> Result<i64> {
         let total = self.conn.query_row(
-            "SELECT COALESCE(SUM(static_tokens), 0) FROM surfaces
-             WHERE load_mode = 'startup_full'
-               AND (scope = 'global' OR (scope = 'project' AND project = ?1))",
+            "SELECT COALESCE(SUM(startup_tokens), 0) FROM surfaces
+             WHERE scope = 'global' OR (scope = 'project' AND project = ?1)",
             [project],
             |row| row.get(0),
         )?;
@@ -1195,15 +1213,22 @@ mod tests {
         assert_eq!(usage[0].out_tokens, 999);
     }
 
-    fn surface(id: &str, scope: Scope, static_tokens: u64) -> Surface {
+    /// A skill surface whose body weighs `static_tokens` and whose description
+    /// (the only part loaded at startup) weighs `startup_tokens`.
+    fn skill_surface(id: &str, scope: Scope, static_tokens: u64, startup_tokens: u64) -> Surface {
         Surface {
             kind: "skill".to_string(),
             id: id.to_string(),
             scope,
             config_path: format!("/cfg/{id}"),
             static_tokens: Some(static_tokens),
+            startup_tokens: Some(startup_tokens),
             load_mode: LoadMode::StartupDescription,
         }
+    }
+
+    fn surface(id: &str, scope: Scope, static_tokens: u64) -> Surface {
+        skill_surface(id, scope, static_tokens, 0)
     }
 
     #[test]
@@ -1588,6 +1613,36 @@ mod tests {
         assert!(sql["events_by_surface"].contains("surface_kind"), "{sql:?}");
     }
 
+    #[test]
+    fn a_catalog_without_the_startup_cost_column_is_rebuilt() {
+        // A catalog weighed before startup cost was split out would silently
+        // answer every "what does removing this save" question with nothing, so
+        // it must not survive the upgrade as it is. `surfaces` is regenerated
+        // from live config on every analyze, so reconciling it costs nothing to
+        // drop — and clearing `analyzed_at` is what routes a `--frozen` read to
+        // the freshness warning instead of reporting the empty catalog as a
+        // finding.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE surfaces (kind TEXT NOT NULL, id TEXT NOT NULL,
+                                    scope TEXT NOT NULL, project TEXT NOT NULL,
+                                    static_tokens INTEGER, load_mode TEXT NOT NULL);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('analyzed_at', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).expect("must migrate, not refuse");
+
+        let names: Vec<String> = table_shape(&store.conn, "surfaces")
+            .unwrap()
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        assert!(names.contains(&"startup_tokens".to_string()), "{names:?}");
+        assert_eq!(store.meta("analyzed_at").unwrap(), None);
+    }
+
     fn span_at_ctx(skill: &str, ctx_start: u64) -> Span {
         Span {
             skill: skill.to_string(),
@@ -1711,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn always_on_config_sums_only_startup_full_surfaces() {
+    fn always_on_config_sums_every_surface_startup_cost() {
         let mut store = Store::in_memory().unwrap();
         store
             .replace_surfaces(&[
@@ -1721,6 +1776,7 @@ mod tests {
                     scope: Scope::Global,
                     config_path: "/c/CLAUDE.md".to_string(),
                     static_tokens: Some(600),
+                    startup_tokens: Some(600),
                     load_mode: LoadMode::StartupFull,
                 },
                 Surface {
@@ -1729,10 +1785,22 @@ mod tests {
                     scope: Scope::Global,
                     config_path: "/c/safety.md".to_string(),
                     static_tokens: Some(900),
+                    startup_tokens: Some(900),
                     load_mode: LoadMode::StartupFull,
                 },
-                // A skill is startup_description — must NOT count.
-                surface("git-commit", Scope::Global, 1000),
+                // A skill contributes its description, never its 1000-token body.
+                skill_surface("git-commit", Scope::Global, 1000, 8),
+                // An MCP server's schema is real but unweighable — it must not
+                // land in the sum as a false zero-cost row either way.
+                Surface {
+                    kind: "mcp_server".to_string(),
+                    id: "playwright".to_string(),
+                    scope: Scope::Global,
+                    config_path: "/c/.mcp.json".to_string(),
+                    static_tokens: None,
+                    startup_tokens: None,
+                    load_mode: LoadMode::ToolSchema,
+                },
                 // Another project's CLAUDE.md is always-on *there*, not globally.
                 Surface {
                     kind: "claude_md".to_string(),
@@ -1740,6 +1808,7 @@ mod tests {
                     scope: Scope::Project("alpha".to_string()),
                     config_path: "/tmp/example/CLAUDE.md".to_string(),
                     static_tokens: Some(400),
+                    startup_tokens: Some(400),
                     load_mode: LoadMode::StartupFull,
                 },
             ])
@@ -1747,8 +1816,20 @@ mod tests {
 
         // The global figure excludes project config; a session in alpha pays
         // the global floor plus alpha's own always-on config.
-        assert_eq!(store.always_on_config_tokens().unwrap(), 1500);
-        assert_eq!(store.always_on_config_tokens_for("alpha").unwrap(), 1900);
+        assert_eq!(store.always_on_config_tokens().unwrap(), 1508);
+        assert_eq!(store.always_on_config_tokens_for("alpha").unwrap(), 1908);
+    }
+
+    #[test]
+    fn the_catalog_carries_startup_and_body_cost_apart() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[skill_surface("repro", Scope::Global, 1015, 7)])
+            .unwrap();
+
+        let catalog = store.effective_catalog().unwrap();
+        assert_eq!(catalog[0].static_tokens, Some(1015));
+        assert_eq!(catalog[0].startup_tokens, Some(7));
     }
 
     #[test]

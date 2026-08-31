@@ -2,6 +2,7 @@
 //! adapter, the parsing core is pure (over file content) and the directory
 //! walking is a thin shell. See `docs/specs/config-format.md`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -171,8 +172,20 @@ pub fn read_project_surfaces(root: &Path, project: &str) -> Vec<Surface> {
     surfaces.extend(read_rule_surfaces(&claude.join("rules"), &scope));
     surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
     surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
+    // A repo that serves both agent conventions usually ships `AGENTS.md` as a
+    // symlink to `CLAUDE.md`. Claude Code injects that content once, so weigh
+    // the file once too: resolve each candidate and keep the first surface per
+    // resolved file, which makes `CLAUDE.md` the one that is reported. Counting
+    // both would double the project's always-on figure and suggest deleting a
+    // link that costs nothing.
+    let mut seen = HashSet::new();
     for name in ["CLAUDE.md", "AGENTS.md"] {
-        if let Some(surface) = read_claude_md_surface(&root.join(name), name, &scope) {
+        let path = root.join(name);
+        let resolved = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(resolved) {
+            continue;
+        }
+        if let Some(surface) = read_claude_md_surface(&path, name, &scope) {
             surfaces.push(surface);
         }
     }
@@ -335,6 +348,62 @@ mod tests {
         assert!(has("rule", "tdd"));
         assert!(has("claude_md", "CLAUDE.md"));
         assert!(has("mcp_server", "playwright"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agents_md_symlinked_to_claude_md_is_one_surface() {
+        // A repo serving both agent conventions ships AGENTS.md as a symlink to
+        // CLAUDE.md. Claude Code injects that content once, so counting both
+        // paths would double the always-on figure and suggest deleting a link
+        // that costs nothing.
+        let root = std::env::temp_dir().join(format!(
+            "cclens-test-symlink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // Start from an empty directory: a leftover AGENTS.md from an aborted
+        // run would make the symlink below fail with AlreadyExists.
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", root.join("AGENTS.md")).unwrap();
+
+        let surfaces = read_project_surfaces(&root, "alpha");
+        fs::remove_dir_all(&root).ok();
+
+        let claude_mds: Vec<_> = surfaces.iter().filter(|s| s.kind == "claude_md").collect();
+        assert_eq!(claude_mds.len(), 1);
+        assert_eq!(claude_mds[0].id, "CLAUDE.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agents_md_of_its_own_stays_a_separate_surface() {
+        // Only the *same file* is deduplicated: a standalone AGENTS.md is real
+        // extra always-on context.
+        let root = std::env::temp_dir().join(format!(
+            "cclens-test-distinct-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // Start from an empty directory: a leftover symlinked AGENTS.md from an
+        // aborted run would write through to CLAUDE.md and hide the two files.
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
+        fs::write(root.join("AGENTS.md"), "project agents md").unwrap();
+
+        let surfaces = read_project_surfaces(&root, "alpha");
+        fs::remove_dir_all(&root).ok();
+
+        let mut ids: Vec<_> = surfaces
+            .iter()
+            .filter(|s| s.kind == "claude_md")
+            .map(|s| s.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["AGENTS.md", "CLAUDE.md"]);
     }
 
     #[test]

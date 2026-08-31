@@ -9,27 +9,22 @@ Run cclens over the user's Claude Code transcripts and config, then present the
 one-screen health check. Everything runs locally and read-only over
 `~/.claude`; nothing is sent anywhere.
 
-## 1. Resolve the binary and the store
+## 1. Resolve the binary
 
 - **Binary**: use `cclens` if `command -v cclens` finds it. Otherwise run every
   command below through Nix instead: `nix run github:lambdalisue/cclens -- <subcommand …>`.
   If neither `cclens` nor `nix` is available, stop and tell the user how to
   install it (`nix profile install github:lambdalisue/cclens`, or
   `cargo install --git https://github.com/lambdalisue/cclens`).
-- **Store**: if `./cclens.db` exists, use it and omit `--db`. Otherwise use the
-  per-user store so no file is dropped into the current project:
 
-  ```sh
-  DB="${XDG_STATE_HOME:-$HOME/.local/state}/cclens/cclens.db"
-  mkdir -p "$(dirname "$DB")"
-  ```
-
-  and pass `--db "$DB"` to every command below.
+Omit `--db` everywhere: the store defaults to a per-user path
+(`${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db`), so nothing is dropped
+into the current project.
 
 ## 2. Report
 
 ```sh
-cclens doctor --db "$DB"
+cclens doctor
 ```
 
 `doctor` refreshes the store automatically (incremental; fast when current)

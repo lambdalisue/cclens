@@ -31,6 +31,16 @@ was deleted since its sessions ran simply contributes no project surfaces.
 | `mcp_server` | `~/.claude/mcp.json` (top-level `mcpServers`) | `<project>/.mcp.json` |
 | `mcp_tool` | the MCP server's advertised tool schemas (dynamic — see below) | — |
 
+`CLAUDE.md` and `AGENTS.md` are two names for the same always-on context, and a
+repo serving both agent conventions typically ships `AGENTS.md` as a symlink to
+`CLAUDE.md`. Claude Code injects that content once, so the adapter weighs the
+file once: `read_project_surfaces` resolves each candidate and keeps the first
+surface per resolved file, which reports the pair under `CLAUDE.md`. The
+deduplication key is the resolved path, not the content — two independently
+maintained files are two real always-on surfaces even when their text coincides.
+Getting this wrong doubles the project's `startup_full` total, which is what the
+always-on floor is reconciled against (`surfaces.md`).
+
 `settings.json` carries two surface kinds at once: `permissions` (allow/deny) and
 `hooks` (matcher → command); the adapter splits one file into several surfaces.
 MCP servers are **not** in `settings.json` — they live in a separate `mcp.json`

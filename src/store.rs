@@ -5,6 +5,8 @@
 //! The schema tracks the spec's `events` table; `attrs_json` is the one column
 //! deferred until a report needs it.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -47,7 +49,6 @@ CREATE TABLE IF NOT EXISTS events (
     sub_tokens_estimated INTEGER NOT NULL DEFAULT 0,
     is_trailing          INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS events_by_surface ON events(surface_kind, surface_id);
 CREATE TABLE IF NOT EXISTS surfaces (
     kind          TEXT NOT NULL,
     id            TEXT NOT NULL,
@@ -71,12 +72,27 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     mtime INTEGER NOT NULL,
     size  INTEGER NOT NULL
 );
+";
+
+/// Indexes are declared apart from the tables so `migrate` can apply them only
+/// after reconciling columns. Declared alongside the table, an index over a
+/// column a future release adds would be replayed against a legacy shape, fail on
+/// the missing column, and take the whole migration down with it.
+const INDEX_SCHEMA: &str = "
+CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
+";
+
+/// Views are pure definitions over the tables, declared apart from them for the
+/// same reason as indexes plus one of their own: `CREATE VIEW IF NOT EXISTS`
+/// would leave an older store's stale definition in place, and a reader would
+/// silently query yesterday's column mapping.
+const VIEW_SCHEMA: &str = "
 -- A clean read view over tool_error events: the friction columns are overloaded
 -- onto generic event columns (category in surface_id, excerpt in source, tool in
 -- model), so this view names them and joins the project — letting an ad-hoc SQL
 -- query (e.g. from the optimize session) ask for any slice without knowing the
 -- encoding. `project LIKE '%--wt%'` distinguishes a worktree from the main checkout.
-CREATE VIEW IF NOT EXISTS tool_errors AS
+CREATE VIEW tool_errors AS
 SELECT e.session_id        AS session_id,
        s.project           AS project,
        e.surface_id        AS category,
@@ -87,6 +103,21 @@ SELECT e.session_id        AS session_id,
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
 ";
+
+/// Stamped into `PRAGMA user_version`. Bumped only for a change `migrate` cannot
+/// reconcile — an existing column removed, retyped, or given a new meaning.
+/// Additive drift (a new column, table, or view) needs no bump: `migrate`
+/// converges any older store onto the declared schema in place.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Tables holding analysis history. Claude Code prunes transcripts on its own
+/// retention schedule, after which these rows are the only surviving record of
+/// those sessions — so a shape change adds columns in place, never rebuilds.
+const MIGRATED_TABLES: [&str; 4] = ["sessions", "events", "ingested_files", "meta"];
+
+/// Tables regenerated wholesale from live config on every analyze
+/// (`replace_surfaces`), so a shape change costs nothing to drop and recreate.
+const REBUILT_TABLES: [&str; 1] = ["surfaces"];
 
 /// Identity and provenance of one analyzed session.
 pub struct SessionMeta {
@@ -213,20 +244,8 @@ impl Store {
         Ok((columns, rows))
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
-        // A db written by an older cclens lacks columns the queries below rely
-        // on (`CREATE TABLE IF NOT EXISTS` will not add them). The store is a
-        // regenerable cache, so refuse it with the fix instead of failing on
-        // some later query.
-        for (table, column) in [("sessions", "root"), ("surfaces", "project")] {
-            if table_exists(&conn, table)? && !column_exists(&conn, table, column)? {
-                anyhow::bail!(
-                    "the store's schema is from an older cclens — delete the db file \
-                     and re-run `cclens analyze` to regenerate it"
-                );
-            }
-        }
-        conn.execute_batch(SCHEMA)?;
+    fn from_connection(mut conn: Connection) -> Result<Self> {
+        migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -843,6 +862,171 @@ impl Store {
     }
 }
 
+/// Bring an existing store onto the current schema **in place**. The store
+/// outlives the transcripts it was built from, so an upgrade may not resolve
+/// schema drift by asking for the file to be deleted — that would discard
+/// history no re-analysis can reconstruct (`docs/specs/storage.md`).
+///
+/// Drift is reconciled per table by what the table costs to lose, and the
+/// declared schema is the single source of truth for the target shape: it is
+/// applied to a scratch database and read back, so adding a column to `SCHEMA`
+/// is all a future change needs.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        // Reconciliation only ever adds; it cannot undo a newer cclens's
+        // changes, and writing this build's shape over them would corrupt a
+        // store that binary still reads correctly.
+        anyhow::bail!(
+            "the store was written by a newer cclens (schema v{version}; this build knows \
+             v{SCHEMA_VERSION}) — upgrade cclens to read it"
+        );
+    }
+
+    let desired = Connection::open_in_memory()?;
+    desired.execute_batch(SCHEMA)?;
+    desired.execute_batch(INDEX_SCHEMA)?;
+    desired.execute_batch(VIEW_SCHEMA)?;
+
+    // One transaction for the whole migration, as every other multi-statement
+    // write in this file does: reconciliation may bail partway through, and a
+    // store left half-migrated is exactly the outcome in-place upgrading exists
+    // to avoid. SQLite rolls DDL back like any other statement.
+    let tx = conn.transaction()?;
+
+    let mut rebuilt = false;
+    for table in REBUILT_TABLES {
+        if table_exists(&tx, table)? && table_shape(&tx, table)? != table_shape(&desired, table)? {
+            tx.execute_batch(&format!("DROP TABLE {table}"))?;
+            rebuilt = true;
+        }
+    }
+    tx.execute_batch(SCHEMA)?;
+    for table in MIGRATED_TABLES {
+        reconcile_columns(&tx, &desired, table)?;
+    }
+    // Indexes and views come last: both reference columns the step above may
+    // have just added.
+    reconcile_derived(&tx, &desired, "index")?;
+    reconcile_derived(&tx, &desired, "view")?;
+    if rebuilt {
+        // The catalog is empty until the next analyze refills it. Without this a
+        // `--frozen` read would print an ordinary freshness line over an empty
+        // catalog, reporting "nothing installed" as though it were a finding.
+        tx.execute("DELETE FROM meta WHERE key = 'analyzed_at'", ())?;
+    }
+
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reconcile `table` against the columns `desired` declares for it. Only
+/// additive drift is reconcilable in place — SQLite can append a column but not
+/// retype or re-key one, and a NOT NULL column needs a default to fill the rows
+/// already stored — so anything else is reported rather than half-applied.
+///
+/// A column already present is compared, not skipped: reconciliation would
+/// otherwise pass silently over a retype or a changed default, leaving the store
+/// permanently diverged from the declaration it is supposed to converge on.
+fn reconcile_columns(conn: &Connection, desired: &Connection, table: &str) -> Result<()> {
+    let present = table_shape(conn, table)?;
+    for column in table_shape(desired, table)? {
+        if let Some(existing) = present.iter().find(|c| c.name == column.name) {
+            if *existing != column {
+                anyhow::bail!(
+                    "`{table}.{}` is declared as {column:?} but the store holds {existing:?}: \
+                     SQLite cannot change a column in place, so this needs an explicit \
+                     migration that states what it discards",
+                    column.name
+                );
+            }
+            continue;
+        }
+        let mut ddl = format!(
+            "ALTER TABLE {table} ADD COLUMN {} {}",
+            column.name, column.decl_type
+        );
+        match &column.default {
+            Some(default) => {
+                if column.notnull {
+                    ddl.push_str(" NOT NULL");
+                }
+                ddl.push_str(&format!(" DEFAULT {default}"));
+            }
+            None if column.notnull => anyhow::bail!(
+                "cannot add `{table}.{}` to an existing store: a NOT NULL column needs a \
+                 DEFAULT to fill the rows already stored",
+                column.name
+            ),
+            None => {}
+        }
+        conn.execute_batch(&ddl)?;
+    }
+    Ok(())
+}
+
+/// Recreate every index or view of `kind` whose stored definition differs from
+/// the declared one. Both carry no data, so replacing one costs nothing but the
+/// rebuild — which is why only a *drifted* object is touched: reindexing a large
+/// `events` table on every open would not be free. Objects the declaration does
+/// not name are left alone; the store is meant to be explored with ad-hoc SQL, so
+/// a helper view someone saved into the file is theirs to keep.
+///
+/// Deriving the names from the declaration is also what removes the hand-kept
+/// list this replaced: such a list drifts, and a declared object missing from it
+/// would collide with its own `CREATE` on the store's second open.
+fn reconcile_derived(conn: &Connection, desired: &Connection, kind: &str) -> Result<()> {
+    let stored = declared_sql(conn, kind)?;
+    for (name, sql) in declared_sql(desired, kind)? {
+        if stored.get(&name).is_some_and(|existing| *existing == sql) {
+            continue;
+        }
+        conn.execute_batch(&format!("DROP {kind} IF EXISTS {name}"))?;
+        conn.execute_batch(&sql)?;
+    }
+    Ok(())
+}
+
+/// `name -> CREATE statement` for every object of `kind` that carries one (an
+/// implicit index has none). SQLite stores the statement as written minus
+/// `IF NOT EXISTS`, so definitions built from the same declaration compare equal.
+fn declared_sql(conn: &Connection, kind: &str) -> Result<BTreeMap<String, String>> {
+    let mut stmt =
+        conn.prepare("SELECT name, sql FROM sqlite_master WHERE type = ?1 AND sql IS NOT NULL")?;
+    let rows = stmt
+        .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<String, String>>>()?;
+    Ok(rows)
+}
+
+/// One column as SQLite reports it (`PRAGMA table_info`).
+#[derive(Debug, PartialEq)]
+struct ColumnDef {
+    name: String,
+    decl_type: String,
+    notnull: bool,
+    default: Option<String>,
+    pk: i64,
+}
+
+/// A table's columns in declaration order; empty when the table does not exist.
+fn table_shape(conn: &Connection, table: &str) -> Result<Vec<ColumnDef>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| {
+            Ok(ColumnDef {
+                name: row.get(1)?,
+                decl_type: row.get(2)?,
+                notnull: row.get::<_, i64>(3)? != 0,
+                default: row.get(4)?,
+                pk: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns)
+}
+
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -850,14 +1034,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(n > 0)
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(names.iter().any(|name| name == column))
 }
 
 fn source_label(source: Source) -> &'static str {
@@ -1079,15 +1255,309 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_outdated_store_schema_is_rejected_with_guidance() {
-        // A db created by an older cclens (no sessions.root / surfaces.project)
-        // must be refused with a re-analyze hint, not fail mid-query.
+    /// A store as an older cclens left it: `sessions` without the columns later
+    /// releases added, and `surfaces` still keyed without `project`.
+    fn legacy_store() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, project TEXT NOT NULL);")
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id          TEXT PRIMARY KEY,
+                 project     TEXT NOT NULL,
+                 slug        TEXT NOT NULL,
+                 source_path TEXT NOT NULL,
+                 started_at  TEXT NOT NULL
+             );
+             CREATE TABLE surfaces (
+                 kind          TEXT NOT NULL,
+                 id            TEXT NOT NULL,
+                 scope         TEXT NOT NULL,
+                 config_path   TEXT,
+                 static_tokens INTEGER,
+                 load_mode     TEXT NOT NULL,
+                 PRIMARY KEY (kind, id, scope)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_legacy_store_gains_missing_columns_without_losing_its_history() {
+        // The rows are irreplaceable once Claude Code has pruned the source
+        // transcripts, so upgrading must add the columns in place.
+        let conn = legacy_store();
+        conn.execute(
+            "INSERT INTO sessions (id, project, slug, source_path, started_at)
+             VALUES ('s1', 'demo', 'demo', '/tmp/example/s1.jsonl', '2026-01-01T00:00:00Z')",
+            (),
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).expect("must migrate, not refuse");
+
+        let (_, rows) = store
+            .query("SELECT id, root, sub_tokens FROM sessions")
             .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec!["s1".to_string(), String::new(), "0".to_string()]],
+            "the pre-existing session must survive, with the added columns defaulted"
+        );
+    }
+
+    #[test]
+    fn a_legacy_catalog_table_is_rebuilt_when_its_shape_drifted() {
+        // `surfaces` is a snapshot of live config, rebuilt on every analyze, so
+        // a shape change is recreated rather than patched column by column.
+        let conn = legacy_store();
+
+        let store = Store::from_connection(conn).expect("must migrate, not refuse");
+
+        let names: Vec<String> = table_shape(&store.conn, "surfaces")
+            .unwrap()
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        assert!(names.contains(&"project".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn an_up_to_date_catalog_survives_reopening() {
+        // Reopening must not drop `surfaces` merely because the store predates
+        // version stamping — a `--frozen` read would then report an empty catalog.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[surface("git-commit", Scope::Global, 1)])
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        assert_eq!(store.effective_catalog().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stale_view_definition_is_replaced_on_open() {
+        // `CREATE VIEW IF NOT EXISTS` leaves an older definition in place, so a
+        // reader would silently query yesterday's column mapping.
+        let conn = legacy_store();
+        conn.execute_batch("CREATE VIEW tool_errors AS SELECT id AS session_id FROM sessions;")
+            .unwrap();
+
+        let store = Store::from_connection(conn).expect("must migrate, not refuse");
+
+        let sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'tool_errors'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("kind = 'tool_error'"), "stale view: {sql}");
+    }
+
+    #[test]
+    fn opening_stamps_the_current_schema_version() {
+        let store = Store::from_connection(legacy_store()).unwrap();
+
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_store_written_by_a_newer_cclens_is_refused_without_advising_deletion() {
+        // Writing to it with this binary's schema would corrupt history the
+        // newer cclens can still read; deleting it would throw that history away.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+            .unwrap();
+
         let err = Store::from_connection(conn).err().expect("must be refused");
-        assert!(err.to_string().contains("cclens analyze"));
+
+        let msg = err.to_string();
+        assert!(msg.contains("upgrade"), "{msg}");
+        assert!(!msg.contains("delete"), "must not advise deletion: {msg}");
+    }
+
+    #[test]
+    fn a_column_that_cannot_be_added_in_place_is_reported() {
+        // SQLite cannot add a NOT NULL column without a default; failing loudly
+        // beats leaving the store half-migrated.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY);")
+            .unwrap();
+        let desired = Connection::open_in_memory().unwrap();
+        desired
+            .execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, tag TEXT NOT NULL);")
+            .unwrap();
+
+        let err = reconcile_columns(&conn, &desired, "t").expect_err("must be reported");
+
+        assert!(err.to_string().contains("tag"), "{err}");
+    }
+
+    #[test]
+    fn a_column_whose_declaration_drifted_is_reported() {
+        // Only additive drift is reconcilable: SQLite cannot retype or re-key a
+        // column in place, so a declaration change that reconciliation would
+        // silently skip has to fail while it is still a development mistake.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, n TEXT NOT NULL DEFAULT '');")
+            .unwrap();
+        let desired = Connection::open_in_memory().unwrap();
+        desired
+            .execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0);")
+            .unwrap();
+
+        let err = reconcile_columns(&conn, &desired, "t").expect_err("must be reported");
+
+        assert!(err.to_string().contains('n'), "{err}");
+    }
+
+    #[test]
+    fn a_failed_migration_leaves_the_store_untouched() {
+        // The whole point of migrating in place is that the file is never left
+        // worse than it was found, so a bail partway through must roll back the
+        // columns already added.
+        let mut conn = legacy_store();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id            INTEGER PRIMARY KEY,
+                 session_id    TEXT NOT NULL,
+                 source_path   TEXT NOT NULL,
+                 kind          TEXT NOT NULL,
+                 started_at    TEXT NOT NULL,
+                 started_epoch INTEGER NOT NULL,
+                 duration_sec  REAL NOT NULL,
+                 out_tokens    TEXT NOT NULL,
+                 ctx_growth    INTEGER NOT NULL,
+                 ctx_start     INTEGER NOT NULL,
+                 ctx_peak      INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect_err("the drifted events.out_tokens must be reported");
+
+        let names: Vec<String> = table_shape(&conn, "sessions")
+            .unwrap()
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        assert!(
+            !names.contains(&"root".to_string()),
+            "sessions was altered before the bail and not rolled back: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_drifted_index_is_recreated_from_the_declaration() {
+        // `CREATE INDEX IF NOT EXISTS` leaves an older definition in place, so
+        // the store would keep an index the declaration no longer describes.
+        let store = Store::in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX events_by_surface;
+                 CREATE INDEX events_by_surface ON events(surface_id);",
+            )
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        let sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'events_by_surface'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("surface_kind"), "stale index: {sql}");
+    }
+
+    #[test]
+    fn rebuilding_the_catalog_clears_the_analyze_timestamp() {
+        // The rebuilt catalog is empty until the next analyze repopulates it, and
+        // a `--frozen` read would otherwise report that emptiness as a finished
+        // analysis. Dropping the timestamp routes it to the freshness warning.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .set_meta("analyzed_at", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE surfaces;
+                 CREATE TABLE surfaces (
+                     kind TEXT NOT NULL, id TEXT NOT NULL, scope TEXT NOT NULL,
+                     config_path TEXT, static_tokens INTEGER, load_mode TEXT NOT NULL,
+                     PRIMARY KEY (kind, id, scope)
+                 );",
+            )
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        assert_eq!(store.meta("analyzed_at").unwrap(), None);
+    }
+
+    #[test]
+    fn a_view_the_declaration_does_not_name_is_left_alone() {
+        // The store is meant to be explored with ad-hoc SQL, so a helper view
+        // someone saved into the file is theirs — reconciliation replaces what the
+        // declaration names and touches nothing else.
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        store
+            .conn
+            .execute_batch("CREATE VIEW stray AS SELECT id FROM sessions;")
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).expect("a second open must not collide");
+
+        let views: Vec<String> = declared_sql(&store.conn, "view")
+            .unwrap()
+            .into_keys()
+            .collect();
+        assert_eq!(views, vec!["stray".to_string(), "tool_errors".to_string()]);
+    }
+
+    #[test]
+    fn an_index_is_created_after_the_columns_it_covers() {
+        // Indexes are declared apart from the tables so they are applied only
+        // after column reconciliation. Declaring one alongside the table would
+        // run it against a legacy shape and fail the whole migration — the exact
+        // destructive refusal in-place upgrading exists to remove.
+        let conn = legacy_store();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id            INTEGER PRIMARY KEY,
+                 session_id    TEXT NOT NULL,
+                 source_path   TEXT NOT NULL,
+                 kind          TEXT NOT NULL,
+                 surface_id    TEXT,
+                 started_at    TEXT NOT NULL,
+                 started_epoch INTEGER NOT NULL,
+                 duration_sec  REAL NOT NULL,
+                 out_tokens    INTEGER NOT NULL,
+                 ctx_growth    INTEGER NOT NULL,
+                 ctx_start     INTEGER NOT NULL,
+                 ctx_peak      INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).expect("must migrate, not refuse");
+
+        let sql = declared_sql(&store.conn, "index").unwrap();
+        assert!(sql["events_by_surface"].contains("surface_kind"), "{sql:?}");
     }
 
     fn span_at_ctx(skill: &str, ctx_start: u64) -> Span {

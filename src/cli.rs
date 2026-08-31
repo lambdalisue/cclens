@@ -1408,7 +1408,9 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
                 "always-on floor unavailable — none of the {sessions} analyzed session(s)\n\
                  carries an observable session start. A store written before session-start\n\
                  tracking keeps its old rows (analyze never re-reads a closed session), so\n\
-                 delete the store and re-analyze."
+                 the floor appears as newer sessions are analyzed. Discarding the store\n\
+                 would backfill it from the transcripts still on disk, at the cost of every\n\
+                 session whose transcript Claude Code has already pruned."
             );
         }
         return Ok(());

@@ -93,8 +93,8 @@ becomes an event). The adapter recognises at least:
 | Subagent spawn | `assistant` `tool_use` with `name == "Agent"` |
 | Tool use | `assistant` `tool_use` blocks (built-in and MCP tools, by `name`) |
 | User prompt | `user` **human turns** (not `last-prompt`, which is a single leaf-pointer to the latest prompt — one per region, not per turn) |
-| Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. The text is classified into a friction category (`core::friction`); a short readable excerpt is kept. Linking the result's `tool_use_id` to the assistant `tool_use` block recovers both the **originating tool** and the call's **target** (its `input.file_path` / `command`) — so a report shows which tool produced each failure and which file/command it hit, even when the error text omits the path (e.g. edit-precondition names no file) |
-| Permission denial | denial text inside a `tool_result` error block (e.g. `"Permission for this action was denied"` / `<tool_use_error>`). **No structured record exists** — this is a low-confidence heuristic; see note below |
+| Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. Categorised from the entry's `toolDenialKind` where that marker can be attributed to it (below), else from the text (`core::friction`); a short readable excerpt is kept. Linking the result's `tool_use_id` to the assistant `tool_use` block recovers both the **originating tool** and the call's **target** (its `input.file_path` / `command`) — so a report shows which tool produced each failure and which file/command it hit, even when the error text omits the path (e.g. edit-precondition names no file) |
+| Permission denial | `toolDenialKind` on the entry that carries the denied `tool_result`, else the denial text inside it (`"Permission for this action was denied"`). Structural where the marker is present; a low-confidence heuristic where it is not — see note below |
 | Compaction | `system` `subtype == compact_boundary` |
 
 These map to configuration surfaces (`surfaces.md`): a `Skill` invocation to a
@@ -114,8 +114,31 @@ no discrete invocation in the transcript — they are injected context, not
 events. They appear in the catalog (`config-format.md`) but acquire no events;
 `surfaces.md` classifies surface kinds as usage-measurable vs catalog-only so the
 join does not mistake "no event possible" for "unused". The permission-denial
-signal above is the one heuristically-extracted (not structured) signal, and is
-flagged as lower-confidence wherever it is used.
+signal above is the one partly heuristic signal, and is flagged as
+lower-confidence wherever it is used.
+
+### Why a denial is read from its marker, not its words
+
+A denied call carries `toolDenialKind` — `permission-rule`, `user-rejected`,
+`automode-blocked` — on the entry, one level above the `tool_result` block it
+explains. Reading it is not an optimization but the only reliable route: the text
+below a hook denial is written by the **user's own hook**, so its wording and its
+*language* are arbitrary, and no keyword list can converge on it. The marker is
+upstream's fixed vocabulary, so it classifies a denial identically whatever the
+hook chose to say. `permission-rule` and `automode-blocked` are blocks the user's
+config could relax; `user-rejected` is the user answering no.
+
+The field is optional in both directions: older transcripts predate it, and not
+every refusal carries one (a built-in guard may simply return an error). An
+unrecognised kind falls through to the text classifier rather than overriding it,
+so a kind added upstream degrades to today's behavior instead of erasing it.
+
+The marker is scoped to the **entry**, not to a block, so it is only attributed
+when the entry holds exactly one failed `tool_result` — every transcript observed
+writes one per entry. Were upstream to batch several, a shared marker could not
+say which of them it denied, so it is dropped and the text classifier decides for
+all. Both fallbacks follow the same rule: where the marker cannot be attributed
+with certainty, it does not get to assert anything.
 
 ### Skill invocation has two distinct paths
 

@@ -1269,7 +1269,8 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
     };
     render(&headers, &aligns, &rows, format);
     note(&format!(
-        "{total} tool failures (categories are lexical heuristics)"
+        "{total} tool failures (denials from the transcript's own marker where present; \
+         everything else is a lexical heuristic)"
     ));
     Ok(())
 }

@@ -36,6 +36,11 @@ struct Raw {
     is_meta: Option<bool>,
     #[serde(rename = "promptId")]
     prompt_id: Option<String>,
+    /// Why a denied tool call was denied. Sits on the entry, one level above the
+    /// `tool_result` block it explains, and only recent Claude Code versions
+    /// write it — hence optional.
+    #[serde(rename = "toolDenialKind")]
+    denial_kind: Option<String>,
     message: Option<RawMessage>,
     /// Top-level content (system `local_command` records carry it here rather
     /// than under `message`).
@@ -214,8 +219,9 @@ pub struct ToolError {
 
 /// Extract failed tool results from a transcript — the raw material for friction
 /// analysis. A tool result is a failure when it is flagged `is_error` or carries
-/// a `tool_use_error` wrapper; its text is classified into a recurring category
-/// (`core::friction`). Two details ride along so a report is actionable without
+/// a `tool_use_error` wrapper. A denied call is categorised from the entry's
+/// `toolDenialKind` marker (see `denial_category`) and everything else from its
+/// text (`core::friction`). Two details ride along so a report is actionable without
 /// re-reading the transcript: a cleaned, truncated **excerpt** (the actual
 /// failing path/file), and the originating **tool** — recovered by threading the
 /// `tool_use` → `tool_result` link (the result's `tool_use_id` matches the
@@ -266,39 +272,90 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
                 else {
                     continue;
                 };
-                for block in blocks {
-                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
-                        continue;
-                    }
+                // Collected once: the marker needs their count, the loop needs
+                // the blocks themselves.
+                let failed: Vec<&Value> = blocks
+                    .iter()
+                    .filter(|block| is_failed_result(block))
+                    .collect();
+                // The marker sits on the entry and names no block, so it can only
+                // be attributed when the entry holds a single failure. Every
+                // transcript seen writes exactly one `tool_result` per entry;
+                // were upstream ever to batch several, a shared marker would not
+                // say which of them it denied, so the text decides for all.
+                let denial = raw
+                    .denial_kind
+                    .as_deref()
+                    .and_then(denial_category)
+                    .filter(|_| failed.len() == 1);
+                for block in failed {
                     let content_value = block.get("content");
                     // Classify on the JSON form (substring heuristics); excerpt
                     // from the human-readable text.
                     let content = content_value.map(|v| v.to_string()).unwrap_or_default();
-                    let is_error = block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
-                        || content.contains("tool_use_error");
-                    if is_error {
-                        let call = block
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|id| tool_calls.get(id));
-                        let (tool, target) = match call {
-                            Some((name, target)) => (name.clone(), target.clone()),
-                            None => ("unknown".to_string(), String::new()),
-                        };
-                        errors.push(ToolError {
-                            epoch_ms: ts,
-                            category: classify_error(&content),
-                            excerpt: content_value.map(error_excerpt).unwrap_or_default(),
-                            tool,
-                            target,
-                        });
-                    }
+                    let call = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|id| tool_calls.get(id));
+                    let (tool, target) = match call {
+                        Some((name, target)) => (name.clone(), target.clone()),
+                        None => ("unknown".to_string(), String::new()),
+                    };
+                    errors.push(ToolError {
+                        epoch_ms: ts,
+                        category: denial.unwrap_or_else(|| classify_error(&content)),
+                        excerpt: content_value.map(error_excerpt).unwrap_or_default(),
+                        tool,
+                        target,
+                    });
                 }
             }
             _ => {}
         }
     }
     errors
+}
+
+/// Whether a content block is a **failed** `tool_result`: flagged `is_error`, or
+/// wrapping a `tool_use_error`.
+fn is_failed_result(block: &Value) -> bool {
+    block.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+        && (block.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+            || block.get("content").is_some_and(wraps_tool_use_error))
+}
+
+/// Whether a tool-result `content` carries the `tool_use_error` wrapper. Plain
+/// string content — the common shape, and the one every wrapper uses — is
+/// searched in place; only the array and object forms pay for a serialized copy.
+/// This runs over every tool result in every transcript, most of which succeeded
+/// and reach the substring test, so the copy is the cost worth not paying.
+fn wraps_tool_use_error(content: &Value) -> bool {
+    match content.as_str() {
+        Some(text) => text.contains("tool_use_error"),
+        None => content.to_string().contains("tool_use_error"),
+    }
+}
+
+/// The friction category a denied tool call belongs to, from the `toolDenialKind`
+/// marker Claude Code stamps on the denying entry. This is what makes denials
+/// classifiable at all: the text below a denial is written by the *user's* hook,
+/// so it carries arbitrary wording in an arbitrary language and no keyword list
+/// can converge on it — while the marker is upstream's own, fixed vocabulary.
+///
+/// `None` for a kind we do not know, so the error text still gets its say;
+/// upstream adds kinds over time and an unrecognised one must not erase what the
+/// text already reveals. Teaching this map a new kind requires bumping
+/// `ANALYZER_VERSION` (`store.rs`), or already-ingested sessions keep their old
+/// categories forever (`docs/specs/storage.md`).
+fn denial_category(kind: &str) -> Option<ErrorCategory> {
+    match kind {
+        // Refused by a permission rule, a PreToolUse hook, or auto mode's
+        // classifier — all config the user owns and can relax.
+        "permission-rule" | "automode-blocked" => Some(ErrorCategory::BlockedByHook),
+        // The user answered no at the prompt: a stop, not a code fault.
+        "user-rejected" => Some(ErrorCategory::Cancelled),
+        _ => None,
+    }
 }
 
 /// The subject of a tool call, from its `input`: the file it touched or the
@@ -428,16 +485,37 @@ pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
     events
 }
 
-/// Count permission denials in a transcript — a friction signal. There is no
-/// structured record for these (`docs/specs/session-format.md`); they appear as
-/// denial text inside a tool-result, so this is a lower-confidence heuristic:
-/// the marker phrase within a `tool_result` line.
+/// Count the denials an allow rule could have prevented — the friction signal
+/// behind the `permission` surface. A denying entry states its own reason, so
+/// counting is structural wherever that marker is present; a user's own "no" is
+/// excluded, since no rule change would have avoided it. Older transcripts carry
+/// no marker, so the English denial phrase remains as a fallback — that part is
+/// still a lower-confidence heuristic (`docs/specs/session-format.md`).
 pub fn count_permission_denials(jsonl: &str) -> usize {
+    jsonl.lines().filter(|line| is_rule_denial(line)).count()
+}
+
+/// Whether one raw entry is a denial an allow rule could have prevented.
+fn is_rule_denial(line: &str) -> bool {
     const MARKER: &str = "Permission for this action was denied";
-    jsonl
-        .lines()
-        .filter(|line| line.contains("tool_result") && line.contains(MARKER))
-        .count()
+    match line_denial_kind(line).as_deref().map(denial_category) {
+        // A kind we know decides on its own — including deciding *against*, as a
+        // user's own "no" does.
+        Some(Some(category)) => category == ErrorCategory::BlockedByHook,
+        // No marker, or one we do not recognise: let the text speak.
+        _ => line.contains("tool_result") && line.contains(MARKER),
+    }
+}
+
+/// The denial marker on one raw entry, parsed only for lines that mention it so
+/// the common case stays a substring check.
+fn line_denial_kind(line: &str) -> Option<String> {
+    if !line.contains("toolDenialKind") {
+        return None;
+    }
+    serde_json::from_str::<Raw>(line)
+        .ok()
+        .and_then(|raw| raw.denial_kind)
 }
 
 /// The working directory a session started in — the project root. Records carry
@@ -749,6 +827,79 @@ mod tests {
         let errors = extract_tool_errors(jsonl);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].tool, "unknown");
+    }
+
+    #[test]
+    fn a_marked_denial_is_classified_by_its_kind_not_its_wording() {
+        // The text is hook-authored, so it can be in any language and match no
+        // keyword; the entry-level denial marker classifies it regardless.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","toolDenialKind":"permission-rule","#,
+            r#""message":{"content":[{"type":"tool_result","is_error":true,"content":"この操作は許可されていません"}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::BlockedByHook);
+    }
+
+    #[test]
+    fn a_marker_is_not_spread_across_several_failures_in_one_entry() {
+        // The marker names no block, so with more than one failure it cannot say
+        // which one it denied — the text decides for all of them.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","toolDenialKind":"permission-rule","message":{"content":["#,
+            r#"{"type":"tool_result","is_error":true,"content":"この操作は許可されていません"},"#,
+            r#"{"type":"tool_result","is_error":true,"content":"File does not exist: /tmp/example/foo.rs"}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].category, ErrorCategory::Other);
+        assert_eq!(errors[1].category, ErrorCategory::PathNotFound);
+    }
+
+    #[test]
+    fn a_user_rejection_is_cancelled_not_a_blocked_call() {
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","toolDenialKind":"user-rejected","#,
+            r#""message":{"content":[{"type":"tool_result","is_error":true,"content":"やめておいて"}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::Cancelled);
+    }
+
+    #[test]
+    fn an_unknown_denial_kind_falls_back_to_the_error_text() {
+        // Upstream may add kinds; an unrecognised one must not swallow what the
+        // text already tells us.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","toolDenialKind":"some-future-kind","#,
+            r#""message":{"content":[{"type":"tool_result","is_error":true,"content":"File does not exist: /tmp/example/foo.rs"}]}}"#,
+        );
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, ErrorCategory::PathNotFound);
+    }
+
+    #[test]
+    fn permission_denials_are_counted_by_marker_and_by_text() {
+        let jsonl = concat!(
+            // Marked, and in a language no keyword list reaches.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","toolDenialKind":"permission-rule","message":{"content":[{"type":"tool_result","is_error":true,"content":"この操作は許可されていません"}]}}"#,
+            "\n",
+            // Marked and phrased in English — counted once, not twice.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","toolDenialKind":"permission-rule","message":{"content":[{"type":"tool_result","is_error":true,"content":"Permission for this action was denied"}]}}"#,
+            "\n",
+            // A user saying no is not a rule the user could relax.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","toolDenialKind":"user-rejected","message":{"content":[{"type":"tool_result","is_error":true,"content":"やめておいて"}]}}"#,
+            "\n",
+            // Unmarked (older transcript): the text heuristic still finds it.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":[{"type":"tool_result","content":"Permission for this action was denied by the user"}]}}"#,
+            "\n",
+            // A kind from a future release: the text still gets its say.
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04.000Z","toolDenialKind":"some-future-kind","message":{"content":[{"type":"tool_result","is_error":true,"content":"Permission for this action was denied"}]}}"#,
+        );
+        assert_eq!(count_permission_denials(jsonl), 4);
     }
 
     #[test]

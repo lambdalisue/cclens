@@ -144,6 +144,8 @@ pub fn classify_error(text: &str) -> ErrorCategory {
     let has = |needle: &str| lower.contains(needle);
 
     if has("string to replace not found")
+        || has("matches of the string to replace")
+        || has("old_string and new_string are exactly the same")
         || has("has not been read")
         || has("has been modified")
         || has("file has not been read yet")
@@ -200,6 +202,20 @@ mod tests {
         );
         assert_eq!(
             classify_error("File has been modified since read, either by the user"),
+            ErrorCategory::EditPrecondition
+        );
+    }
+
+    #[test]
+    fn edit_preconditions_beyond_a_missing_string() {
+        // Both texts are emitted verbatim by the Edit tool, so matching them is
+        // precise rather than a guess at free-form wording.
+        assert_eq!(
+            classify_error("Found 2 matches of the string to replace, but replace_all is false"),
+            ErrorCategory::EditPrecondition
+        );
+        assert_eq!(
+            classify_error("No changes to make: old_string and new_string are exactly the same."),
             ErrorCategory::EditPrecondition
         );
     }

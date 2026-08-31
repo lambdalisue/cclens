@@ -69,9 +69,10 @@ CREATE TABLE ingested_files (
     size  INTEGER NOT NULL
 );
 
--- Analyze-run metadata: analyzed_at (RFC3339 UTC), projects_dir, config_dir.
--- Freshness reporting reads analyzed_at; auto-analyze on read commands re-runs
--- the analysis against the same recorded roots (cli.md).
+-- Analyze-run metadata: analyzed_at (RFC3339 UTC), projects_dir, config_dir,
+-- analyzer_version. Freshness reporting reads analyzed_at; auto-analyze on read
+-- commands re-runs the analysis against the same recorded roots (cli.md);
+-- analyzer_version invalidates the incremental skip (below).
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -241,13 +242,23 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
   current — `surfaces.md`.)
 
 The fingerprint is keyed on the *file*, not on what cclens knew how to extract
-from it, so a store built by an older cclens keeps skipping transcripts that have
-since stopped changing — a closed session never re-ingests, so any event kind
-added after it was written stays missing for that session, and any field added
-after it stays NULL. There is no ingest-level invalidation.
+from it. On its own that skip never expires: a session that has closed will never
+change again, so its rows would stay pinned to whatever the cclens that first read
+them understood — an event kind added later stays missing for that session, a
+field added later stays NULL, and a classifier that learned a new pattern never
+reaches it.
 
-The contract is that a reader **reports the gap or drops the row**, never
-substitutes something plausible:
+`meta.analyzer_version` is the invalidation. It names the **analysis semantics**
+the stored rows were produced by; a run whose version differs from the store's
+ignores the fingerprint skip, re-ingests every transcript once (replace, per
+above, so this is safe to repeat), and stamps the new value. Bump it whenever
+extraction or classification changes what an *unchanged* transcript yields. It is
+deliberately not the crate version — a release that changes no analysis should not
+cost every user a full re-analyze.
+
+Invalidation only recovers what the transcript actually holds. Where a signal was
+never recorded at all, the contract remains that a reader **reports the gap or
+drops the row**, never substitutes something plausible:
 
 - `overhead` reports the always-on floor as unavailable when no `session_start`
   was observed, rather than falling back to a skill span's `ctx_start`
@@ -256,9 +267,9 @@ substitutes something plausible:
   falling back to the basename in `surface_id` (`events.md`).
 
 Both fallbacks would have looked like working output while silently restoring the
-bug the field exists to prevent, which is worse than an empty report. An empty or
-unavailable result names a gap in what was extracted at the time — the transcript
-it came from may be gone, so re-analysis cannot always close it.
+bug the field exists to prevent, which is worse than an empty report. Such a
+result is a fact about the input: re-analyzing will not conjure a signal the
+transcript never recorded, and the transcript it came from may be gone entirely.
 
 `(mtime, size)` is a cheap change detector, not a content hash; a touch that
 changes mtime without changing bytes triggers a harmless idempotent replace, and

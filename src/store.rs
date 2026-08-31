@@ -15,6 +15,16 @@ use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
 
+/// The `meta` key holding the analysis semantics a store's rows were built with.
+const ANALYZER_META_KEY: &str = "analyzer_version";
+
+/// The analysis semantics this build produces. **Bump it whenever extraction or
+/// classification changes what an unchanged transcript yields** — that is the
+/// only way rows behind the incremental-ingest skip get rebuilt. It is not the
+/// crate version: a release that changes no analysis should not force everyone
+/// through a full re-analyze.
+const ANALYZER_VERSION: &str = "1";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
@@ -60,7 +70,8 @@ CREATE TABLE IF NOT EXISTS surfaces (
     PRIMARY KEY (kind, id, scope, project)
 );
 -- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
--- commands can report freshness and re-run the analysis with the same roots.
+-- commands can report freshness and re-run the analysis with the same roots,
+-- plus analyzer_version, which invalidates the ingest fingerprints above.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -748,6 +759,23 @@ impl Store {
             (key, value),
         )?;
         Ok(())
+    }
+
+    /// Whether the store's rows were produced by the current analysis semantics.
+    /// The `(mtime, size)` skip below never expires, so an improved extractor or
+    /// classifier would otherwise leave a transcript that never changes stamped
+    /// with its old results forever; a mismatch here tells `analyze` to re-ingest
+    /// everything once (`docs/specs/storage.md`). "Everything" means every
+    /// transcript still on disk — rows whose source file is gone can never be
+    /// re-derived, so they stay as last extracted.
+    pub fn is_analyzer_current(&self) -> Result<bool> {
+        Ok(self.meta(ANALYZER_META_KEY)?.as_deref() == Some(ANALYZER_VERSION))
+    }
+
+    /// Stamp the store with the analysis semantics its rows were produced by.
+    /// Call once a full analyze run has completed.
+    pub fn record_analyzer_version(&mut self) -> Result<()> {
+        self.set_meta(ANALYZER_META_KEY, ANALYZER_VERSION)
     }
 
     /// Whether a source file's `(mtime, size)` matches its recorded ingest
@@ -1767,6 +1795,18 @@ mod tests {
         // A new fingerprint supersedes the old one.
         store.record_ingested_file("/tmp/a.jsonl", 101, 6).unwrap();
         assert!(store.is_ingested("/tmp/a.jsonl", 101, 6).unwrap());
+    }
+
+    #[test]
+    fn a_store_is_stale_until_stamped_with_the_current_analyzer() {
+        let mut store = Store::in_memory().unwrap();
+        // A store written by an older analyzer (or none at all) is stale, so
+        // `analyze` re-ingests even the transcripts whose fingerprint matches.
+        assert!(!store.is_analyzer_current().unwrap());
+        store.set_meta(ANALYZER_META_KEY, "0").unwrap();
+        assert!(!store.is_analyzer_current().unwrap());
+        store.record_analyzer_version().unwrap();
+        assert!(store.is_analyzer_current().unwrap());
     }
 
     #[test]

@@ -1504,6 +1504,11 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let projects = projects.map(Ok).unwrap_or_else(default_projects_dir)?;
     let mut store = Store::open(db).context("open store")?;
 
+    // Rows produced by older analysis semantics are rebuilt once: the
+    // fingerprint skip below would otherwise pin them forever, because the
+    // transcripts they came from will never change again.
+    let reuse_ingested = store.is_analyzer_current()?;
+
     let mut sessions = 0;
     let mut skipped = 0;
     let mut spans_total = 0;
@@ -1515,7 +1520,8 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
         // is guaranteed a mismatch — and a re-ingest — next run
         // (`docs/specs/storage.md`).
         let fingerprint = file_fingerprint(&transcript);
-        if let Some((mtime, size)) = fingerprint
+        if reuse_ingested
+            && let Some((mtime, size)) = fingerprint
             && store.is_ingested(&path_str, mtime, size)?
         {
             skipped += 1;
@@ -1587,6 +1593,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
 
+    store.record_analyzer_version()?;
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;
     store.set_meta("projects_dir", &projects.display().to_string())?;
     store.set_meta("config_dir", &config_dir.display().to_string())?;

@@ -37,10 +37,10 @@ jobs:
           # image, which is on its way out. `cc` passes `-arch x86_64` for this
           # triple, which is all bundled SQLite needs.
           - { target: x86_64-apple-darwin, os: macos-latest }
-          # No Windows targets. `~/.claude` is resolved through the HOME
-          # environment variable, which Windows does not set, so every default
-          # invocation would fail before it found a transcript. Shipping a
-          # binary that cannot start is worse than shipping none.
+          # No Windows targets. The crate builds and runs on Windows, but
+          # nothing here would deliver the result: there is no tap to point at
+          # it, the archive step assumes tar, and no one has asked for a
+          # binary. Until one of those changes, Windows users build from source.
     # The tag reaches the steps through the environment rather than being
     # interpolated into a script, so its text can never be read as shell.
     env:

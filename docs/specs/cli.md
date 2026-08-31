@@ -222,10 +222,14 @@ what stops the seeded session from re-deriving what `analyze` already computed.
 
 **The briefing is never passed on argv.** It holds concrete paths and error
 excerpts that may be sensitive, and a process argument is world-visible (`ps`).
-So the launch writes the briefing to a private (`0600`) temp file and passes
-`claude` only a data-free pointer prompt (the prescribed instructions plus "read
-this file"); the file is removed the instant the session ends, whatever the
-outcome. `--print` is the exception — it writes the full prompt (briefing inline)
+So the launch writes the briefing to a private temp file and passes `claude`
+only a data-free pointer prompt (the prescribed instructions plus "read this
+file"); the file is removed the instant the session ends, whatever the outcome.
+Private means **created exclusively** first and `0600` second: the temp dir is
+shared, so a same-user process that pre-creates the path as a symlink would
+capture the briefing no matter what mode was set afterwards. Where there is no
+mode to set (Windows), the per-user temp directory carries the guarantee
+instead. `--print` is the exception — it writes the full prompt (briefing inline)
 to stdout for piping / inspection, where the user has opted into seeing it.
 
 The split mirrors the rest of the tool: prompt composition is a pure transform

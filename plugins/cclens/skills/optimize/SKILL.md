@@ -20,7 +20,7 @@ advisor prompt. This skill runs the same analysis but adopts that prompt in the
   per-user store so no file is dropped into the current project:
 
   ```sh
-  DB="${XDG_CACHE_HOME:-$HOME/.cache}/cclens/cclens.db"
+  DB="${XDG_STATE_HOME:-$HOME/.local/state}/cclens/cclens.db"
   mkdir -p "$(dirname "$DB")"
   ```
 

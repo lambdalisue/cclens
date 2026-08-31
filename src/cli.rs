@@ -55,9 +55,9 @@ enum Command {
         /// Output format: table | json (the run's counters).
         #[arg(long)]
         format: Option<String>,
-        /// Output store path.
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// How often each skill ran and what it cost — per skill, or over time
     /// with --by.
@@ -71,8 +71,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Everything installed in your config (skills, rules, agents, MCP
     /// servers, CLAUDE.md), what it weighs, and whether it was ever used.
@@ -87,8 +88,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Cleanup opportunities: config that is never used, loaded every session
     /// while heavy, or rarely worth its cost — ranked by what removing it
@@ -104,8 +106,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// What every session pays in context before any work starts, and how
     /// much of that comes from your own config files vs Claude Code itself.
@@ -116,8 +119,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// How you steer Claude: the mix of instructing, steering ("go ahead"),
     /// correcting ("no, instead…"), and questioning prompts — and what that
@@ -129,8 +133,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Tool calls that kept failing the same way — recurring failures that
     /// waste turns and tokens, each with a suggested fix.
@@ -146,8 +151,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Files Claude kept re-editing in rapid bursts — where it got stuck
     /// retrying instead of making progress.
@@ -158,8 +164,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// The health check — what to fix first, what your sessions cost, and
     /// what is fine as-is. Start here.
@@ -174,8 +181,9 @@ enum Command {
         /// Read the store as-is; skip the automatic refresh.
         #[arg(long)]
         frozen: bool,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Ask anything the fixed reports don't cover: run a read-only SQL query
     /// against the analyzed store (as an argument, or piped via stdin).
@@ -186,8 +194,9 @@ enum Command {
         /// Output format: table | markdown.
         #[arg(long)]
         format: Option<String>,
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Act on the findings: opens an interactive `claude` session pre-loaded
     /// with the full analysis, which investigates each problem and proposes
@@ -196,9 +205,10 @@ enum Command {
         /// Transcript root (default: ~/.claude/projects).
         #[arg(long)]
         projects: Option<PathBuf>,
-        /// Store to analyze into / read from.
-        #[arg(long, default_value = "cclens.db")]
-        db: PathBuf,
+        /// Store to analyze into / read from (default:
+        /// $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
         /// Optimize one config layer only: global (~/.claude) | project |
         /// project:<slug>.
         #[arg(long)]
@@ -218,13 +228,18 @@ pub fn run() -> Result<()> {
             projects,
             format,
             db,
-        } => analyze(projects, parse_format(format.as_deref())?, &db),
+        } => analyze(projects, parse_format(format.as_deref())?, &resolve_db(db)?),
         Command::Usage {
             by,
             format,
             frozen,
             db,
-        } => usage(by.as_deref(), parse_format(format.as_deref())?, frozen, &db),
+        } => usage(
+            by.as_deref(),
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db)?,
+        ),
         Command::Inventory {
             scope,
             format,
@@ -234,7 +249,7 @@ pub fn run() -> Result<()> {
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &db,
+            &resolve_db(db)?,
         ),
         Command::Waste {
             scope,
@@ -245,13 +260,13 @@ pub fn run() -> Result<()> {
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &db,
+            &resolve_db(db)?,
         ),
         Command::Overhead { format, frozen, db } => {
-            overhead(parse_format(format.as_deref())?, frozen, &db)
+            overhead(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
         }
         Command::Prompts { format, frozen, db } => {
-            prompts(parse_format(format.as_deref())?, frozen, &db)
+            prompts(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
         }
         Command::Failures {
             scope,
@@ -262,10 +277,10 @@ pub fn run() -> Result<()> {
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &db,
+            &resolve_db(db)?,
         ),
         Command::Stuck { format, frozen, db } => {
-            stuck(parse_format(format.as_deref())?, frozen, &db)
+            stuck(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
         }
         Command::Doctor {
             scope,
@@ -276,11 +291,13 @@ pub fn run() -> Result<()> {
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
-            &db,
+            &resolve_db(db)?,
         ),
-        Command::Sql { query, format, db } => {
-            sql(query.as_deref(), parse_format(format.as_deref())?, &db)
-        }
+        Command::Sql { query, format, db } => sql(
+            query.as_deref(),
+            parse_format(format.as_deref())?,
+            &resolve_db(db)?,
+        ),
         Command::Optimize {
             projects,
             db,
@@ -289,7 +306,7 @@ pub fn run() -> Result<()> {
             print,
         } => optimize(
             projects,
-            &db,
+            &resolve_db(db)?,
             &parse_scope(scope.as_deref())?,
             frozen,
             print,
@@ -2472,6 +2489,50 @@ fn claude_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude"))
 }
 
+/// Resolve `--db`, defaulting to a **user-level** store rather than a
+/// cwd-relative file. What gets analyzed is every transcript under
+/// `~/.claude/projects` — one cross-project dataset — so a per-directory
+/// default would build a separate copy of the same store per directory cclens
+/// happens to run from, and leave a database inside unrelated Git working
+/// trees.
+///
+/// State, not cache. The store accumulates rows whose source transcripts Claude
+/// Code later prunes, at which point it is the only surviving record of those
+/// sessions and nothing on disk can rebuild it (`storage.md`). A cache
+/// directory is by definition somewhere a cleaner may empty without asking —
+/// exactly the one thing this file cannot survive.
+///
+/// Pure over its inputs (the environment is read by the caller) so the
+/// resolution is testable.
+fn store_path(
+    db: Option<PathBuf>,
+    state_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(db) = db {
+        return Ok(db);
+    }
+    // Both roots must be absolute, for the same reason: honoring a relative one
+    // would reintroduce the cwd-relative store this default exists to avoid.
+    // (For `XDG_STATE_HOME` the XDG spec says as much — a non-absolute value is
+    // invalid and must be ignored.)
+    let base = match state_home.filter(|dir| dir.is_absolute()) {
+        Some(dir) => dir.to_path_buf(),
+        None => home
+            .filter(|dir| dir.is_absolute())
+            .context("HOME is not set to an absolute path")?
+            .join(".local")
+            .join("state"),
+    };
+    Ok(base.join("cclens").join("cclens.db"))
+}
+
+/// `store_path` against the live environment.
+fn resolve_db(db: Option<PathBuf>) -> Result<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    store_path(db, state_home.as_deref(), home_dir().map(Path::new))
+}
+
 /// Column alignment for the table renderer.
 #[derive(Clone, Copy)]
 enum Align {
@@ -2801,5 +2862,58 @@ mod tests {
         let suggestion = savings_suggestion(Wedge::Unused, StartupSavings::Declutter, Some(1015));
         assert!(suggestion.contains("1015 tok when invoked"));
         assert!(suggestion.contains("declutter only"));
+    }
+
+    #[test]
+    fn store_path_defaults_under_the_user_state_dir() {
+        assert_eq!(
+            store_path(None, Some(Path::new("/tmp/example/state")), None).unwrap(),
+            PathBuf::from("/tmp/example/state/cclens/cclens.db")
+        );
+        assert_eq!(
+            store_path(None, None, Some(Path::new("/tmp/example/home"))).unwrap(),
+            PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+        );
+    }
+
+    #[test]
+    fn store_path_ignores_a_relative_xdg_state_home() {
+        // XDG: a non-absolute XDG_STATE_HOME is invalid and must be ignored —
+        // honoring it would put the store back under the current directory.
+        assert_eq!(
+            store_path(
+                None,
+                Some(Path::new("relative/state")),
+                Some(Path::new("/tmp/example/home"))
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/example/home/.local/state/cclens/cclens.db")
+        );
+    }
+
+    #[test]
+    fn store_path_without_a_home_is_an_error() {
+        assert!(store_path(None, None, None).is_err());
+    }
+
+    #[test]
+    fn store_path_refuses_a_relative_home() {
+        // The fallback root is held to the same bar as XDG_STATE_HOME: a
+        // relative one would put the store back under the current directory.
+        assert!(store_path(None, None, Some(Path::new("relative/home"))).is_err());
+    }
+
+    #[test]
+    fn store_path_takes_an_explicit_db_as_is() {
+        // The escape hatch for a deliberately project-local store.
+        assert_eq!(
+            store_path(
+                Some(PathBuf::from("./cclens.db")),
+                Some(Path::new("/tmp/example/state")),
+                Some(Path::new("/tmp/example/home"))
+            )
+            .unwrap(),
+            PathBuf::from("./cclens.db")
+        );
     }
 }

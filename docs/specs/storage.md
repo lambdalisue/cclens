@@ -61,7 +61,6 @@ CREATE TABLE events (
 );
 
 CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
-CREATE INDEX events_by_time    ON events(started_epoch);
 
 -- Incremental-ingest fingerprints.
 CREATE TABLE ingested_files (
@@ -158,6 +157,74 @@ worktree recorded on Windows folds by `project` while `root` stays split, and
 per-root config scanning (`config-format.md`) sees two roots where there is one
 checkout.
 
+## Schema evolution is non-destructive
+
+The store outlives its inputs. Claude Code prunes transcripts on its own
+retention schedule, and once a transcript is gone the rows extracted from it are
+the only surviving record of that session — nothing on disk can rebuild them.
+So an upgrade may never resolve schema drift by asking for the file to be
+deleted; `Store::open` migrates in place instead (`migrate` in `store.rs`).
+
+The declared schema is the single source of truth for the target shape: it is
+applied to a scratch in-memory database and read back through
+`PRAGMA table_info`, and the live store is reconciled against that. Adding a
+column to the declaration is therefore the whole of a routine migration — there
+is no parallel list of ALTER statements to keep in step, which is what made the
+previous "detect a missing column, refuse the file" check drift into a
+delete-and-lose-history instruction.
+
+Drift is reconciled per object by what that object costs to lose:
+
+- `sessions`, `events`, `ingested_files`, `meta` hold history, so a missing
+  column is appended with `ALTER TABLE ADD COLUMN`. Existing rows take the
+  column's default, which the "report the gap, never substitute" contract below
+  already covers. A column that is already present is **compared, not skipped** —
+  matching on name alone would pass silently over a retype or a changed default,
+  leaving the store permanently diverged from the declaration it is meant to
+  converge on.
+- `surfaces` is a snapshot of live config rebuilt on every analyze, so a shape
+  change drops and recreates it. The shape is compared first — an unchanged
+  catalog must survive reopening, or a `--frozen` read would report an empty one.
+  When it *is* rebuilt, `analyzed_at` is cleared, so a `--frozen` read is routed
+  to the freshness warning instead of printing an ordinary header over an empty
+  catalog.
+- Indexes and views carry no data, so a drifted one is simply dropped and
+  recreated. Only a *drifted* one: `CREATE INDEX / VIEW IF NOT EXISTS` would keep
+  a stale definition — a reader would then silently query yesterday's column
+  mapping — but reindexing `events` on every open is not free either, so the
+  stored `CREATE` statement is compared against the declared one and matched
+  objects are left untouched. Objects the declaration does not name are also left
+  untouched: the store is meant to be explored with ad-hoc SQL, so a helper view
+  someone saved into the file is theirs to keep.
+
+Indexes and views are **declared apart from the tables**, in their own constants,
+and applied only after column reconciliation. Declared alongside the table they
+would be replayed by the same `execute_batch` that creates missing tables, before
+any column was added — so an index over a column a future release introduces
+would hit `no such column` on a legacy store and take the whole migration down,
+which is the destructive refusal this design exists to remove. Deriving the names
+to reconcile from the declaration is also what removes a hand-kept list: such a
+list drifts, and a declared object missing from it would collide with its own
+`CREATE` on the store's second open.
+
+The whole migration runs in one transaction, as every other multi-statement write
+here does: reconciliation can bail partway through, and a store left
+half-migrated is the outcome in-place upgrading exists to avoid.
+
+`PRAGMA user_version` carries `SCHEMA_VERSION`. Reconciliation only ever adds, so
+routine additive changes do not bump it; it exists to catch what reconciliation
+cannot express. A store stamped **newer** than this build is refused rather than
+written to — this build's shape would overwrite changes it does not understand,
+in a file the newer binary still reads correctly. The version is also the seam
+for a future change that reconciliation cannot cover (a column removed, retyped,
+or given a new meaning). Reconciliation now *fails* on such drift rather than
+ignoring it, so the seam cannot be skipped by accident; the migration written to
+fill it must state what it discards, because the answer is no longer "nothing".
+
+`Store::open_readonly` (the `sql` command) cannot migrate. An ad-hoc query
+against a store older than this build surfaces SQLite's own missing-column
+error; any read command opens read-write and migrates first.
+
 ## Incremental ingest
 
 Transcripts are append-only and **active sessions keep growing**, so re-running
@@ -177,7 +244,7 @@ The fingerprint is keyed on the *file*, not on what cclens knew how to extract
 from it, so a store built by an older cclens keeps skipping transcripts that have
 since stopped changing — a closed session never re-ingests, so any event kind
 added after it was written stays missing for that session, and any field added
-after it stays NULL. There is no schema version and no invalidation.
+after it stays NULL. There is no ingest-level invalidation.
 
 The contract is that a reader **reports the gap or drops the row**, never
 substitutes something plausible:
@@ -190,7 +257,8 @@ substitutes something plausible:
 
 Both fallbacks would have looked like working output while silently restoring the
 bug the field exists to prevent, which is worse than an empty report. An empty or
-unavailable result is the signal to delete the store and re-analyze.
+unavailable result names a gap in what was extracted at the time — the transcript
+it came from may be gone, so re-analysis cannot always close it.
 
 `(mtime, size)` is a cheap change detector, not a content hash; a touch that
 changes mtime without changing bytes triggers a harmless idempotent replace, and

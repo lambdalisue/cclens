@@ -174,9 +174,11 @@ derived store.
 
 - Counts are usage signals for ranking, **not a billing ledger**; static cost is
   a token estimate, not a measured runtime figure.
-- The store is a regenerable cache. After upgrading cclens across a schema
-  change, commands refuse the old file with a hint — delete `cclens.db` (or
-  point `--db` somewhere fresh) and it is rebuilt on the next read.
+- The store outlives your transcripts. Claude Code prunes those on its own
+  retention schedule, and cclens keeps the rows it already extracted — so the db
+  holds history that `~/.claude/projects` no longer can, and deleting it is a
+  real loss, not a cache flush. Upgrading cclens across a schema change migrates
+  the file in place; you never need to delete it.
 - `optimize` launches `claude` (Claude Code) seeded with the findings; the
   briefing is written to a private temp file, never passed on the command line.
 - Not yet implemented (see [`docs/specs/`](docs/specs/)): meta-skill (`loop`)

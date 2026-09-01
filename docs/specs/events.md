@@ -18,7 +18,7 @@ identifying the configuration surface it exercises (the join key into
 | `kind` | Surface exercised | Span? |
 | --- | --- | --- |
 | `skill_invocation` | `skill` | yes — work window until the skill's activity ends |
-| `agent_spawn` | `agent` | the subagent's lifetime (cost attributed via `promptId`) |
+| `agent_spawn` | `agent` | no — point event; its cost is carried by the run it started (below) |
 | `tool_use` | `mcp_tool` / `mcp_server` / built-in tool | point event |
 | `prompt` | — (user input; raw material for skill extraction) | point event; text referenced, not stored |
 | `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model`, the call's target (file_path / command) in `target` |
@@ -178,30 +178,86 @@ the minimum across a project's sessions is what filters those out, which is why
 the session count travels with the floor in reports — one observation cannot be
 distinguished from one resumed session.
 
+## Subagent runs
+
+A **run** is one execution of one agent type, extracted from its own transcript
+plus the sidecar beside it (`session-format.md`). It is a first-class persisted
+row (`storage.md`), not an intermediate, because the session-level total answers
+only *how much* subagent work cost — never *whose*. Two agents with similar
+spawn counts can differ by an order of magnitude in output, and the spawn count
+alone cannot tell them apart; without runs, the largest figure in the report is
+the one nothing can be done about.
+
+A run carries the agent type, its own output tokens, its model, its depth in the
+spawn tree, and the ids that link it back: its own `tool_use_id`, its parent
+run, and the **root** `tool_use_id` its tree started at (`core::subagent`).
+
+- **Every run counts once, at its own cost, whatever its depth.** A nested run
+  is the agent that wrote those tokens; folding it into its parent's type would
+  bill an agent that only delegated. So the per-agent rows sum exactly to the
+  session-level total.
+- **A run whose agent type is unknown** (no sidecar) is kept, grouped under
+  "unknown". Dropping it would silently break that sum; guessing a type would
+  be worse.
+- **The root link is what crosses the boundary.** A nested run's own
+  `tool_use_id` names a call inside its *parent's* transcript, which no
+  main-thread span contains. Walking `parent_agent_id` to the tree's root gives
+  the one call the main thread actually made, so a subtree's cost lands on the
+  main-thread work that caused it. A broken chain (missing parent, or a cycle in
+  malformed input) leaves the run unrooted and unattributed rather than charged
+  to an arbitrary spawn.
+
 ## Subagent attribution
 
-A span's `sub_tokens` is the cost of subagents it spawned, joined by `promptId`
-(`session-format.md`). Because several subagents can share one `promptId` and a
-turn can contain more than one span that spawned subagents, the join is not
-always one-to-one.
+A span's `sub_tokens` is the cost of the runs it spawned. The join is tried at
+two precisions, and falls back only when it must:
 
-- A subagent is attributed to the span containing the `Agent` spawn for its
-  `promptId`. The spawning assistant record does not carry the `promptId`
-  itself, so the adapter threads the current turn's id forward and stamps it on
-  the spawn — that stamped id is what matches the subagent transcript.
-- When more than one span in the same `promptId` competes for the same
-  subagents, their tokens are **split equally** across the competing spans.
-- A subagent whose `promptId` matches no span (e.g. spawned outside any skill)
-  is not attributed per-span; it still counts in the session-level subagent
-  total, which is exact and needs no such join.
-- Any span whose `sub_tokens` includes an equally-split (not cleanly
-  attributable) subagent is marked `sub_tokens_estimated`. Equal-split is a
-  deliberate approximation — this tool ranks, it does not bill
-  (`architecture.md`) — and the flag lets reports separate exact figures from
-  estimates rather than hiding the uncertainty.
+1. **By spawn call.** A run rooted at a known `Agent` call is attributed to the
+   one span whose window contains that call. Spans do not overlap, so this
+   claims at most one span: the attribution is exact and is **never** flagged
+   estimated.
+2. **By turn.** Used **only when the run carries no call id at all** — an older
+   transcript with no sidecar. Then only `promptId` is left, and it identifies
+   the turn rather than the spawn: the run is claimed by every span that spawned
+   anything in that turn, and when more than one competes they **split its tokens
+   equally** and are each marked `sub_tokens_estimated`. A single claimant is not
+   flagged: the flag means *this figure was split*, which is what the metrics
+   table above defines it as.
 
-The worst-case error of equal-split is bounded by the spread of the competing
-subagents' sizes; the flag, not false precision, is the mitigation.
+The precisions are selected by what the run *knows*, never by whether the exact
+join happened to hit. Once a run carries a call id the turn join is never used
+for it, in either failing case:
+
+- **Its rooted call sits in no span.** The root already says which call spawned
+  it, so no span containing that call means it was spawned outside every span.
+- **Its parent chain is broken** (a missing parent, or a cycle in malformed
+  input), so it has no root. The call id still shows it was spawned by another
+  subagent rather than from the main thread.
+
+Retrying by turn in either case would charge the run to whichever unrelated span
+happened to spawn something in the same turn — the exact error the call id
+exists to prevent.
+
+A run matching no span (spawned outside any skill, or unrooted) is not
+attributed per-span; it still counts in the session-level total, which is exact
+and needs no join.
+
+Equal-split is a deliberate approximation — this tool ranks, it does not bill
+(`architecture.md`) — and its worst-case error is bounded by the spread of the
+competing runs' sizes. The flag, not false precision, is the mitigation, and it
+now marks only the runs that genuinely could not be resolved.
+
+### The spawn event carries the run's cost
+
+An `agent_spawn` event and a run describe one subagent from opposite sides: the
+event is what the main thread *did*, the run is what it *cost*. They are joined
+by the spawn call's id, so the event's `out_tokens` is the run's own output and
+its `sub_tokens` the output of everything that run spawned in turn. A spawn
+whose run is missing keeps zeros rather than borrowing another's figures.
+
+This is why the spawn stays a point event rather than growing a window: its cost
+is measured in the subagent's transcript, not inferred from main-thread records
+inside a guessed boundary.
 
 ### Per-span attribution is window-bounded, not authoritative
 
@@ -213,11 +269,17 @@ subagents spawned by *later, same-window* activity. Observed in real data: a
 that ran after the commit in the same turn. There is no transcript marker for
 "the skill returned", so this cannot be tightened structurally.
 
+Joining by the spawn call instead of the turn does not fix this: the call is
+inside the window either way, so the window is still the thing being trusted.
+What it fixes is the *other* half — a span that spawned nothing in that turn no
+longer takes a share.
+
 Therefore `events.sub_tokens` is recorded per span (queryable, and exact for
 skills that genuinely spawn their own agents) but is **not rolled up into the
 per-skill report**, where it would over-count. The authoritative subagent figure
 is the **session-level total** (`sessions.sub_tokens`), which is exact — every
-subagent transcript counted once, no window guess involved.
+subagent run counted once, no window guess involved — and the per-agent split of
+that total (`subagent_runs`) is exact for the same reason.
 
 ## Determinism
 

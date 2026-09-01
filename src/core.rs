@@ -9,6 +9,7 @@ pub mod path;
 pub mod prompt;
 pub mod scope;
 pub mod span;
+pub mod subagent;
 pub mod surface;
 pub mod thrash;
 pub mod usage;

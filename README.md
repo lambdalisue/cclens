@@ -166,9 +166,10 @@ derived store.
 - **Where the work stumbles** — recurring tool failures by category and
   originating tool (`failures`), files Claude got stuck re-editing (`stuck`),
   each with concrete examples and the project it concentrates in.
-- **Where tokens go** — main-thread skill output vs. subagent cost, and the
-  always-on context floor reconciled against your readable config (the residual
-  is system + tools + MCP you cannot trim from files).
+- **Where tokens go** — main-thread skill output vs. subagent cost, the subagent
+  half split per agent type (which agents actually spent it, nested spawns
+  included), and the always-on context floor reconciled against your readable
+  config (the residual is system + tools + MCP you cannot trim from files).
 - **How you prompt** — the steer / correct / question / instruct mix.
 
 ## Notes

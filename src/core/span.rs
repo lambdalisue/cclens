@@ -31,10 +31,12 @@ pub enum RecordKind {
         model: String,
     },
     /// A subagent spawn (the `Agent` tool) — usage of an `agent` surface. The
-    /// `prompt_id` is the spawning turn's id, the join key to the subagent's
-    /// transcript for cost attribution (`docs/specs/events.md`).
+    /// two ids are the join keys to the subagent's own transcript for cost
+    /// attribution: `tool_use_id` names this exact call, `prompt_id` only the
+    /// turn it happened in (`docs/specs/events.md`).
     AgentSpawn {
         agent: String,
+        tool_use_id: Option<String>,
         prompt_id: Option<String>,
     },
     /// A tool invocation by name — used to detect MCP tool usage.
@@ -48,6 +50,18 @@ pub enum RecordKind {
 pub struct Record {
     pub timestamp_ms: i64,
     pub kind: RecordKind,
+}
+
+/// A subagent spawn observed inside a span's window, reduced to the keys
+/// attribution joins on (`docs/specs/events.md`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnRef {
+    /// The `Agent` tool call's id: exact, so a subagent that names it lands on
+    /// exactly one span.
+    pub tool_use_id: Option<String>,
+    /// The spawning turn's id: shared by every spawn in the turn, so it can only
+    /// narrow a subagent to a set of candidate spans.
+    pub prompt_id: Option<String>,
 }
 
 /// A single extracted skill execution with its rolled-up cost metrics.
@@ -66,9 +80,9 @@ pub struct Span {
     /// sibling skill, or idle gap followed) — its `duration_sec` is a lower
     /// bound (`docs/specs/events.md`).
     pub is_trailing: bool,
-    /// Prompt ids of the subagents this span spawned — the join key for
+    /// The subagent spawns inside this span's window — the join keys for
     /// attribution; not persisted.
-    pub agent_prompt_ids: Vec<String>,
+    pub spawns: Vec<SpawnRef>,
     /// Subagent cost attributed to this span (filled by `attribute_subagents`).
     pub sub_tokens: u64,
     pub sub_agent_count: u32,
@@ -173,7 +187,7 @@ fn roll_up(
     let mut prompt_sizes = Vec::new();
     let mut out_tokens = 0;
     let mut models = Vec::new();
-    let mut agent_prompt_ids = Vec::new();
+    let mut spawns = Vec::new();
     for record in window {
         match &record.kind {
             RecordKind::Assistant {
@@ -186,9 +200,13 @@ fn roll_up(
                 models.push(model.as_str());
             }
             RecordKind::AgentSpawn {
-                prompt_id: Some(prompt_id),
+                tool_use_id,
+                prompt_id,
                 ..
-            } => agent_prompt_ids.push(prompt_id.clone()),
+            } => spawns.push(SpawnRef {
+                tool_use_id: tool_use_id.clone(),
+                prompt_id: prompt_id.clone(),
+            }),
             _ => {}
         }
     }
@@ -204,7 +222,7 @@ fn roll_up(
         ctx_peak: prompt_sizes.iter().copied().max().unwrap_or(0),
         model: representative_model(&models).map(String::from),
         is_trailing,
-        agent_prompt_ids,
+        spawns,
         sub_tokens: 0,
         sub_agent_count: 0,
         sub_tokens_estimated: false,
@@ -395,6 +413,40 @@ mod tests {
         assert_eq!(span.ctx_start, 100);
         assert_eq!(span.ctx_peak, 250);
         assert_eq!(span.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn a_span_records_both_join_keys_of_the_spawns_in_its_window() {
+        let records = [
+            at(1000, skill("code-review")),
+            at(
+                2000,
+                RecordKind::AgentSpawn {
+                    agent: "Explore".into(),
+                    tool_use_id: Some("toolu_1".into()),
+                    prompt_id: Some("p1".into()),
+                },
+            ),
+            at(3000, RecordKind::HumanTurn),
+            at(
+                4000,
+                RecordKind::AgentSpawn {
+                    agent: "Explore".into(),
+                    tool_use_id: Some("toolu_2".into()),
+                    prompt_id: Some("p2".into()),
+                },
+            ),
+        ];
+
+        let span = &extract_spans(&records, DEFAULT_IDLE_GAP_MS)[0];
+
+        assert_eq!(
+            span.spawns,
+            vec![SpawnRef {
+                tool_use_id: Some("toolu_1".into()),
+                prompt_id: Some("p1".into()),
+            }]
+        );
     }
 
     #[test]

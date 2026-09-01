@@ -37,14 +37,24 @@ jobs:
           # image, which is on its way out. `cc` passes `-arch x86_64` for this
           # triple, which is all bundled SQLite needs.
           - { target: x86_64-apple-darwin, os: macos-latest }
-          # No Windows targets. `~/.claude` is resolved through the HOME
-          # environment variable, which Windows does not set, so every default
-          # invocation would fail before it found a transcript. Shipping a
-          # binary that cannot start is worse than shipping none.
+          # Windows falls back to `USERPROFILE` when a shell leaves `HOME` unset,
+          # so the binary finds `~/.claude` and starts like it does anywhere
+          # else. Being in this matrix is also what keeps it that way: the
+          # `#[cfg(unix)]` gates compile away silently on every other target, so
+          # the next unix-only API added to the crate fails here rather than
+          # reaching a user. Both arches build natively, as Linux does — the
+          # arm64 image is free to public repositories, which this one is.
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
     # The tag reaches the steps through the environment rather than being
     # interpolated into a script, so its text can never be read as shell.
     env:
       TAG: ${{ inputs.tag }}
+    # Git Bash on the Windows runner, whose default is PowerShell — one script
+    # per step then covers every target instead of branching on the shell.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -59,11 +69,17 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # The archive name carries the tag and the triple so the Homebrew formula
-      # can address it by URL without consulting the releases API.
+      # can address it by URL without consulting the releases API. `.tar.gz` for
+      # Windows too, rather than the `.zip` that platform expects: the release
+      # job's checksum loop and the tap both address archives by that suffix, and
+      # a second format would fork both for the one target neither installs.
       - name: Package
         run: |
+          set -euo pipefail
+          bin=cclens
+          if [ "$RUNNER_OS" = Windows ]; then bin=cclens.exe; fi
           tar -C "target/${{ matrix.target }}/release" -czf \
-            "cclens-${TAG}-${{ matrix.target }}.tar.gz" cclens
+            "cclens-${TAG}-${{ matrix.target }}.tar.gz" "$bin"
 
       - uses: actions/upload-artifact@v7
         with:

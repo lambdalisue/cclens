@@ -151,6 +151,13 @@ and folding is idempotent** (folding an already-folded value is a no-op). Gettin
 this wrong splits or merges a project's usage, which is a correctness bug for
 every per-project wedge, not a presentation detail.
 
+`sessions.root` folds by the same rule one level down, on the real path rather
+than the slug. The two must agree: the slug form keys on a `--wt-` infix and is
+separator-free, so the path form accepts **either separator** — otherwise a
+worktree recorded on Windows folds by `project` while `root` stays split, and
+per-root config scanning (`config-format.md`) sees two roots where there is one
+checkout.
+
 ## Incremental ingest
 
 Transcripts are append-only and **active sessions keep growing**, so re-running

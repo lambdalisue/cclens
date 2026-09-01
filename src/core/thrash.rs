@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::core::path::basename;
+
 /// One edit to one file, with the work context that makes it comparable to
 /// another edit: the same path touched by a different session is different work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +39,7 @@ impl ThrashEpisode {
     /// The edited file's basename — what a report shows; the full `path`
     /// disambiguates when two projects share a name.
     pub fn file(&self) -> &str {
-        self.path.rsplit('/').next().unwrap_or(&self.path)
+        basename(&self.path)
     }
 }
 
@@ -156,6 +158,17 @@ mod tests {
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].edits, 3);
         assert_eq!(episodes[0].span_secs(), 50);
+        assert_eq!(episodes[0].file(), "a.rs");
+    }
+
+    #[test]
+    fn the_reported_file_is_a_basename_on_either_separator() {
+        let edits = [
+            edit(r"C:\example\p\a.rs", 0),
+            edit(r"C:\example\p\a.rs", 30),
+            edit(r"C:\example\p\a.rs", 50),
+        ];
+        let episodes = detect_thrash(&edits, 60, 3);
         assert_eq!(episodes[0].file(), "a.rs");
     }
 

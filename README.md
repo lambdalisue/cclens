@@ -37,14 +37,17 @@ just build           # release binary at target/release/cclens
 Plain Cargo also works (`cargo build --release`) if you have a recent stable
 Rust; the flake just pins it. CI runs `nix develop -c just check` / `just test`.
 
-Publishing a GitHub Release for a `vX.Y.Z` tag builds binaries for Linux and
-macOS (x86_64 and arm64 each), attaches them to that release with `.sha256`
-files, and points the
+Publishing a GitHub Release for a `vX.Y.Z` tag builds binaries for Linux, macOS,
+and Windows (x86_64 and arm64 each), attaches them to that release with
+`.sha256` files, and points the
 [`lambdalisue/homebrew-cclens`](https://github.com/lambdalisue/homebrew-cclens)
 tap at the new archives. The release is published before its assets are built,
-so the notes are visible for a few minutes with nothing attached yet. Windows is
-not supported: `~/.claude` is located through the `HOME` environment variable,
-which Windows does not set.
+so the notes are visible for a few minutes with nothing attached yet.
+
+The tap covers Linux and macOS only; on Windows, take the `-pc-windows-msvc`
+archive for your arch from the release, or build from source. `~/.claude` is
+located through `HOME`, falling back to `USERPROFILE` where Windows leaves
+`HOME` unset.
 
 ## Claude Code plugin
 

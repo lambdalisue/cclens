@@ -64,7 +64,7 @@ jobs:
           # which is the storage growth this cache cannot afford.
           cachix pin cclens "release-${{ matrix.system }}" "$out" --keep-revisions 3
 
-  # One job owns the upload so the four builds cannot race, and so the checksums
+  # One job owns the upload so the matrix builds cannot race, and so the checksums
   # are computed from exactly the bytes that get attached.
   release:
     name: attach assets
@@ -178,8 +178,8 @@ jobs:
       # Install the rendered formula before publishing it. A URL typo, a sha256
       # paired with the wrong triple, or a binary that will not start all reach
       # the tap otherwise, and users are the ones who discover it. Only the
-      # Linux x86_64 archive is downloaded and installed here; the other three
-      # are rendered by the same loop but never fetched.
+      # Linux x86_64 archive is downloaded and installed here; the other triples
+      # the formula names are rendered by the same loop but never fetched.
       - name: Verify formula
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1

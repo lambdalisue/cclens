@@ -365,23 +365,49 @@ fn optimize(
     Ok(())
 }
 
-/// Write `contents` to a uniquely-named file in the temp dir, readable only by
-/// the current user (`0600`). Used for the optimization briefing, which may hold
-/// sensitive paths/excerpts and must not sit on argv or be world-readable.
+/// Write `contents` to a fresh file in the temp dir. Used for the optimization
+/// briefing, which may hold sensitive paths/excerpts and must not sit on argv or
+/// be world-readable.
 fn write_private_tempfile(contents: &str) -> Result<PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
+    // The clock is here to avoid a collision with a leftover file, not to be
+    // unguessable — exclusive creation is what makes guessing the name useless.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
     let mut path = std::env::temp_dir();
-    path.push(format!("cclens-briefing-{}.md", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(contents.as_bytes())?;
+    path.push(format!(
+        "cclens-briefing-{}-{nanos:x}.md",
+        std::process::id()
+    ));
+    write_private_file(&path, contents)?;
     Ok(path)
+}
+
+/// Create `path` and write `contents` to it, for the current user only.
+///
+/// The temp dir is shared on unix, so the file has to be **created
+/// exclusively**: a same-user process that pre-creates the path — as a symlink
+/// to somewhere it can read — would otherwise capture the briefing, and no
+/// permission bits set afterwards would help. Losing that race now fails the
+/// open instead of following what is already there.
+///
+/// `0600` narrows it further on unix. Windows has no mode to set here; the
+/// default per-user `%LOCALAPPDATA%\Temp` is what keeps other unprivileged
+/// users out, so the guarantee there rests on the directory rather than the
+/// file. Setting an explicit ACL would mean a new dependency for a second lock
+/// on a door that is already locked.
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents.as_bytes())?;
+    Ok(())
 }
 
 /// Gather the COMPLETE analysis the optimization briefing carries — every view's
@@ -1009,14 +1035,29 @@ fn preamble(format: Format, text: &str) {
     }
 }
 
-/// Shorten an absolute path under $HOME to `~/…` for display.
+/// Shorten an absolute path under the home directory to `~/…` for display.
 fn tilde_path(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => match path.strip_prefix(&home) {
-            Some("") => "~".to_string(),
-            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-            _ => path.to_string(),
-        },
+    shorten_to_tilde(path, home_dir())
+}
+
+/// The shortening itself, separated from the environment lookup so it stays
+/// pure and testable. A separator must follow the prefix, so `/home/metadata`
+/// is not mistaken for something under `/home/me`; either separator counts, so
+/// a Windows path shortens against a Windows home.
+fn shorten_to_tilde(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_string();
+    };
+    // The two sides come from different places — `home` from the environment,
+    // `path` from the cwd a transcript recorded — so on Windows they can spell
+    // the same directory differently; the OS accepts either. Only the
+    // comparison is folded. The suffix is sliced from the original at the same
+    // offset, which stays valid because folding swaps one ASCII byte for
+    // another, so the display keeps whatever spelling the path really had.
+    let fold = |s: &str| s.replace('\\', "/");
+    match fold(path).strip_prefix(&fold(home)) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{}", &path[home.len()..]),
         _ => path.to_string(),
     }
 }
@@ -1645,11 +1686,31 @@ fn file_fingerprint(path: &Path) -> Option<(i64, i64)> {
 
 /// Fold a worktree checkout's path onto its parent repository, mirroring
 /// `normalize_project`'s slug rule at path level: `/repo/.wt/feat-x` → `/repo`.
+///
+/// Either separator delimits the segment, so a cwd recorded on Windows
+/// (`C:\repo\.wt\feat-x`) folds like a unix one. The slug rule keys on `--wt-`
+/// and is separator-free, so without this the two halves of the same
+/// normalization disagreed and a project folded by slug stayed split by root.
 fn normalize_root(cwd: &str) -> String {
-    match cwd.split_once("/.wt/") {
-        Some((parent, _)) => parent.to_string(),
-        None => cwd.to_string(),
+    const SEGMENT: &str = ".wt";
+    for (idx, _) in cwd.match_indices(SEGMENT) {
+        let has_parent = cwd[..idx].ends_with(['/', '\\']);
+        let has_child = cwd[idx + SEGMENT.len()..].starts_with(['/', '\\']);
+        if has_parent && has_child {
+            // `idx` is at least 1 here, and the separator before it is one byte.
+            let parent = &cwd[..idx - 1];
+            // Directly under a filesystem root there is no parent to fold onto:
+            // the separator *is* the root, so dropping it would turn `/.wt/x`
+            // into `""` and `C:\.wt\x` into a drive-relative `C:`. A drive
+            // prefix is exactly two bytes, which keeps an ordinary directory
+            // whose name ends in a colon out of this branch.
+            if parent.is_empty() || (parent.len() == 2 && parent.ends_with(':')) {
+                return cwd[..idx].to_string();
+            }
+            return parent.to_string();
+        }
     }
+    cwd.to_string()
 }
 
 /// The `(prompt_id, output_tokens)` of each of a session's subagent transcripts,
@@ -2195,8 +2256,39 @@ fn default_projects_dir() -> Result<PathBuf> {
     Ok(claude_home()?.join("projects"))
 }
 
+/// The user's home directory, resolved once per run.
+///
+/// `HOME` is preferred, so unix behaves exactly as before; Windows does not set
+/// it, hence `USERPROFILE`. The wrinkle is that a Windows shell like Git Bash
+/// *does* export `HOME` — as a POSIX path (`/c/Users/…`) that a native binary
+/// cannot resolve. Taking it at face value would send every lookup to a
+/// directory that does not exist and report "no transcripts" instead of an
+/// error, so on Windows a candidate has to name a real directory to win. The
+/// check stays off on unix, where a home that does not exist is worth surfacing
+/// as itself rather than silently falling through to another variable.
+fn home_dir() -> Option<&'static str> {
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        ["HOME", "USERPROFILE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .find(|value| !cfg!(windows) || Path::new(value).is_dir())
+    })
+    .as_deref()
+}
+
 fn claude_home() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
+    // What can go wrong differs by platform, so the advice does too: only
+    // Windows requires the value to name a real directory, and telling a unix
+    // user otherwise sends them looking for a problem they do not have.
+    let home = home_dir().with_context(|| {
+        if cfg!(windows) {
+            "set HOME or USERPROFILE to an existing directory"
+        } else {
+            "HOME is not set"
+        }
+    })?;
     Ok(PathBuf::from(home).join(".claude"))
 }
 
@@ -2351,6 +2443,118 @@ fn pad(text: &str, width: usize, align: Align) -> String {
 mod tests {
     use super::*;
 
+    /// A path in the temp dir that no other test uses, removed on drop so a
+    /// failure does not leak a file into the runner's temp dir.
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!("cclens-test-{}-{tag}", std::process::id()));
+            let _ = fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_private_file_refuses_a_path_that_already_exists() {
+        // The temp dir is shared, so a same-user process can pre-create the
+        // path — as a symlink to somewhere it can read. Writing the briefing
+        // into whatever is already there is the leak this prevents.
+        let path = TempPath::new("preexisting.md");
+        fs::write(&path.0, "squatted").unwrap();
+        assert!(write_private_file(&path.0, "briefing").is_err());
+        assert_eq!(fs::read_to_string(&path.0).unwrap(), "squatted");
+    }
+
+    #[test]
+    fn write_private_file_writes_the_contents_to_a_fresh_path() {
+        let path = TempPath::new("fresh.md");
+        write_private_file(&path.0, "briefing").unwrap();
+        assert_eq!(fs::read_to_string(&path.0).unwrap(), "briefing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = TempPath::new("mode.md");
+        write_private_file(&path.0, "briefing").unwrap();
+        let mode = fs::metadata(&path.0).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn shorten_to_tilde_replaces_the_home_prefix() {
+        assert_eq!(
+            shorten_to_tilde("/tmp/example/me/.claude", Some("/tmp/example/me")),
+            "~/.claude"
+        );
+        // Home itself collapses to a bare tilde.
+        assert_eq!(
+            shorten_to_tilde("/tmp/example/me", Some("/tmp/example/me")),
+            "~"
+        );
+    }
+
+    #[test]
+    fn shorten_to_tilde_accepts_a_backslash_separator() {
+        assert_eq!(
+            shorten_to_tilde(r"C:\example\me\.claude", Some(r"C:\example\me")),
+            r"~\.claude"
+        );
+    }
+
+    #[test]
+    fn shorten_to_tilde_matches_a_home_spelled_with_the_other_separator() {
+        // Windows takes either separator, and the home comes from the
+        // environment while the path comes from a recorded cwd — so the two can
+        // disagree on spelling while naming the same directory.
+        assert_eq!(
+            shorten_to_tilde("C:/example/me/.claude", Some(r"C:\example\me")),
+            "~/.claude"
+        );
+        assert_eq!(
+            shorten_to_tilde(r"C:\example\me\.claude", Some("C:/example/me")),
+            r"~\.claude"
+        );
+        // The suffix keeps the spelling the path actually had, not the folded
+        // one used for the comparison.
+        assert_eq!(
+            shorten_to_tilde(r"C:\example\me\a/b\c", Some("C:/example/me")),
+            r"~\a/b\c"
+        );
+    }
+
+    #[test]
+    fn shorten_to_tilde_leaves_a_path_outside_home_alone() {
+        assert_eq!(
+            shorten_to_tilde("/tmp/other", Some("/tmp/example/me")),
+            "/tmp/other"
+        );
+        // A sibling that merely shares the prefix is not under home.
+        assert_eq!(
+            shorten_to_tilde("/tmp/example/metadata", Some("/tmp/example/me")),
+            "/tmp/example/metadata"
+        );
+    }
+
+    #[test]
+    fn shorten_to_tilde_passes_the_path_through_without_a_home() {
+        assert_eq!(shorten_to_tilde("/tmp/example/me", None), "/tmp/example/me");
+        assert_eq!(
+            shorten_to_tilde("/tmp/example/me", Some("")),
+            "/tmp/example/me"
+        );
+    }
+
     #[test]
     fn normalize_root_folds_a_worktree_path_onto_its_repo() {
         assert_eq!(
@@ -2359,5 +2563,42 @@ mod tests {
         );
         // Idempotent: an already-folded root stays put.
         assert_eq!(normalize_root("/tmp/example/repo"), "/tmp/example/repo");
+    }
+
+    #[test]
+    fn normalize_root_folds_a_backslash_worktree_path() {
+        // A cwd recorded on Windows spells the same layout natively; leaving it
+        // unfolded splits a project whose slug already folded.
+        assert_eq!(
+            normalize_root(r"C:\example\repo\.wt\feat-x"),
+            r"C:\example\repo"
+        );
+        assert_eq!(normalize_root(r"C:\example\repo"), r"C:\example\repo");
+    }
+
+    #[test]
+    fn normalize_root_keeps_the_filesystem_root_separator() {
+        // Folding onto the root leaves the separator standing: it *is* the
+        // parent. Dropping it would hand back a relative path — `""` on unix,
+        // the drive-relative `C:` on Windows — and the root then names a
+        // different directory than the one the session ran in.
+        assert_eq!(normalize_root("/.wt/feat-x"), "/");
+        assert_eq!(normalize_root(r"C:\.wt\feat-x"), r"C:\");
+        // A directory whose name merely ends in a colon is not a drive.
+        assert_eq!(normalize_root("/tmp/odd:/.wt/feat-x"), "/tmp/odd:");
+    }
+
+    #[test]
+    fn normalize_root_leaves_a_dot_wt_that_is_not_a_segment_alone() {
+        // Only a whole `.wt` directory is a worktree parent.
+        assert_eq!(
+            normalize_root("/tmp/example/repo/x.wt/feat-x"),
+            "/tmp/example/repo/x.wt/feat-x"
+        );
+        // A trailing `.wt` names no checkout to fold onto.
+        assert_eq!(
+            normalize_root("/tmp/example/repo/.wt"),
+            "/tmp/example/repo/.wt"
+        );
     }
 }

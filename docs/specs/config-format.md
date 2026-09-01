@@ -57,6 +57,18 @@ so a tokenizer that is *close* and *consistent* is sufficient. The exact
 tokenizer is a tuning choice (see open question) injected into the weighing
 function, not hard-wired.
 
+A surface is weighed **twice**, because one number cannot answer both questions
+a reader has. `static_tokens` is the whole definition — for a skill or agent,
+what its body costs *when invoked*. `startup_tokens` is the part every session
+pays for merely having it installed: the whole text for an always-on file, the
+frontmatter `description` alone for a skill or agent, nothing for a body that
+waits (a path-conditional rule), and *unknown* for an MCP server. Only the second
+is what deleting the surface reclaims, and reporting the first as if it were the
+saving is a promise the deletion cannot keep (`surfaces.md`, "Ranking by what
+removal actually saves"). Only the description text is weighed for the startup
+half — the listing scaffolding Claude Code wraps it in is upstream's, not the
+config's, so counting it would be inventing a figure.
+
 **Static cost is a config-side estimate, not a measured runtime component.** The
 transcript exposes only a *total* prompt size, never a per-surface breakdown
 (`session-format.md`), so `static_tokens` is never validated, on its own, as the
@@ -90,11 +102,12 @@ distinction for optimization, because **always-on cost is the expensive kind**:
 | **on-demand** | `skill` / `agent` body, when invoked | Paid per use — this is what `events` measures at runtime. |
 | **tool-schema** | `mcp_tool`, built-in tools | The tool definition injected into the system/tool context. MCP schemas can be very large (the deferred-tool catalog). |
 
-So a surface records both its **full static cost** (whole definition) and its
-**load mode**, and the report distinguishes "always-on" tax from "per-use" cost.
-A skill whose body is huge but is invoked daily is a *body-trim* candidate; a
-`CLAUDE.md` that is huge is an *always-on* candidate; a rule that never fires is
-a *delete* candidate.
+So a surface records its **full static cost** (whole definition), its
+**startup cost** (the slice of that text the load mode actually injects at
+session start, per the table above), and its **load mode**, and the report
+distinguishes "always-on" tax from "per-use" cost. A skill whose body is huge but
+is invoked daily is a *body-trim* candidate; a `CLAUDE.md` that is huge is an
+*always-on* candidate; a rule that never fires is a *delete* candidate.
 
 ## The MCP tool-schema hard case
 
@@ -123,13 +136,16 @@ schema access this tool does not have.
 
 ## Frontmatter the adapter reads
 
-- `skill`: `name`, `description` (the startup-loaded text), `argument-hint`,
-  `allowed-tools`. Body length feeds the on-demand cost.
+- `skill`: `name`, `description` (the startup-loaded text — its weight *is*
+  `startup_tokens`), `argument-hint`, `allowed-tools`. Body length feeds the
+  on-demand cost. The description is read defensively: a plain or quoted scalar,
+  or a block scalar folded from its indented continuation lines; a skill
+  declaring none simply costs nothing at startup.
 - `rule`: `paths:` (the load condition) and, when present, `description:`.
   Presence of `paths:` sets the load mode to path-conditional; its absence means
   the rule is always loaded. `description:` is frequently absent on real rules —
   read it defensively, do not rely on it.
-- `agent`: `name`, `description`, `tools`, `model`.
+- `agent`: `name`, `description` (weighed like a skill's), `tools`, `model`.
 
 Parsing is defensive: unknown frontmatter keys are ignored, missing optional
 keys tolerated. A surface the adapter cannot fully parse is still catalogued

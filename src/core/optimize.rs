@@ -78,12 +78,21 @@ pub struct FrictionCat {
     pub examples: Vec<String>,
 }
 
-/// A configuration surface referenced in the config sections.
+/// A configuration surface referenced in the config sections. The two costs are
+/// kept apart because they answer different questions: `startup_tokens` is what
+/// removing the surface actually reclaims from every session, `on_demand_tokens`
+/// is what its body costs when it is invoked. Collapsing them into one figure
+/// made an unused skill's body read as a startup saving (`docs/specs/surfaces.md`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SurfaceRef {
     pub kind: String,
     pub id: String,
-    pub static_tokens: Option<i64>,
+    /// Tokens added to every session's startup context; `None` when unknown
+    /// (an MCP server's tool schema, weighable only at runtime).
+    pub startup_tokens: Option<i64>,
+    /// Tokens paid when the body is loaded; `None` for a surface with no body
+    /// beyond what startup already pays.
+    pub on_demand_tokens: Option<i64>,
 }
 
 /// A thrash burst — a file re-edited many times in a short window.
@@ -317,7 +326,10 @@ fn render_config_to_trim(
     out.push_str(&format!("\n## {heading}\n"));
     if !unused.is_empty() {
         out.push_str(&format!(
-            "\n### Unused surfaces ({}) — installed but never used in the window\n",
+            "\n### Unused surfaces ({}) — installed but never used in the window\n\
+             Each line gives what the surface costs at every session start — the only part \
+             removing it reclaims — and, where it has a body, what that body costs when \
+             invoked, which an unused surface has never paid.\n",
             unused.len()
         ));
         for s in unused {
@@ -335,11 +347,18 @@ fn render_config_to_trim(
     }
 }
 
+/// Render one surface with its cost split, so a body figure can never be read as
+/// a startup saving.
 fn render_surface(s: &SurfaceRef) -> String {
-    match s.static_tokens {
-        Some(t) => format!("{}/{} ({} tok)", s.kind, s.id, t),
-        None => format!("{}/{} (unknown tok)", s.kind, s.id),
-    }
+    let cost = match (s.startup_tokens, s.on_demand_tokens) {
+        (Some(startup), Some(body)) => {
+            format!("~{startup} tok at startup / {body} tok when invoked")
+        }
+        (Some(startup), None) => format!("{startup} tok every session"),
+        (None, Some(body)) => format!("{body} tok when invoked; startup cost unknown"),
+        (None, None) => "loaded every session, size unknown".to_string(),
+    };
+    format!("{}/{} ({cost})", s.kind, s.id)
 }
 
 /// How to reach the analyzed store for `cclens sql` — appended so the
@@ -430,15 +449,25 @@ mod tests {
             cd_pct: Some(53),
             top_commands: vec![("cd".to_string(), 200), ("cargo".to_string(), 80)],
             hotspots: vec![("lib.rs".to_string(), 40)],
-            unused: vec![SurfaceRef {
-                kind: "skill".to_string(),
-                id: "code-review".to_string(),
-                static_tokens: Some(1345),
-            }],
+            unused: vec![
+                SurfaceRef {
+                    kind: "skill".to_string(),
+                    id: "code-review".to_string(),
+                    startup_tokens: Some(9),
+                    on_demand_tokens: Some(1345),
+                },
+                SurfaceRef {
+                    kind: "mcp_server".to_string(),
+                    id: "playwright".to_string(),
+                    startup_tokens: None,
+                    on_demand_tokens: None,
+                },
+            ],
             always_on_heavy: vec![SurfaceRef {
                 kind: "rule".to_string(),
                 id: "git/safety".to_string(),
-                static_tokens: Some(922),
+                startup_tokens: Some(922),
+                on_demand_tokens: None,
             }],
             steer_pct: Some(13),
             correct_pct: Some(6),
@@ -469,7 +498,8 @@ mod tests {
                 unused: vec![SurfaceRef {
                     kind: "skill".to_string(),
                     id: "deploy".to_string(),
-                    static_tokens: Some(500),
+                    startup_tokens: Some(5),
+                    on_demand_tokens: Some(500),
                 }],
                 always_on_heavy: vec![],
             }],
@@ -487,7 +517,8 @@ mod tests {
         assert_eq!(json["projects"][0]["project"], "alpha");
         assert_eq!(json["projects"][0]["friction"][0]["count"], 92);
         assert_eq!(json["projects"][0]["thrash"][0]["edits"], 25);
-        assert_eq!(json["unused"][0]["static_tokens"], 1345);
+        assert_eq!(json["unused"][0]["startup_tokens"], 9);
+        assert_eq!(json["unused"][0]["on_demand_tokens"], 1345);
     }
 
     #[test]
@@ -585,10 +616,26 @@ mod tests {
     #[test]
     fn briefing_lists_concrete_config_surfaces_not_just_counts() {
         let brief = render_briefing(&findings(), &ScopeFilter::All);
-        assert!(brief.contains("skill/code-review (1345 tok)"));
-        assert!(brief.contains("rule/git/safety (922 tok)"));
+        // An unused skill's body is what it costs *when invoked*; deleting it
+        // reclaims only the description. Reporting the body as the trim figure
+        // would promise ~1345 tokens of startup context that removal never frees.
+        assert!(brief.contains("skill/code-review (~9 tok at startup / 1345 tok when invoked)"));
+        // An MCP server's schema is real every-session cost the catalog cannot weigh.
+        assert!(brief.contains("mcp_server/playwright (loaded every session, size unknown)"));
+        // An always-on file is paid in full at startup, so one figure says it all.
+        assert!(brief.contains("rule/git/safety (922 tok every session)"));
         // The project's own wedge sits in the project section.
-        assert!(brief.contains("skill/deploy (500 tok)"));
+        assert!(brief.contains("skill/deploy (~5 tok at startup / 500 tok when invoked)"));
+    }
+
+    #[test]
+    fn the_unused_section_says_what_removal_actually_saves() {
+        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        assert!(brief.contains("the only part removing it reclaims"));
+        // The same list holds an MCP server whose schema *is* loaded every
+        // session, so the section must not claim an unused surface is free.
+        assert!(brief.contains("mcp_server/playwright (loaded every session"));
+        assert!(!brief.contains("already costs nothing"));
     }
 
     #[test]

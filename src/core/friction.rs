@@ -1,7 +1,8 @@
 //! Classify tool failures into recurring, fixable categories. The value is not
 //! the raw error count but the *pattern*: 100+ "string to replace not found"
 //! across sessions is fixable friction (read-before-edit), not noise. Lexical
-//! heuristics over the error text; reports label them as such.
+//! heuristics over the error text — the fallback for everything the transcript
+//! does not label itself; reports say which is which.
 
 /// A category of tool failure, ordered so the most specific match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,11 +130,22 @@ impl ErrorCategory {
 
 /// Classify an error tool-result's text. Order matters: more specific patterns
 /// (which may also contain generic phrases like "not found") are checked first.
+///
+/// This is the **fallback**: a denied call is classified from the structural
+/// marker the transcript carries instead (`adapter::transcript`), because denial
+/// text is hook-authored and may be in any language. Text matching only has to
+/// cover what carries no such marker.
+///
+/// Editing these patterns changes what an unchanged transcript yields, so it
+/// requires bumping `ANALYZER_VERSION` (`store.rs`) — otherwise already-ingested
+/// sessions keep their old categories forever (`docs/specs/storage.md`).
 pub fn classify_error(text: &str) -> ErrorCategory {
     let lower = text.to_lowercase();
     let has = |needle: &str| lower.contains(needle);
 
     if has("string to replace not found")
+        || has("matches of the string to replace")
+        || has("old_string and new_string are exactly the same")
         || has("has not been read")
         || has("has been modified")
         || has("file has not been read yet")
@@ -190,6 +202,20 @@ mod tests {
         );
         assert_eq!(
             classify_error("File has been modified since read, either by the user"),
+            ErrorCategory::EditPrecondition
+        );
+    }
+
+    #[test]
+    fn edit_preconditions_beyond_a_missing_string() {
+        // Both texts are emitted verbatim by the Edit tool, so matching them is
+        // precise rather than a guess at free-form wording.
+        assert_eq!(
+            classify_error("Found 2 matches of the string to replace, but replace_all is false"),
+            ErrorCategory::EditPrecondition
+        );
+        assert_eq!(
+            classify_error("No changes to make: old_string and new_string are exactly the same."),
             ErrorCategory::EditPrecondition
         );
     }

@@ -25,7 +25,7 @@ identifying the configuration surface it exercises (the join key into
 | `file_edit` | — (an Edit/Write target) | point event; the file's **basename** in `surface_id`, its **full path** in `target` |
 | `bash_cmd` | — (a Bash invocation) | point event; the command's leading word in `surface_id` |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
-| `permission_prompt` | `permission` | point event (friction signal) — heuristic source |
+| `permission_prompt` | `permission` | point event (friction signal) — partly heuristic source |
 
 New kinds are added additively as the adapter learns to recognise new signals
 (`session-format.md`); the schema's loose `kind` / `surface_*` columns
@@ -38,11 +38,12 @@ Two kinds carry caveats that downstream reports must honour:
   skill-extraction layer, keeping personal data out of the store (`storage.md`,
   `.claude/rules/session-data-privacy.md`). This reserves the
   prompt-clustering capability now so it survives transcript rotation.
-- **`permission_prompt`** has **no structured transcript record**; it is
-  extracted heuristically from denial text inside `tool_result` error blocks
-  (`session-format.md`). It is therefore lower-confidence than the structurally
-  detected kinds, and the friction wedge built on it (`surfaces.md`) is labelled
-  as such.
+- **`permission_prompt`** is counted from the denial marker a denying entry
+  carries, falling back to denial text where there is none (`session-format.md`).
+  The marked half is as structural as any other kind; the fallback half is not,
+  so the friction wedge built on it (`surfaces.md`) stays labelled
+  lower-confidence — a transcript written before the marker existed is still
+  counted by an English phrase alone.
 - **`tool_error`** keeps a short, bounded **excerpt** of the error text — unlike
   `prompt`, which stores only a pointer. The asymmetry is deliberate: prompt text
   is large and wholesale-sensitive and is needed in full only by a later layer,

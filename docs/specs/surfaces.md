@@ -44,7 +44,7 @@ fastest way to a wrong recommendation. Each kind is classified:
 | `skill` | usage-measurable | `skill_invocation` |
 | `agent` | usage-measurable | `agent_spawn` |
 | `mcp_server` / `mcp_tool` | usage-measurable | `tool_use` |
-| `permission` | usage-measurable (heuristic) | `permission_prompt` from denial text — lower confidence |
+| `permission` | usage-measurable (partly heuristic) | `permission_prompt` from the denial marker, falling back to denial text — lower confidence |
 | `rule` | **catalog-only** | none (injected context; no invocation event) |
 | `hook` | **catalog-only** | none (no structured transcript trace) |
 | `claude_md` | **catalog-only** | none (always-on; usage is not the question — static cost is) |
@@ -82,7 +82,7 @@ its evidence; acting (or the future AI layer proposing) is downstream.
 | **Always-on heavy** | startup-full load mode, large static cost, confirmed against observed context (below) | static cost + observed `ctx_start` | slim, or move to a path-conditional rule / on-demand skill |
 | **Never-fires rule** | path-conditional rule whose `paths:` never matched session activity | rule paths × activity file-paths (see below) | narrow or delete |
 | **Redundant** | surfaces with overlapping purpose, usage splitting between them | a similarity signal (not in v1 schema — below) | merge |
-| **Recurring friction** | repeated permission denials for the same operation | `permission_prompt` (heuristic) | add an allow rule |
+| **Recurring friction** | repeated permission denials for the same operation | `permission_prompt` (partly heuristic) | add an allow rule |
 | **Orphaned usage** | events with no matching surface | any usage event | re-add config, or ignore if intentional |
 
 ### Ranking by what removal actually saves

@@ -10,32 +10,27 @@ its fixed views don't cover is one read-only query away. Answer the user's
 question by querying the store — never by re-parsing the raw
 `~/.claude/projects` transcripts yourself.
 
-## 1. Resolve the binary and the store
+## 1. Resolve the binary
 
 - **Binary**: use `cclens` if `command -v cclens` finds it. Otherwise run every
   command below through Nix instead: `nix run github:lambdalisue/cclens -- <subcommand …>`.
   If neither `cclens` nor `nix` is available, stop and tell the user how to
   install it (`nix profile install github:lambdalisue/cclens`, or
   `cargo install --git https://github.com/lambdalisue/cclens`).
-- **Store**: if `./cclens.db` exists, use it and omit `--db`. Otherwise use the
-  per-user store so no file is dropped into the current project:
 
-  ```sh
-  DB="${XDG_CACHE_HOME:-$HOME/.cache}/cclens/cclens.db"
-  mkdir -p "$(dirname "$DB")"
-  ```
-
-  and pass `--db "$DB"` to every command below. `cclens sql` errors on an
-  absent store — run `cclens analyze --db "$DB"` first in that case (also run
-  it when the user wants current data; it is incremental and fast).
+Omit `--db` everywhere: the store defaults to a per-user path
+(`${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db`), so nothing is dropped
+into the current project. `cclens sql` errors on an absent store — run
+`cclens analyze` first in that case (also run it when the user wants current
+data; it is incremental and fast).
 
 ## 2. Query
 
 The query is an argument, or stdin (which sidesteps shell quoting):
 
 ```sh
-cclens sql --db "$DB" "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
-echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | cclens sql --db "$DB"
+cclens sql "SELECT category, tool, COUNT(*) n FROM tool_errors GROUP BY 1,2 ORDER BY n DESC"
+echo "SELECT excerpt FROM tool_errors WHERE category='path-not-found'" | cclens sql
 ```
 
 The store is opened read-only, so a query can never mutate it.

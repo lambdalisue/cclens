@@ -67,9 +67,8 @@ so you can drive cclens from inside a Claude Code session:
 | `/cclens:query` | Answer an ad-hoc usage question with read-only SQL over the store. |
 
 The skills use the `cclens` binary when it is on PATH and fall back to
-`nix run github:lambdalisue/cclens` otherwise. Outside this repository they
-keep the store at `~/.cache/cclens/cclens.db` instead of dropping a
-`cclens.db` into your project.
+`nix run github:lambdalisue/cclens` otherwise. They read and write the same
+per-user store as the CLI.
 
 ## Quick start
 
@@ -89,9 +88,12 @@ cclens optimize --scope global
 
 Analysis reads your transcripts (`~/.claude/projects`) and live config —
 `~/.claude/*` plus each analyzed project's own `.claude/` / `CLAUDE.md` —
-**read-only** and incrementally, writing `cclens.db`. Nothing is sent anywhere;
-the store is a local file. Every command takes `--db <path>` (default
-`cclens.db`). Read commands refresh the store automatically before reporting
+**read-only** and incrementally, writing the store. Nothing is sent anywhere;
+the store is a local file. Every command takes `--db <path>`; it defaults to
+`${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db` — one per-user store,
+because what is analyzed spans every project, not the directory you run from.
+Pass `--db ./cclens.db` if you deliberately want a project-local one (and
+`.gitignore` it). Read commands refresh the store automatically before reporting
 (unchanged transcripts are skipped, so this is fast) and print a freshness line
 on stderr; pass `--frozen` to read the store exactly as it is. Running
 `cclens analyze` yourself is only needed to refresh without reading.
@@ -179,8 +181,10 @@ derived store.
 - The store outlives your transcripts. Claude Code prunes those on its own
   retention schedule, and cclens keeps the rows it already extracted — so the db
   holds history that `~/.claude/projects` no longer can, and deleting it is a
-  real loss, not a cache flush. Upgrading cclens across a schema change migrates
-  the file in place; you never need to delete it.
+  real loss, not a cache flush. That is why it lives under
+  `${XDG_STATE_HOME:-~/.local/state}/cclens/` rather than a cache directory a
+  cleaner may empty. Upgrading cclens across a schema change migrates the file
+  in place; you never need to delete it.
 - `optimize` launches `claude` (Claude Code) seeded with the findings; the
   briefing is written to a private temp file, never passed on the command line.
 - Not yet implemented (see [`docs/specs/`](docs/specs/)): meta-skill (`loop`)

@@ -9,29 +9,24 @@ description: Investigate cclens findings about the user's Claude Code usage to r
 advisor prompt. This skill runs the same analysis but adopts that prompt in the
 **current** session instead, so the user stays where they are.
 
-## 1. Resolve the binary and the store
+## 1. Resolve the binary
 
 - **Binary**: use `cclens` if `command -v cclens` finds it. Otherwise run every
   command below through Nix instead: `nix run github:lambdalisue/cclens -- <subcommand …>`.
   If neither `cclens` nor `nix` is available, stop and tell the user how to
   install it (`nix profile install github:lambdalisue/cclens`, or
   `cargo install --git https://github.com/lambdalisue/cclens`).
-- **Store**: if `./cclens.db` exists, use it and omit `--db`. Otherwise use the
-  per-user store so no file is dropped into the current project:
 
-  ```sh
-  DB="${XDG_CACHE_HOME:-$HOME/.cache}/cclens/cclens.db"
-  mkdir -p "$(dirname "$DB")"
-  ```
-
-  and pass `--db "$DB"` to every command below.
+Omit `--db` everywhere: the store defaults to a per-user path
+(`${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db`), so nothing is dropped
+into the current project.
 
 ## 2. Analyze and fetch the advisor prompt
 
 ```sh
-cclens analyze --db "$DB"
+cclens analyze
 PROMPT="$(mktemp)"
-cclens optimize --frozen --print --db "$DB" > "$PROMPT"
+cclens optimize --frozen --print > "$PROMPT"
 ```
 
 If the user asked to optimize their global setup or one specific project, add

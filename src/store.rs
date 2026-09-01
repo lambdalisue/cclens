@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::core::span::{SessionStart, Source, Span};
@@ -235,9 +235,92 @@ pub struct Store {
     conn: Connection,
 }
 
+/// `create_dir_all` with owner-only permissions on every directory it creates —
+/// the mode the XDG Base Directory spec prescribes for a directory a program
+/// creates on the user's behalf. Directories that already exist keep theirs.
+fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Make sure the store file is readable only by its owner: create it `0600`
+/// when absent, and narrow it when it is already there with group/other bits
+/// set. Creating it here rather than letting SQLite create it under the umask
+/// is what removes the window — SQLite would otherwise write the schema into a
+/// world-readable file and only then have it chmod'ed — and it lets SQLite
+/// inherit the mode for the rollback journal it writes beside the database.
+///
+/// An existing store is narrowed rather than left alone: a store an older
+/// cclens created under the umask is the realistic case, and nobody
+/// deliberately shares this store. Only a regular file is touched, so pointing
+/// `--db` at a directory fails at SQLite instead of silently re-moding it, and
+/// a store owned by someone else is left as it is — re-moding it is not this
+/// process's call, and refusing to run over it would break a store legitimately
+/// created under another account.
+fn ensure_owner_only(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::{OpenOptions, Permissions};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create store {}", path.display())),
+        }
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("read store permissions {}", path.display()))?;
+        let mode = meta.permissions().mode();
+        if meta.is_file() && mode & 0o077 != 0 {
+            // 0600 outright rather than masking the existing mode: masking would
+            // carry over a stray execute bit, and could leave the owner without
+            // the read/write the store needs to be opened at all.
+            match std::fs::set_permissions(path, Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                // Not our file to re-mode. Everything else is a real failure.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("restrict store permissions {}", path.display()));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if needed) a store at `path`, ensuring the schema exists.
+    /// The directory is created too: the default store lives under the user
+    /// state directory, which need not exist yet, and SQLite will not create it.
+    ///
+    /// Both are **owner-only**. The store aggregates transcript-derived data —
+    /// file paths, error excerpts, project names — for every project at one
+    /// well-known user-level path, so the umask default (commonly a
+    /// group/world-readable `0755` directory and `0644` file) would expose it to
+    /// other local accounts.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            create_private_dir_all(parent)
+                .with_context(|| format!("create store directory {}", parent.display()))?;
+        }
+        ensure_owner_only(path)?;
         Self::from_connection(Connection::open(path)?)
     }
 
@@ -1257,6 +1340,52 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 mod tests {
     use super::*;
     use crate::core::surface::{LoadMode, Scope};
+
+    /// Permissions are the reason this test and the next one work on a real
+    /// temp directory instead of `Store::in_memory`: the default store path
+    /// lives under a user state directory that may not exist yet, and both it
+    /// and the store must come out owner-only.
+    #[test]
+    fn open_creates_a_missing_directory_and_keeps_both_owner_only() {
+        let dir = std::env::temp_dir().join(format!("cclens-open-test-{}", std::process::id()));
+        let path = dir.join("cclens").join("cclens.db");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        drop(Store::open(&path).unwrap());
+
+        assert!(path.exists(), "the store was not created at {path:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The store an older cclens left under the umask is the case that actually
+    /// exists in the wild, so opening it has to narrow it — otherwise the
+    /// protection never reaches anyone who already ran the tool.
+    #[cfg(unix)]
+    #[test]
+    fn open_narrows_a_store_an_earlier_run_left_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cclens-mode-test-{}", std::process::id()));
+        let path = dir.join("cclens.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(Store::open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(Store::open(&path).unwrap());
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn span(skill: &str, out_tokens: u64, ctx_growth: u64, duration_sec: f64) -> Span {
         Span {

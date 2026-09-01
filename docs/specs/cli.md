@@ -22,6 +22,29 @@ catalog rebuilt from current config (`storage.md`). The verb is `analyze`, not
 `analyze` reads everything **read-only** and never copies input into the repo or
 the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).
 
+### `--db` — one store per user, not per directory
+
+Shared by every command. The input is not scoped to the current directory —
+`analyze` walks *every* project's transcripts under `~/.claude/projects` — so a
+cwd-relative default would contradict the data it holds: it would build a
+separate copy of the same cross-project store per directory cclens is invoked
+from, and leave a database file inside unrelated Git working trees. The default
+is therefore user-level, `${XDG_STATE_HOME:-~/.local/state}/cclens/cclens.db`
+(`store_path` in `cli.rs`), with the directory created on demand by
+`Store::open` — owner-only, like the store itself (`storage.md`). A non-absolute
+`XDG_STATE_HOME` is invalid per the XDG spec and ignored — honoring one would
+reintroduce exactly the cwd-relative store this default exists to avoid.
+
+State and not cache (`$XDG_CACHE_HOME`) because the store is not regenerable.
+It is built incrementally from the transcripts, but Claude Code prunes those on
+its own retention schedule, and the rows already extracted are then the only
+surviving record of those sessions — nothing on disk can rebuild them
+(`storage.md`). A cache directory is by definition somewhere a cleaner may empty
+without asking, which is the one thing this file cannot survive; that the store
+migrates in place rather than being discarded on a schema change is the same
+premise applied to upgrades. A project-local store stays available by asking for
+it — `--db ./cclens.db`.
+
 ## Views — read the store
 
 ```

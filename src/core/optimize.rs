@@ -405,7 +405,7 @@ fn render_surface(s: &SurfaceRef) -> String {
 fn store_pointer(db_path: &str) -> String {
     format!(
         "The analyzed store is at `{db_path}`; pass `--db {db_path}` to `cclens sql` \
-         (or run from a directory where it is `cclens.db`)."
+         (the default store path is used when `--db` is omitted)."
     )
 }
 

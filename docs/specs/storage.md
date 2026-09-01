@@ -119,9 +119,10 @@ WHERE e.kind = 'tool_error';
 
 The `REFERENCES` annotations above record which column joins which table; they
 are **not declared constraints**. SQLite does not enforce foreign keys unless
-`PRAGMA foreign_keys` is on, and turning it on would constrain ingest ordering
-for what is a regenerable cache — so the schema states the relationship and the
-ingest code maintains it (delete-then-insert per `source_path`, below).
+`PRAGMA foreign_keys` is on, and turning it on would constrain the order a
+delete-then-insert re-ingest may touch the tables in, for no integrity this
+single-writer store does not already have — so the schema states the
+relationship and the ingest code maintains it (per `source_path`, below).
 
 The store is also a **read surface for arbitrary queries** (`cli.md`: `sql`).
 Because it is plain SQLite holding already-extracted facts, the session-analysis
@@ -145,6 +146,30 @@ while reserving the capability now, so it survives transcript rotation: the
 pointer is cheap to keep and the alternative — discovering later that the text is
 gone — is unrecoverable. (If the source file is rotated away, the pointer simply
 resolves to nothing; the event's counts remain.)
+
+### The store file is owner-only
+
+What survives ingestion is still sensitive: file paths, tool-error excerpts,
+project names, and pointers back into the raw transcripts. Since the default
+store is a single well-known user-level path shared by every project
+(`cli.md`), the umask default — commonly a group/world-readable `0755`
+directory and `0644` file — would expose that aggregate to other local
+accounts. `Store::open` therefore creates the directory `0700` and the store
+`0600`, matching how the `optimize` briefing (carrying the same class of data)
+is written.
+
+The store file is created by `Store::open` itself rather than chmod'ed after
+SQLite creates it, which is what keeps the guarantee airtight: the schema write
+would otherwise land in a file still carrying the umask mode, and SQLite copies
+the database's mode onto the rollback journal it writes beside it, so the
+journal inherits `0600` for free. An **existing** store is narrowed as well —
+a store an older cclens created under the umask is the case that actually
+exists, and a permanently exposed one would mean this protection never reaches
+anyone who already ran the tool. Only a regular file is re-moded, so a `--db`
+pointing at a directory still fails at SQLite rather than being silently
+re-moded, and a store owned by another account is left as it is — re-moding it
+is not this process's call, and refusing to run over it would break a store
+legitimately created under another user.
 
 ## Surface identity, scope, and the effective join
 

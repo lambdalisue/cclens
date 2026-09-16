@@ -20,6 +20,9 @@ owning project's normalized slug, since many projects coexist in one catalog
 records' `cwd`, worktree folded onto the parent checkout) and scans each root
 that still exists on disk (`read_project_surfaces` in `config.rs`); a root that
 was deleted since its sessions ran simply contributes no project surfaces.
+`~/.claude` throughout this document means `$CLAUDE_CONFIG_DIR` when that
+variable names a non-empty path, because Claude Code relocates the whole tree
+under it (`claude_config_dir` in `config.rs`); an empty value is treated as unset.
 
 | Surface kind | Global | Project-local |
 | --- | --- | --- |

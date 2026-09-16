@@ -57,9 +57,11 @@ rewrites `version` in `Cargo.toml` from it before publishing, so the committed
 `0.0.0` is a placeholder and cutting a release never means bumping a file first.
 
 The tap covers Linux and macOS only; on Windows, take the `-pc-windows-msvc`
-archive for your arch from the release, or build from source. `~/.claude` is
-located through `HOME`, falling back to `USERPROFILE` where Windows leaves
-`HOME` unset.
+archive for your arch from the release, or build from source. `CLAUDE_CONFIG_DIR`
+names the config tree directly when it is set to a non-empty path, as it does
+for Claude Code itself. Otherwise — including when the variable is set but
+empty — `~/.claude` is located through `HOME`, falling back to `USERPROFILE`
+where Windows leaves `HOME` unset.
 
 ## Claude Code plugin
 

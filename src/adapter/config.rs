@@ -4,9 +4,20 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::surface::{LoadMode, Scope, Surface};
+
+/// The Claude Code config root: `$CLAUDE_CONFIG_DIR` when it names a non-empty
+/// path, else `.claude` under the home directory. Reading those two values is
+/// the CLI's job, so the rule stays testable without a process to configure
+/// (`docs/specs/config-format.md`).
+pub fn claude_config_dir(config_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = config_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        return Some(dir.to_path_buf());
+    }
+    Some(home?.join(".claude"))
+}
 
 /// Approximate the token weight of injected text. A ranking signal, not a
 /// billing figure (`docs/specs/config-format.md`), so a cheap, consistent
@@ -365,6 +376,38 @@ fn read_markdown_files(dir: &Path) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_config_dir_is_dot_claude_under_home() {
+        assert_eq!(
+            claude_config_dir(None, Some(Path::new("/tmp/example/home"))),
+            Some(PathBuf::from("/tmp/example/home/.claude"))
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_prefers_an_explicit_config_dir_over_home() {
+        assert_eq!(
+            claude_config_dir(
+                Some(Path::new("/tmp/example/cfg")),
+                Some(Path::new("/tmp/example/home"))
+            ),
+            Some(PathBuf::from("/tmp/example/cfg"))
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_falls_back_to_home_for_an_empty_config_dir() {
+        assert_eq!(
+            claude_config_dir(Some(Path::new("")), Some(Path::new("/tmp/example/home"))),
+            Some(PathBuf::from("/tmp/example/home/.claude"))
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_without_a_home_has_no_answer() {
+        assert_eq!(claude_config_dir(None, None), None);
+    }
 
     #[test]
     fn approx_tokens_is_about_four_chars_each() {

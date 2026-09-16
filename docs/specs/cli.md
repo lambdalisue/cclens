@@ -14,10 +14,14 @@ cclens analyze [--projects <dir>] [--config <dir>] [--db <path>]
 
 Reads both Claude Code inputs — session transcripts (default
 `~/.claude/projects/`) and live config (default `~/.claude/` plus the relevant
-project `.claude/`) — and writes the SQLite store (`storage.md`). Incremental and
-idempotent: unchanged transcripts are skipped, changed ones replaced, the surface
-catalog rebuilt from current config (`storage.md`). The verb is `analyze`, not
-`build` — it analyzes raw input into facts.
+project `.claude/`) — and writes the SQLite store (`storage.md`). That
+`~/.claude` root is `$CLAUDE_CONFIG_DIR` whenever that variable names a
+non-empty path — an empty value carries no location and is treated as unset —
+so cclens follows a config tree the user has relocated instead of reporting on
+an empty default. Incremental and idempotent: unchanged transcripts are skipped,
+changed ones replaced, the surface catalog rebuilt from current config
+(`storage.md`). The verb is `analyze`, not `build` — it analyzes raw input into
+facts.
 
 `analyze` reads everything **read-only** and never copies input into the repo or
 the store beyond the derived facts (`.claude/rules/session-data-privacy.md`).

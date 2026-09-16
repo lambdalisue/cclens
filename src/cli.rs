@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::adapter::config::{
-    read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces, read_project_surfaces,
-    read_rule_surfaces, read_skill_surfaces,
+    claude_config_dir, read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces,
+    read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
@@ -49,7 +49,8 @@ enum Command {
     /// automatically before every report — call it directly only to refresh
     /// without reading anything.
     Analyze {
-        /// Transcript root (default: ~/.claude/projects).
+        /// Transcript root (default: $CLAUDE_CONFIG_DIR/projects, or
+        /// ~/.claude/projects).
         #[arg(long)]
         projects: Option<PathBuf>,
         /// Output format: table | json (the run's counters).
@@ -202,7 +203,8 @@ enum Command {
     /// with the full analysis, which investigates each problem and proposes
     /// concrete config edits for your approval.
     Optimize {
-        /// Transcript root (default: ~/.claude/projects).
+        /// Transcript root (default: $CLAUDE_CONFIG_DIR/projects, or
+        /// ~/.claude/projects).
         #[arg(long)]
         projects: Option<PathBuf>,
         /// Store to analyze into / read from (default:
@@ -2102,13 +2104,17 @@ fn usage_by_time(store: &Store, bucket: Bucket, format: Format) -> Result<()> {
 
 /// Read all installed config (global scope) into one surface list.
 fn read_global_surfaces() -> Result<Vec<Surface>> {
-    let home = claude_home()?;
+    let config_dir = claude_home()?;
     let scope = Scope::Global;
-    let mut surfaces = read_skill_surfaces(&home.join("skills"), &scope);
-    surfaces.extend(read_rule_surfaces(&home.join("rules"), &scope));
-    surfaces.extend(read_agent_surfaces(&home.join("agents"), &scope));
-    surfaces.extend(read_mcp_server_surfaces(&home.join("mcp.json"), &scope));
-    if let Some(claude_md) = read_claude_md_surface(&home.join("CLAUDE.md"), "global", &scope) {
+    let mut surfaces = read_skill_surfaces(&config_dir.join("skills"), &scope);
+    surfaces.extend(read_rule_surfaces(&config_dir.join("rules"), &scope));
+    surfaces.extend(read_agent_surfaces(&config_dir.join("agents"), &scope));
+    surfaces.extend(read_mcp_server_surfaces(
+        &config_dir.join("mcp.json"),
+        &scope,
+    ));
+    if let Some(claude_md) = read_claude_md_surface(&config_dir.join("CLAUDE.md"), "global", &scope)
+    {
         surfaces.push(claude_md);
     }
     Ok(surfaces)
@@ -2531,18 +2537,21 @@ fn home_dir() -> Option<&'static str> {
     .as_deref()
 }
 
+/// The Claude Code config root for this run: the environment read that
+/// `adapter::config::claude_config_dir` deliberately does not do, plus the
+/// advice to show when neither variable names one.
 fn claude_home() -> Result<PathBuf> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
     // What can go wrong differs by platform, so the advice does too: only
     // Windows requires the value to name a real directory, and telling a unix
     // user otherwise sends them looking for a problem they do not have.
-    let home = home_dir().with_context(|| {
+    claude_config_dir(config_dir.as_deref(), home_dir().map(Path::new)).with_context(|| {
         if cfg!(windows) {
-            "set HOME or USERPROFILE to an existing directory"
+            "set CLAUDE_CONFIG_DIR, or HOME/USERPROFILE to an existing directory"
         } else {
-            "HOME is not set"
+            "set CLAUDE_CONFIG_DIR or HOME"
         }
-    })?;
-    Ok(PathBuf::from(home).join(".claude"))
+    })
 }
 
 /// Resolve `--db`, defaulting to a **user-level** store rather than a

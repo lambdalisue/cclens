@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::adapter::config::{
-    claude_config_dir, read_agent_surfaces, read_claude_md_surface, read_mcp_server_surfaces,
+    claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
     read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::transcript::{
@@ -1702,7 +1702,11 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     let mut surfaces = read_global_surfaces()?;
     for (root, project) in store.session_roots()? {
         if Path::new(&root).is_dir() {
-            surfaces.extend(read_project_surfaces(Path::new(&root), &project));
+            surfaces.extend(read_project_surfaces(
+                Path::new(&root),
+                &project,
+                home_dir().map(Path::new),
+            ));
         }
     }
     let surface_count = surfaces.len();
@@ -2113,10 +2117,11 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
         &config_dir.join("mcp.json"),
         &scope,
     ));
-    if let Some(claude_md) = read_claude_md_surface(&config_dir.join("CLAUDE.md"), "global", &scope)
-    {
-        surfaces.push(claude_md);
-    }
+    surfaces.extend(read_claude_md_surfaces(
+        &[(&config_dir.join("CLAUDE.md"), "global")],
+        &scope,
+        home_dir().map(Path::new),
+    ));
     Ok(surfaces)
 }
 

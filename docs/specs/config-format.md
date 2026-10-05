@@ -37,12 +37,31 @@ under it (`claude_config_dir` in `config.rs`); an empty value is treated as unse
 `CLAUDE.md` and `AGENTS.md` are two names for the same always-on context, and a
 repo serving both agent conventions typically ships `AGENTS.md` as a symlink to
 `CLAUDE.md`. Claude Code injects that content once, so the adapter weighs the
-file once: `read_project_surfaces` resolves each candidate and keeps the first
+file once: `read_claude_md_surfaces` resolves each candidate and keeps the first
 surface per resolved file, which reports the pair under `CLAUDE.md`. The
 deduplication key is the resolved path, not the content — two independently
 maintained files are two real always-on surfaces even when their text coincides.
 Getting this wrong doubles the project's `startup_full` total, which is what the
 always-on floor is reconciled against (`surfaces.md`).
+
+A `CLAUDE.md` can pull other files in with `@path` imports, and Claude Code
+injects the imported text every session just like the file's own. Weighing only
+the importing file would book a config made of import lines as nearly free and
+push the real always-on cost into the unattributed residual — exactly inverting
+the "always-on heavy" wedge for such a layout. So `read_claude_md_surfaces`
+follows the imports and records **each imported file as its own `claude_md`
+surface** (`startup_full`, id `@<path>`, relative to the importing top-level
+file's directory when inside it), rather than folding the text into the
+importer: the cost lands on the file that carries it, and each one can be pruned
+on its own. The import rules mirror Claude Code's documented behavior: an import
+is an `@` opening a whitespace-separated word (an e-mail address is not one),
+ignored inside code spans and fenced blocks; it resolves relative to the
+importing file, `~/` to the home directory, or as an absolute path; recursion
+stops after five hops; an import naming no readable file is skipped. The same
+resolved-path deduplication as the `AGENTS.md` symlink applies across the whole
+import graph — a file imported twice, imported in a cycle, or imported *and*
+read as a top-level `AGENTS.md` is weighed once, with the top-level name
+winning.
 
 `settings.json` carries two surface kinds at once: `permissions` (allow/deny) and
 `hooks` (matcher → command); the adapter splits one file into several surfaces.

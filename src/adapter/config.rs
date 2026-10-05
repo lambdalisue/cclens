@@ -262,22 +262,124 @@ fn collect_rule_surfaces(root: &Path, dir: &Path, scope: &Scope, out: &mut Vec<S
     }
 }
 
-/// Read a single `CLAUDE.md` / `AGENTS.md` file into a surface, if it exists.
-pub fn read_claude_md_surface(path: &Path, id: &str, scope: &Scope) -> Option<Surface> {
-    let content = fs::read_to_string(path).ok()?;
-    Some(claude_md_surface(
-        id,
-        &path.display().to_string(),
-        &content,
-        scope,
-    ))
+/// How many hops of `@import` Claude Code follows from a `CLAUDE.md`; a file
+/// further away is never injected, so it is never weighed either.
+const MAX_IMPORT_HOPS: usize = 5;
+
+/// The raw `@path` imports a `CLAUDE.md` names, in order. An import is an `@`
+/// opening a whitespace-separated word — so an e-mail address is not one — and
+/// is not evaluated inside a code span or fenced block, where `@` is just text
+/// (`docs/specs/config-format.md`).
+fn import_refs(content: &str) -> Vec<&str> {
+    let mut refs = Vec::new();
+    let mut fence: Option<&str> = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
+        match (fence, marker) {
+            (None, Some(open)) => fence = Some(open),
+            (Some(open), Some(close)) if open == close => fence = None,
+            _ => {}
+        }
+        if fence.is_some() || marker.is_some() {
+            continue;
+        }
+        // Even-indexed pieces between backticks are outside any code span.
+        for prose in line.split('`').step_by(2) {
+            refs.extend(
+                prose
+                    .split_whitespace()
+                    .filter_map(|word| word.strip_prefix('@'))
+                    .filter(|path| !path.is_empty()),
+            );
+        }
+    }
+    refs
+}
+
+/// Where an `@path` import points: relative to the importing file's directory,
+/// `~/` to the home directory, an absolute path as written.
+fn resolve_import(raw: &str, base_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    match raw.strip_prefix("~/") {
+        Some(rest) => Some(home?.join(rest)),
+        None => Some(base_dir.join(raw)),
+    }
+}
+
+/// Read the `CLAUDE.md` / `AGENTS.md` files of one scope, plus everything they
+/// `@import`, into surfaces. Each `(path, id)` that exists becomes a surface;
+/// each file reached through imports becomes its own surface too, with id
+/// `@<path>` (relative to the importing top-level file's directory when inside
+/// it), so the always-on cost lands on the file that carries it and can be
+/// pruned file by file. Every file is weighed once however many times it is
+/// reached — by symlink, by a second import, by a cycle — because Claude Code
+/// injects it once (`docs/specs/config-format.md`).
+pub fn read_claude_md_surfaces(
+    files: &[(&Path, &str)],
+    scope: &Scope,
+    home: Option<&Path>,
+) -> Vec<Surface> {
+    let mut seen = HashSet::new();
+    let mut surfaces = Vec::new();
+    let mut pending = Vec::new();
+    for &(path, id) in files {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !seen.insert(resolved) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        surfaces.push(claude_md_surface(
+            id,
+            &path.display().to_string(),
+            &content,
+            scope,
+        ));
+        let root = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        pending.push((path.to_path_buf(), content, root, 0));
+    }
+    // Breadth-first, so a file reachable at several depths is met at the
+    // shallowest one and the hop limit cuts exactly where Claude Code does.
+    let mut cursor = 0;
+    while let Some((path, content, root, hops)) = pending.get(cursor).cloned() {
+        cursor += 1;
+        if hops == MAX_IMPORT_HOPS {
+            continue;
+        }
+        let base_dir = path.parent().unwrap_or(Path::new(""));
+        for raw in import_refs(&content) {
+            let Some(target) = resolve_import(raw, base_dir, home) else {
+                continue;
+            };
+            let Ok(resolved) = fs::canonicalize(&target) else {
+                continue;
+            };
+            if !resolved.is_file() || !seen.insert(resolved) {
+                continue;
+            }
+            let Ok(imported) = fs::read_to_string(&target) else {
+                continue;
+            };
+            let shown = target.strip_prefix(&root).unwrap_or(&target);
+            surfaces.push(claude_md_surface(
+                &format!("@{}", shown.display()),
+                &target.display().to_string(),
+                &imported,
+                scope,
+            ));
+            pending.push((target, imported, root.clone(), hops + 1));
+        }
+    }
+    surfaces
 }
 
 /// Read one project's installed config into surfaces, every one stamped with
 /// that project's scope. Mirrors the global layout under `<root>/.claude`, plus
-/// the in-repo `CLAUDE.md` / `AGENTS.md` and `.mcp.json`
-/// (`docs/specs/config-format.md`). A root with none of these yields nothing.
-pub fn read_project_surfaces(root: &Path, project: &str) -> Vec<Surface> {
+/// the in-repo `CLAUDE.md` / `AGENTS.md` (with their `@import`s) and
+/// `.mcp.json` (`docs/specs/config-format.md`). `home` resolves a `~/` import.
+/// A root with none of these yields nothing.
+pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) -> Vec<Surface> {
     let scope = Scope::Project(project.to_string());
     let claude = root.join(".claude");
     let mut surfaces = read_skill_surfaces(&claude.join("skills"), &scope);
@@ -285,22 +387,14 @@ pub fn read_project_surfaces(root: &Path, project: &str) -> Vec<Surface> {
     surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
     surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
     // A repo that serves both agent conventions usually ships `AGENTS.md` as a
-    // symlink to `CLAUDE.md`. Claude Code injects that content once, so weigh
-    // the file once too: resolve each candidate and keep the first surface per
-    // resolved file, which makes `CLAUDE.md` the one that is reported. Counting
-    // both would double the project's always-on figure and suggest deleting a
-    // link that costs nothing.
-    let mut seen = HashSet::new();
-    for name in ["CLAUDE.md", "AGENTS.md"] {
-        let path = root.join(name);
-        let resolved = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !seen.insert(resolved) {
-            continue;
-        }
-        if let Some(surface) = read_claude_md_surface(&path, name, &scope) {
-            surfaces.push(surface);
-        }
-    }
+    // symlink to `CLAUDE.md`; listing `CLAUDE.md` first makes it the one that
+    // is reported when the pair resolves to one file.
+    let (claude_md, agents_md) = (root.join("CLAUDE.md"), root.join("AGENTS.md"));
+    surfaces.extend(read_claude_md_surfaces(
+        &[(&claude_md, "CLAUDE.md"), (&agents_md, "AGENTS.md")],
+        &scope,
+        home,
+    ));
     surfaces
 }
 
@@ -629,7 +723,7 @@ mod tests {
         )
         .unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha");
+        let surfaces = read_project_surfaces(&root, "alpha", None);
         fs::remove_dir_all(&root).ok();
 
         let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
@@ -663,7 +757,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
         std::os::unix::fs::symlink("CLAUDE.md", root.join("AGENTS.md")).unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha");
+        let surfaces = read_project_surfaces(&root, "alpha", None);
         fs::remove_dir_all(&root).ok();
 
         let claude_mds: Vec<_> = surfaces.iter().filter(|s| s.kind == "claude_md").collect();
@@ -688,7 +782,130 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
         fs::write(root.join("AGENTS.md"), "project agents md").unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha");
+        let surfaces = read_project_surfaces(&root, "alpha", None);
+        fs::remove_dir_all(&root).ok();
+
+        let mut ids: Vec<_> = surfaces
+            .iter()
+            .filter(|s| s.kind == "claude_md")
+            .map(|s| s.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["AGENTS.md", "CLAUDE.md"]);
+    }
+
+    /// An empty scratch directory unique to the calling test.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cclens-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_import_is_an_at_word_outside_code() {
+        let content = "@a.md\nSee @b.md and @c.md for more.\nmail me@example.com\n\
+                       `@inline.md` stays text\n```\n@fenced.md\n```\n@d.md";
+        assert_eq!(import_refs(content), ["a.md", "b.md", "c.md", "d.md"]);
+    }
+
+    #[test]
+    fn an_import_resolves_against_the_importing_file_or_home() {
+        let base = Path::new("/tmp/example/cfg");
+        let home = Some(Path::new("/tmp/example/home"));
+        assert_eq!(
+            resolve_import("docs/x.md", base, home),
+            Some(PathBuf::from("/tmp/example/cfg/docs/x.md"))
+        );
+        assert_eq!(
+            resolve_import("~/notes.md", base, home),
+            Some(PathBuf::from("/tmp/example/home/notes.md"))
+        );
+        assert_eq!(
+            resolve_import("/tmp/example/abs.md", base, home),
+            Some(PathBuf::from("/tmp/example/abs.md"))
+        );
+        assert_eq!(resolve_import("~/notes.md", base, None), None);
+    }
+
+    #[test]
+    fn imported_files_are_weighed_as_their_own_always_on_surfaces() {
+        // A CLAUDE.md made only of import lines costs little itself; the
+        // imported text is what every session pays, so it must be catalogued
+        // rather than left to the unattributed residual.
+        let dir = scratch_dir("imports");
+        fs::create_dir_all(dir.join("parts")).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "@parts/a.md\n@missing.md\n").unwrap();
+        fs::write(
+            dir.join("parts/a.md"),
+            format!("{}\n@b.md", "x".repeat(400)),
+        )
+        .unwrap();
+        fs::write(dir.join("parts/b.md"), "y".repeat(40)).unwrap();
+
+        let surfaces =
+            read_claude_md_surfaces(&[(&dir.join("CLAUDE.md"), "global")], &Scope::Global, None);
+        fs::remove_dir_all(&dir).ok();
+
+        let found: Vec<_> = surfaces
+            .iter()
+            .map(|s| (s.id.as_str(), s.startup_tokens, s.load_mode))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("global", Some(6), LoadMode::StartupFull),
+                ("@parts/a.md", Some(102), LoadMode::StartupFull),
+                ("@parts/b.md", Some(10), LoadMode::StartupFull),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_reached_twice_or_in_a_cycle_is_weighed_once() {
+        let dir = scratch_dir("import-cycle");
+        fs::write(dir.join("CLAUDE.md"), "@a.md @a.md").unwrap();
+        fs::write(dir.join("a.md"), "@CLAUDE.md").unwrap();
+
+        let surfaces =
+            read_claude_md_surfaces(&[(&dir.join("CLAUDE.md"), "global")], &Scope::Global, None);
+        fs::remove_dir_all(&dir).ok();
+
+        let ids: Vec<_> = surfaces.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["global", "@a.md"]);
+    }
+
+    #[test]
+    fn imports_beyond_the_hop_limit_are_not_weighed() {
+        // CLAUDE.md -> 1 -> 2 -> 3 -> 4 -> 5 -> 6: the sixth hop is never
+        // injected, so it must not be counted as always-on cost.
+        let dir = scratch_dir("import-depth");
+        fs::write(dir.join("CLAUDE.md"), "@1.md").unwrap();
+        for n in 1..=6 {
+            fs::write(dir.join(format!("{n}.md")), format!("@{}.md", n + 1)).unwrap();
+        }
+
+        let surfaces =
+            read_claude_md_surfaces(&[(&dir.join("CLAUDE.md"), "global")], &Scope::Global, None);
+        fs::remove_dir_all(&dir).ok();
+
+        let ids: Vec<_> = surfaces.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["global", "@1.md", "@2.md", "@3.md", "@4.md", "@5.md"]);
+    }
+
+    #[test]
+    fn a_project_claude_md_importing_agents_md_counts_it_once() {
+        // `@AGENTS.md` in CLAUDE.md is the import form of the symlink pair:
+        // the same file must not be weighed as both a root and an import.
+        let root = scratch_dir("import-agents");
+        fs::write(root.join("CLAUDE.md"), "@AGENTS.md").unwrap();
+        fs::write(root.join("AGENTS.md"), "project agents md").unwrap();
+
+        let surfaces = read_project_surfaces(&root, "alpha", None);
         fs::remove_dir_all(&root).ok();
 
         let mut ids: Vec<_> = surfaces

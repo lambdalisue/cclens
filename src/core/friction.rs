@@ -11,6 +11,13 @@ pub enum ErrorCategory {
     EditPrecondition,
     /// A command or operation blocked by a hook or permission rule.
     BlockedByHook,
+    /// A network connection the Bash sandbox refused — read from the
+    /// harness's own report of the refusal, so not a guess at wording.
+    SandboxNetwork,
+    /// A write the OS refused (`EPERM`, read-only file system), most often the
+    /// Bash sandbox guarding paths outside its allowed directories. A lexical
+    /// heuristic: the same wording comes from any other permission refusal.
+    SandboxWrite,
     /// A command binary was not found.
     CommandNotFound,
     /// A file or path that does not exist.
@@ -42,6 +49,8 @@ impl ErrorCategory {
         match self {
             ErrorCategory::EditPrecondition => "edit-precondition",
             ErrorCategory::BlockedByHook => "blocked-by-hook",
+            ErrorCategory::SandboxNetwork => "sandbox-network",
+            ErrorCategory::SandboxWrite => "sandbox-write",
             ErrorCategory::CommandNotFound => "command-not-found",
             ErrorCategory::PathNotFound => "path-not-found",
             ErrorCategory::CompileError => "compile-error",
@@ -62,6 +71,8 @@ impl ErrorCategory {
         match label {
             "edit-precondition" => ErrorCategory::EditPrecondition,
             "blocked-by-hook" => ErrorCategory::BlockedByHook,
+            "sandbox-network" => ErrorCategory::SandboxNetwork,
+            "sandbox-write" => ErrorCategory::SandboxWrite,
             "command-not-found" => ErrorCategory::CommandNotFound,
             "path-not-found" => ErrorCategory::PathNotFound,
             "compile-error" => ErrorCategory::CompileError,
@@ -92,6 +103,31 @@ impl ErrorCategory {
         )
     }
 
+    /// Whether the Bash sandbox refused the call — the failures whose fix is a
+    /// sandbox allowlist entry, and whose usual workaround is an unsandboxed
+    /// retry (`core::thrash::count_unsandboxed_retries`).
+    pub fn is_sandbox(self) -> bool {
+        matches!(
+            self,
+            ErrorCategory::SandboxNetwork | ErrorCategory::SandboxWrite
+        )
+    }
+
+    /// Whether a check run failing this way means the check itself failed. A
+    /// missing path, a refusal or a stop means the check never got to say —
+    /// `cd /missing && cargo test` ran no tests — so such a failure is no fix
+    /// round (`core::thrash::check_outcome`).
+    pub fn is_check_failure(self) -> bool {
+        matches!(
+            self,
+            ErrorCategory::CompileError
+                | ErrorCategory::TestFailure
+                | ErrorCategory::Timeout
+                | ErrorCategory::CommandFailed
+                | ErrorCategory::Other
+        )
+    }
+
     /// What recurring instances of this category suggest fixing.
     pub fn suggestion(self) -> &'static str {
         match self {
@@ -100,6 +136,12 @@ impl ErrorCategory {
             }
             ErrorCategory::BlockedByHook => {
                 "a habit keeps hitting a rule/hook — the rule blocks but doesn't prevent it"
+            }
+            ErrorCategory::SandboxNetwork => {
+                "the sandbox refused a host — allow it in the sandbox network settings if the work needs it"
+            }
+            ErrorCategory::SandboxWrite => {
+                "a write was refused (likely the sandbox) — allow the path in the sandbox filesystem settings, or keep writes inside the project"
             }
             ErrorCategory::CommandNotFound => "a missing tool; install it or note its absence",
             ErrorCategory::PathNotFound => {
@@ -164,6 +206,8 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         || has("blocked:")
     {
         ErrorCategory::BlockedByHook
+    } else if has("operation not permitted") || has("read-only file system") {
+        ErrorCategory::SandboxWrite
     } else if has("temporarily unavailable") || has("overloaded") {
         ErrorCategory::Transient
     } else if has("no such tool available") {
@@ -187,6 +231,34 @@ pub fn classify_error(text: &str) -> ErrorCategory {
         ErrorCategory::CommandFailed
     } else {
         ErrorCategory::Other
+    }
+}
+
+/// The failure a check runner printed even though the command exited 0 — the
+/// usual reason being `cmd 2>&1 | tail`, where the pipeline's status is
+/// `tail`'s. Read from the runner's own summary lines (cargo, rustc, tsc, bun,
+/// just), so it is a lexical heuristic, and it is only asked of check runs
+/// (`core::thrash::check_key`) whose result was not already a failure.
+pub fn masked_failure(output: &str) -> Option<ErrorCategory> {
+    let failed_tests = output.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("test result: FAILED")
+            || line
+                .strip_suffix(" fail")
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n > 0)
+    });
+    if failed_tests {
+        Some(ErrorCategory::TestFailure)
+    } else if output.contains("error[E")
+        || output.contains("error: could not compile")
+        || output.contains(": error TS")
+    {
+        Some(ErrorCategory::CompileError)
+    } else if output.contains("error: Recipe `") {
+        Some(ErrorCategory::CommandFailed)
+    } else {
+        None
     }
 }
 
@@ -308,6 +380,69 @@ mod tests {
             classify_error("Exit code 2 (eval): bad substitution"),
             ErrorCategory::CommandFailed
         );
+    }
+
+    #[test]
+    fn an_os_permission_refusal_is_a_sandbox_write() {
+        assert_eq!(
+            classify_error("rm: /tmp/example/x: Operation not permitted\nExit code 1"),
+            ErrorCategory::SandboxWrite
+        );
+        assert_eq!(
+            classify_error("touch: /tmp/example/y: Read-only file system"),
+            ErrorCategory::SandboxWrite
+        );
+    }
+
+    #[test]
+    fn a_sandbox_write_beats_the_path_it_names() {
+        // The refused path may also "not exist" from the sandbox's view; the
+        // refusal is the cause worth routing.
+        assert_eq!(
+            classify_error("mkdir: /tmp/example/a: Operation not permitted; No such file"),
+            ErrorCategory::SandboxWrite
+        );
+    }
+
+    #[test]
+    fn sandbox_categories_round_trip_and_are_actionable() {
+        for category in [ErrorCategory::SandboxNetwork, ErrorCategory::SandboxWrite] {
+            assert_eq!(ErrorCategory::from_label(category.label()), category);
+            assert!(category.is_actionable());
+            assert!(category.is_sandbox());
+        }
+        assert!(!ErrorCategory::PathNotFound.is_sandbox());
+    }
+
+    #[test]
+    fn a_runners_own_failure_line_reveals_a_masked_failure() {
+        assert_eq!(
+            masked_failure("running 3 tests\ntest result: FAILED. 1 passed; 2 failed"),
+            Some(ErrorCategory::TestFailure)
+        );
+        assert_eq!(
+            masked_failure(" 10 pass\n 2 fail\nRan 12 tests"),
+            Some(ErrorCategory::TestFailure)
+        );
+        assert_eq!(
+            masked_failure("error[E0308]: mismatched types\nerror: could not compile `x`"),
+            Some(ErrorCategory::CompileError)
+        );
+        assert_eq!(
+            masked_failure("src/a.ts(3,1): error TS2322: Type 'x' is not assignable"),
+            Some(ErrorCategory::CompileError)
+        );
+        assert_eq!(
+            masked_failure("error: Recipe `check` failed on line 12 with exit code 101"),
+            Some(ErrorCategory::CommandFailed)
+        );
+    }
+
+    #[test]
+    fn a_passing_runs_output_is_no_masked_failure() {
+        assert_eq!(masked_failure("test result: ok. 12 passed; 0 failed"), None);
+        assert_eq!(masked_failure(" 12 pass\n 0 fail\nRan 12 tests"), None);
+        assert_eq!(masked_failure("Finished `test` profile"), None);
     }
 
     #[test]

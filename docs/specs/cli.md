@@ -86,9 +86,14 @@ routed (`core::scope`):
 - **Friction categories** route by concentration: a strict-majority project owns
   the category (fix in that project's config); a spread category is global (a
   cross-project habit).
-- **Thrash** routes to the project it happened in — carried on the episode
-  itself, since an episode is scoped to one session and therefore to one project
-  (`events.md`); **cd% / prompting / token totals** are behavioral, hence global.
+- **Thrash** — file bursts and failing-check loops alike — routes to the
+  project it happened in — carried on the episode itself, since an episode is
+  scoped to one session and therefore to one project (`events.md`); **cd% /
+  prompting / token totals** are behavioral, hence global.
+- **Unsandboxed retries** route by concentration, like a friction category:
+  the fix is a sandbox allowlist entry, which lives in the settings of whichever
+  layer the retries concentrate in (a project's `.claude/settings.json`, or the
+  global one when they spread).
 
 `--scope` narrows a report to one layer: `global`, `project` (all projects), or
 `project:<slug>` (one). `doctor`, the optimize briefing, and (by default) the
@@ -104,9 +109,9 @@ ranking.
 | `rules` | Every catalogued rule (and `CLAUDE.md`) with its load history (`surfaces.md` "Rule loads"): load mode, loads, sessions loaded in **out of the observed sessions** it is measured against, tokens paid (static weight × loads), last loaded, and a status — `NEVER LOADED`, `ALWAYS LOADED` (a conditional rule paid in nearly every session), or `unmeasured` when too few observed sessions back a verdict. Conditional rules sort first, since only they can be flagged. The observed-session count is printed on every row because it is the gate: a store whose transcripts predate load records shows every rule unmeasured, never unloaded. `--scope` filters to one layer. |
 | `overhead` | Reconcile the empirical always-on floor (the leanest observed **session start**, not the context a skill happened to run at — `surfaces.md`) against the readable always-on config; the residual is the system prompt + built-in tools + MCP schemas the catalog cannot weigh. The per-project table carries the session count behind each floor, because the floor is a minimum over observations and a project with few sessions may never have caught a fresh one. Reports the metric as unavailable when no session start was observed at all. |
 | `prompts` | How the user steers the session: the mix of steer / correct / question / instruct prompts (`core::prompt`, lexical heuristics), with a verdict — heavy steering suggests more autonomy, frequent correction suggests clearer upfront specs. This is a behavioral signal, not a config metric; embeddings showed prompt *topics* do not map to reusable skills, so the value is in *how* you prompt, not *what about*. |
-| `failures` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Denials are categorised from the transcript's own denial marker; everything else by lexical heuristics. |
+| `failures` | Where the work stumbles: recurring tool failures by category (`core::friction` — edit-precondition, path-not-found, blocked-by-hook, …), ranked, each with what it suggests fixing and the originating-tool split. This analyses the *work*, not the config — where the real cost is. The classifier separates fixable friction from non-actionable noise (cancelled, transient). `--scope` follows the routing above: `global` = spread categories, `project` = each project's majority-owned categories, `project:<slug>` = everything in that one project (this subsumes the old `--project` flag). Denials are categorised from the transcript's own denial marker, a network refusal from the harness's `<sandbox_violations>` block (`sandbox-network`); everything else by lexical heuristics — including `sandbox-write`, read from the OS's `EPERM` wording and so labelled lower-confidence. Below the table, the **unsandboxed retries** in scope — Bash runs repeated with the sandbox disabled right after a sandboxed failure (`events.md`) — with the subset that followed a sandbox-classified failure, the part an allowlist entry removes; JSON carries both as `unsandboxed_retries`. |
 | `hooks` | What each configured hook costs and catches (`core::hook`, `events.md` "Hook runs"): its uses (the triggers its matcher selected — an estimate against today's config, `surfaces.md`), blocks and block rate, its own errors, the measured wall-clock tax (total / p50 / p95, with how many runs measured one), the context it injected — a prompt- or session-start hook's injection is labelled per prompt / per session as the standing cost it is — and what its blocks cost (mean retry calls until the same tool passed, and how many were never resolved; a heuristic, labelled so). A hook whose matcher never matched is flagged `NEVER MATCHED`, and a prompt- or session-start hook that injected context `STANDING CONTEXT`. Traces no single catalogued hook claims are listed apart: `UNATTRIBUTED` when Claude Code recorded no command and several of the user's hooks qualify, `ORPHANED` when none does (`surfaces.md`). This is not `failures`' `blocked-by-hook`, which counts the agent's blocked calls by category: `hooks` is per hook, and includes the hooks that never block. `--scope` filters catalogued rows as `inventory` does. |
-| `stuck` | Bursts of rapid re-edits to one file by one session (`core::thrash` — N+ edits within a few minutes), ranked. This isolates *where Claude got stuck and kept retrying* from healthy spread-out editing — an algorithmic signal a flat edit count cannot give. Observed: a file edited 25× in under 8 minutes. The table carries the project; `--format json` adds the session id and full path, which is what makes an episode investigable. |
+| `stuck` | Where Claude got stuck and kept retrying, from two sides (`core::thrash`). **Files**: bursts of rapid re-edits to one file by one session (N+ edits within a few minutes) — isolated from healthy spread-out editing, an algorithmic signal a flat edit count cannot give; observed: a file edited 25× in under 8 minutes. **Checks**: one test/build/lint check still failing after 3+ fix rounds in one session (4+ failing runs, edits in between) (`events.md`), with whether it was resolved — the point the "three rounds, then ask" rule says to stop. Each table carries the project; `--format json` adds the session id and full path (`episodes`) or check key and run counts (`checks`), which is what makes an episode investigable. A section with no episodes is omitted. |
 
 ### Output formats — human vs machine
 
@@ -256,7 +261,8 @@ plan, gate only on applying it" shape is the design; if it changes, update
 `INSTRUCTIONS` in `core::optimize` and this paragraph together.
 
 Crucially the briefing is the **complete** analysis, not a headline — every
-project's friction breakdown, the full Bash/hotspot/thrash detail, and the actual
+project's friction breakdown, the full Bash/hotspot/thrash detail (failing-check
+loops and unsandboxed retries included), and the actual
 unused / always-on-heavy surface lists with startup-vs-body token costs — **routed the same way
 the views are** (see "Scope"): global sections first, then one section per
 project, so the session fixes each finding in the layer that owns it. `--scope`

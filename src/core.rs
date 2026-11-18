@@ -2,6 +2,7 @@
 //! This layer is the tool's primary test surface (see `.claude/rules/tdd.md`).
 
 pub mod bucket;
+pub mod context_load;
 pub mod friction;
 pub mod hook;
 pub mod metrics;

@@ -13,12 +13,15 @@ use crate::adapter::config::{
     read_mcp_server_surfaces, read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::transcript::{
-    HookActivity, count_permission_denials, extract_hook_activity, extract_prompt_pointers,
-    extract_tool_errors, extract_work_events, parse_session, parse_subagent_sidecar, prompt_tokens,
-    session_cwd, subagent_id_from_file_name, subagent_prompt_id, subagent_sidecar_path,
-    subagents_dir,
+    HookActivity, count_permission_denials, extract_context_loads, extract_hook_activity,
+    extract_prompt_pointers, extract_tool_errors, extract_work_events, parse_session,
+    parse_subagent_sidecar, prompt_tokens, session_cwd, subagent_id_from_file_name,
+    subagent_prompt_id, subagent_sidecar_path, subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
+use crate::core::context_load::{
+    ContextLoad, LoadTuning, LoadVerdict, load_verdict, load_wedge, tokens_paid,
+};
 use crate::core::friction::ErrorCategory;
 use crate::core::hook::{
     CallResult, CatalogHook, HookDef, HookOutcome, HookTrace, HookUsage, Step, Unattributed,
@@ -37,7 +40,7 @@ use crate::core::surface::{
 };
 use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens, run_model};
-use crate::store::{AgentModelCost, SessionMeta, Store};
+use crate::store::{AgentModelCost, SessionMeta, Store, canonical_path};
 
 #[derive(Parser)]
 #[command(
@@ -113,6 +116,24 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
         /// Output format: table | markdown.
+        #[arg(long)]
+        format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// How often each rule (and CLAUDE.md) was actually loaded into context —
+    /// and which path-conditional rules never fire or fire in almost every
+    /// session.
+    Rules {
+        /// Show one config layer only: global (~/.claude) | project (all
+        /// projects' own config) | project:<slug> (one project's).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output format: table | markdown | json.
         #[arg(long)]
         format: Option<String>,
         /// Read the store as-is; skip the automatic refresh.
@@ -287,6 +308,17 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => waste(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db)?,
+        ),
+        Command::Rules {
+            scope,
+            format,
+            frozen,
+            db,
+        } => rules(
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
@@ -2021,6 +2053,11 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             })
             .collect();
         store.ingest_hook_activity(&meta.id, &meta.source_path, &hook_rows, &calls)?;
+        store.ingest_context_loads(
+            &meta.id,
+            &meta.source_path,
+            &session_context_loads(&transcript, &text),
+        )?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.
@@ -2261,6 +2298,83 @@ fn subagent_runs(transcript: &Path) -> (Vec<SubagentRun>, Vec<HookActivity>) {
     });
     link_runs(&mut runs);
     (runs, hooks)
+}
+
+/// Fold a file loaded inside a worktree checkout onto the same file in the
+/// parent checkout, as `normalize_root` folds the session itself: the session
+/// is the parent project's, its catalog is scanned at the parent's root, and a
+/// worktree's copy of a rule is that rule. Left unfolded, every load of it
+/// would miss the catalog while the session still counted as observed, and the
+/// rule would read as never firing. A path outside the worktree, or a cwd in
+/// no worktree, is returned as is.
+fn fold_worktree_path(path: &str, cwd: &str) -> String {
+    let root = normalize_root(cwd);
+    if root == cwd || root.is_empty() {
+        return path.to_string();
+    }
+    // The checkout is the root plus two whole segments: `.wt` and the
+    // worktree's own name. Cut at segment boundaries — a substring search for
+    // the name would match inside `.wt` itself for a worktree named `wt`.
+    let after_root = &cwd[root.len()..];
+    let mut end = 0;
+    for _ in 0..2 {
+        let rest = &after_root[end..];
+        let start = rest.len() - rest.trim_start_matches(['/', '\\']).len();
+        let len = rest[start..]
+            .find(['/', '\\'])
+            .unwrap_or(rest.len() - start);
+        if len == 0 {
+            return path.to_string();
+        }
+        end += start + len;
+    }
+    let checkout = &cwd[..root.len() + end];
+    match path.strip_prefix(checkout) {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => format!("{root}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Every config-file load of a session: its own transcript's, plus every
+/// subagent transcript's — a rule can fire only inside a subagent, and that is
+/// still this session's work (`docs/specs/events.md`). A load inside a
+/// worktree is folded onto the parent checkout (`fold_worktree_path`), then
+/// canonicalized like the catalog's, so the join holds even if a
+/// transcript recorded a linked path; a file that no longer exists keeps the
+/// path as recorded.
+fn session_context_loads(transcript: &Path, text: &str) -> Vec<ContextLoad> {
+    let mut loads = own_context_loads(text);
+    if let Ok(entries) = fs::read_dir(subagents_dir(transcript)) {
+        let mut runs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        runs.sort();
+        for run in runs {
+            if let Ok(run_text) = fs::read_to_string(&run) {
+                loads.extend(own_context_loads(&run_text));
+            }
+        }
+    }
+    for load in &mut loads {
+        if let Some(resolved) = canonical_path(&load.path) {
+            load.path = resolved;
+        }
+    }
+    loads
+}
+
+/// One transcript's loads, folded against that transcript's own cwd: a
+/// subagent can run in a worktree of its own, apart from its parent's.
+fn own_context_loads(text: &str) -> Vec<ContextLoad> {
+    let mut loads = extract_context_loads(text);
+    if let Some(cwd) = session_cwd(text) {
+        for load in &mut loads {
+            load.path = fold_worktree_path(&load.path, &cwd);
+        }
+    }
+    loads
 }
 
 fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
@@ -2640,9 +2754,9 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
          CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
          \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
          is the whole definition, which for a skill or agent is paid only on invocation.\n\
-         UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
-         using them leaves no trace in transcripts. A hook's uses are the calls its\n\
-         matcher selected (see `cclens hooks`).",
+         UNUSED marks delete candidates. A load is not a use, so rules and CLAUDE.md show\n\
+         no uses here — `cclens rules` shows how often each one was loaded. A hook's\n\
+         uses are the calls its matcher selected (see `cclens hooks`).",
     );
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
@@ -2793,6 +2907,43 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
         }
     }
 
+    // Rule loads raise their own wedges; a load is not a use, so the row's
+    // evidence is its load history rather than a `uses` count.
+    let rule_stats = store.rule_load_stats()?;
+    let mut load_evidence: std::collections::HashMap<(&str, &str, &str, &str), String> =
+        std::collections::HashMap::new();
+    for stat in rule_stats
+        .iter()
+        .filter(|s| in_scope(filter, &s.scope, &s.project))
+    {
+        let load_mode = LoadMode::from_label(&stat.load_mode).unwrap_or(LoadMode::OnDemand);
+        let verdict = load_verdict(load_mode, stat.history(), LoadTuning::default());
+        let Some(wedge) = load_wedge(verdict) else {
+            continue;
+        };
+        load_evidence.insert(
+            (&stat.kind, &stat.id, &stat.scope, &stat.project),
+            format!("{}/{} sess", stat.sessions, stat.observed_sessions),
+        );
+        found.push(Row {
+            wedge,
+            kind: &stat.kind,
+            id: &stat.id,
+            scope: &stat.scope,
+            project: &stat.project,
+            uses: stat.loads as i64,
+            measurable: false,
+            savings: startup_savings(load_mode, Some(0)),
+            startup_tokens: Some(0),
+            on_demand_tokens: on_demand_tokens(load_mode, stat.static_tokens),
+        });
+    }
+    let evidence = |row: &Row| {
+        load_evidence
+            .get(&(row.kind, row.id, row.scope, row.project))
+            .cloned()
+    };
+
     // Rank by real startup savings: measured tokens (desc), then unmeasured MCP
     // schemas, then declutter-only.
     found.sort_by_key(|row| savings_rank(row.savings));
@@ -2817,6 +2968,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                     "startup_tokens": row.startup_tokens,
                     "on_demand_tokens": row.on_demand_tokens,
                     "uses": if row.measurable { Some(row.uses) } else { None },
+                    "load_evidence": evidence(row),
                     "suggestion": waste_suggestion(row.kind, row.wedge, row.savings, row.on_demand_tokens),
                 })
             })
@@ -2840,7 +2992,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
             let uses_cell = if row.measurable {
                 row.uses.to_string()
             } else {
-                "-".to_string()
+                evidence(row).unwrap_or_else(|| "-".to_string())
             };
             vec![
                 row.wedge.label().to_string(),
@@ -2873,6 +3025,143 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
         format,
     );
     Ok(())
+}
+
+/// Every catalogued rule and `CLAUDE.md` with its load history and the verdict
+/// on its `paths:` condition (`docs/specs/surfaces.md` "Rule loads"). The
+/// observed-session count rides on every row because it is the gate: below the
+/// minimum a rule is unmeasured, never "never loaded".
+fn rules(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let tuning = LoadTuning::default();
+    let mut rows: Vec<_> = store
+        .rule_load_stats()?
+        .into_iter()
+        .filter(|s| in_scope(filter, &s.scope, &s.project))
+        .map(|stat| {
+            let load_mode = LoadMode::from_label(&stat.load_mode).unwrap_or(LoadMode::OnDemand);
+            let verdict = load_verdict(load_mode, stat.history(), tuning);
+            (stat, verdict)
+        })
+        .collect();
+    // Only a conditional rule can be flagged, so those lead; within a verdict
+    // the costliest history first.
+    rows.sort_by_key(|(stat, verdict)| {
+        (
+            verdict_rank(*verdict),
+            std::cmp::Reverse(tokens_paid(stat.static_tokens, stat.loads).unwrap_or(0)),
+            stat.id.clone(),
+        )
+    });
+
+    if format == Format::Json {
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(stat, verdict)| {
+                serde_json::json!({
+                    "kind": stat.kind,
+                    "id": stat.id,
+                    "scope": stat.scope,
+                    "project": if stat.project.is_empty() { None } else { Some(&stat.project) },
+                    "load_mode": stat.load_mode,
+                    "static_tokens": stat.static_tokens,
+                    "loads": stat.loads,
+                    "sessions": stat.sessions,
+                    "observed_sessions": stat.observed_sessions,
+                    "tokens_paid": tokens_paid(stat.static_tokens, stat.loads),
+                    "last_loaded_epoch": stat.last_loaded_epoch,
+                    "verdict": verdict.label(),
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({
+            "min_observed_sessions": tuning.min_observed_sessions,
+            "always_on_share": tuning.always_on_share,
+            "rules": items,
+        }));
+    }
+    if rows.is_empty() {
+        println!("no rules catalogued — run `cclens analyze` first");
+        return Ok(());
+    }
+
+    preamble(
+        format,
+        &format!(
+            "How often each rule and CLAUDE.md actually entered the context. \"sessions\" is\n\
+             observed sessions it loaded in / observed sessions — those new enough to record\n\
+             loads (Claude Code 2.1.30x+); older transcripts count for nothing, not zero.\n\
+             A path-conditional rule is NEVER LOADED with 0 loads over {min}+ observed\n\
+             sessions, ALWAYS LOADED in {share:.0}%+ of them; with fewer than {min} it is\n\
+             unmeasured. \"tok paid\" is the file's weight times its loads.",
+            min = tuning.min_observed_sessions,
+            share = tuning.always_on_share * 100.0,
+        ),
+    );
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|(stat, verdict)| {
+            vec![
+                format!("{}/{}", stat.kind, stat.id),
+                scope_cell(&stat.scope, &stat.project),
+                stat.load_mode.clone(),
+                stat.loads.to_string(),
+                format!("{}/{}", stat.sessions, stat.observed_sessions),
+                tokens_paid(stat.static_tokens, stat.loads)
+                    .map_or_else(|| "?".to_string(), |n| n.to_string()),
+                stat.last_loaded_epoch.map_or_else(
+                    || "-".to_string(),
+                    |epoch| bucket_label(epoch, Bucket::Day, JST_OFFSET_SECS),
+                ),
+                verdict_cell(*verdict).to_string(),
+            ]
+        })
+        .collect();
+    render(
+        &[
+            "surface",
+            "scope",
+            "load mode",
+            "loads",
+            "sessions",
+            "tok paid",
+            "last loaded",
+            "status",
+        ],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+            Align::Left,
+        ],
+        &table,
+        format,
+    );
+    Ok(())
+}
+
+fn verdict_rank(verdict: LoadVerdict) -> u8 {
+    match verdict {
+        LoadVerdict::NeverLoaded => 0,
+        LoadVerdict::AlwaysLoaded => 1,
+        LoadVerdict::Selective => 2,
+        LoadVerdict::Unmeasured => 3,
+        LoadVerdict::Unconditional => 4,
+    }
+}
+
+fn verdict_cell(verdict: LoadVerdict) -> &'static str {
+    match verdict {
+        LoadVerdict::NeverLoaded => "NEVER LOADED",
+        LoadVerdict::AlwaysLoaded => "ALWAYS LOADED",
+        LoadVerdict::Selective => "",
+        LoadVerdict::Unmeasured => "(unmeasured)",
+        LoadVerdict::Unconditional => "(always-on)",
+    }
 }
 
 /// Sort key: real measured savings first (largest first), then unmeasured MCP
@@ -2916,6 +3205,21 @@ fn savings_suggestion(wedge: Wedge, savings: StartupSavings, on_demand: Option<u
         Some(n) => format!("body is {n} tok when invoked"),
         None => "body is on-demand".to_string(),
     };
+    let per_load = on_demand.map_or_else(String::new, |n| format!(", {n} tok per load"));
+    match wedge {
+        Wedge::NeverFires => {
+            return format!(
+                "never loaded: narrow the paths: globs, or delete (declutter only{per_load})"
+            );
+        }
+        Wedge::AlwaysLoaded => {
+            return format!(
+                "loads in almost every session{per_load}: drop paths: to load once at \
+                 start, or narrow the globs"
+            );
+        }
+        Wedge::Unused | Wedge::AlwaysOnHeavy | Wedge::CostlyRare => {}
+    }
     match savings {
         StartupSavings::Tokens(n) => format!("removing saves ~{n} tokens every session"),
         StartupSavings::UnknownSchema => {
@@ -3446,6 +3750,61 @@ mod tests {
     }
 
     #[test]
+    fn a_load_inside_a_worktree_folds_onto_the_parent_checkout() {
+        assert_eq!(
+            fold_worktree_path(
+                "/tmp/example/repo/.wt/feat-x/.claude/rules/rust.md",
+                "/tmp/example/repo/.wt/feat-x/src"
+            ),
+            "/tmp/example/repo/.claude/rules/rust.md"
+        );
+    }
+
+    #[test]
+    fn a_load_outside_the_worktree_keeps_its_path() {
+        assert_eq!(
+            fold_worktree_path(
+                "/tmp/example/home/.claude/rules/rust.md",
+                "/tmp/example/repo/.wt/feat-x"
+            ),
+            "/tmp/example/home/.claude/rules/rust.md"
+        );
+    }
+
+    #[test]
+    fn a_load_in_a_plain_checkout_keeps_its_path() {
+        assert_eq!(
+            fold_worktree_path(
+                "/tmp/example/repo/.claude/rules/rust.md",
+                "/tmp/example/repo"
+            ),
+            "/tmp/example/repo/.claude/rules/rust.md"
+        );
+    }
+
+    #[test]
+    fn a_worktree_named_like_its_marker_folds_at_segment_boundaries() {
+        assert_eq!(
+            fold_worktree_path(
+                "/tmp/example/repo/.wt/wt/.claude/rules/rust.md",
+                "/tmp/example/repo/.wt/wt"
+            ),
+            "/tmp/example/repo/.claude/rules/rust.md"
+        );
+    }
+
+    #[test]
+    fn a_backslash_worktree_load_folds_too() {
+        assert_eq!(
+            fold_worktree_path(
+                r"C:\repo\.wt\feat-x\.claude\rules\rust.md",
+                r"C:\repo\.wt\feat-x"
+            ),
+            r"C:\repo\.claude\rules\rust.md"
+        );
+    }
+
+    #[test]
     fn normalize_root_folds_a_worktree_path_onto_its_repo() {
         assert_eq!(
             normalize_root("/tmp/example/repo/.wt/feat-x"),
@@ -3503,6 +3862,15 @@ mod tests {
         assert_eq!(
             savings_cell(StartupSavings::Tokens(922), Some(922)),
             "922/sess".to_string()
+        );
+    }
+
+    #[test]
+    fn a_never_firing_rule_is_suggested_as_declutter_with_its_per_load_cost() {
+        let suggestion = savings_suggestion(Wedge::NeverFires, StartupSavings::Declutter, Some(80));
+        assert_eq!(
+            suggestion,
+            "never loaded: narrow the paths: globs, or delete (declutter only, 80 tok per load)"
         );
     }
 

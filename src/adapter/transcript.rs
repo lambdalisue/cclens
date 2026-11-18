@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::adapter::config::approx_tokens;
+use crate::core::context_load::{ContextLoad, FileClass, LoadTrigger};
 use crate::core::friction::{ErrorCategory, classify_error};
 use crate::core::hook::{CallResult, HookOutcome, HookTrace, Step};
 use crate::core::path::basename;
@@ -849,6 +850,108 @@ fn named_command(command: &str) -> Option<String> {
         .strip_prefix("command hook")
         .is_some_and(|rest| rest.trim().chars().all(|ch| ch.is_ascii_digit()));
     (!anonymous && !command.is_empty()).then(|| command.to_string())
+}
+
+/// Extract every config-file load a transcript records: each file the
+/// `instructions` attachment lists at session start, and each `nested_memory`
+/// attachment written when a touched file pulled in a conditional rule or a
+/// subdirectory `CLAUDE.md` (`docs/specs/session-format.md`). Only path,
+/// timestamp and file class are read — never the injected text.
+pub fn extract_context_loads(jsonl: &str) -> Vec<ContextLoad> {
+    let mut loads = Vec::new();
+    for line in jsonl.lines() {
+        // Cheap pre-filter: nearly every line is not a load attachment.
+        if !(line.contains("\"nested_memory\"") || line.contains("\"instructions\"")) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("attachment") {
+            continue;
+        }
+        let Some(epoch_ms) = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_ms)
+        else {
+            continue;
+        };
+        let Some(attachment) = record.get("attachment") else {
+            continue;
+        };
+        let version = record
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match attachment.get("type").and_then(Value::as_str) {
+            Some("instructions") => {
+                let files = attachment.get("files").and_then(Value::as_array);
+                for file in files.into_iter().flatten() {
+                    let Some(path) = file.get("path").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let class = if file.get("type").and_then(Value::as_str) == Some("AutoMem") {
+                        FileClass::Memory
+                    } else if is_rules_path(path) {
+                        FileClass::Rule
+                    } else {
+                        FileClass::ClaudeMd
+                    };
+                    loads.push(ContextLoad {
+                        epoch_ms,
+                        path: path.to_string(),
+                        class,
+                        trigger: LoadTrigger::Startup,
+                        version: version.clone(),
+                    });
+                }
+            }
+            Some("nested_memory") => {
+                let content = attachment.get("content");
+                let Some(path) = attachment
+                    .get("path")
+                    .or_else(|| content.and_then(|c| c.get("path")))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let is_rule = content
+                    .and_then(|c| c.get("isRule"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let has_globs = content
+                    .and_then(|c| c.get("globs"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|globs| !globs.is_empty());
+                let auto_memory =
+                    content.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("AutoMem");
+                let class = if is_rule || has_globs {
+                    FileClass::Rule
+                } else if auto_memory {
+                    FileClass::Memory
+                } else {
+                    FileClass::ClaudeMd
+                };
+                loads.push(ContextLoad {
+                    epoch_ms,
+                    path: path.to_string(),
+                    class,
+                    trigger: LoadTrigger::OnDemand,
+                    version,
+                });
+            }
+            _ => {}
+        }
+    }
+    loads
+}
+
+/// Whether a startup-loaded file sits under a `rules` directory. The
+/// `instructions` entry does not say which files are rules, and the label only
+/// matters for a load the catalog cannot match by path.
+fn is_rules_path(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| segment == "rules")
 }
 
 /// Count the denials an allow rule could have prevented — the friction signal
@@ -1742,5 +1845,147 @@ mod tests {
             })
             .collect();
         assert_eq!(results, [CallResult::Denied, CallResult::Succeeded]);
+    }
+    fn attachment(timestamp: &str, attachment: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "attachment",
+            "timestamp": timestamp,
+            "sessionId": "s-1",
+            "attachment": attachment,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn startup_instructions_yield_one_load_per_file() {
+        let line = attachment(
+            "2026-01-01T00:00:00.000Z",
+            serde_json::json!({"type": "instructions", "files": [
+                {"path": "/tmp/example/home/.claude/CLAUDE.md", "type": "User", "content": "x"},
+                {"path": "/tmp/example/home/.claude/rules/style.md", "type": "User", "content": "x"},
+            ]}),
+        );
+        let loads = extract_context_loads(&line);
+        assert_eq!(
+            loads,
+            vec![
+                ContextLoad {
+                    epoch_ms: 1_767_225_600_000,
+                    path: "/tmp/example/home/.claude/CLAUDE.md".to_string(),
+                    class: FileClass::ClaudeMd,
+                    trigger: LoadTrigger::Startup,
+                    version: None,
+                },
+                ContextLoad {
+                    epoch_ms: 1_767_225_600_000,
+                    path: "/tmp/example/home/.claude/rules/style.md".to_string(),
+                    class: FileClass::Rule,
+                    trigger: LoadTrigger::Startup,
+                    version: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_memory_in_startup_instructions_is_memory() {
+        let line = attachment(
+            "2026-01-01T00:00:00.000Z",
+            serde_json::json!({"type": "instructions", "files": [
+                {"path": "/tmp/example/memory/MEMORY.md", "type": "AutoMem"},
+            ]}),
+        );
+        assert_eq!(extract_context_loads(&line)[0].class, FileClass::Memory);
+    }
+
+    #[test]
+    fn a_nested_memory_rule_is_an_on_demand_rule_load() {
+        let line = attachment(
+            "2026-01-01T00:00:01.000Z",
+            serde_json::json!({"type": "nested_memory", "path": "/tmp/example/repo/.claude/rules/rust.md",
+                "content": {"type": "Project", "isRule": true, "globs": ["**/*.rs"], "content": "x"}}),
+        );
+        assert_eq!(
+            extract_context_loads(&line),
+            vec![ContextLoad {
+                epoch_ms: 1_767_225_601_000,
+                path: "/tmp/example/repo/.claude/rules/rust.md".to_string(),
+                class: FileClass::Rule,
+                trigger: LoadTrigger::OnDemand,
+                version: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_nested_memory_rule_without_is_rule_is_recognised_by_its_globs() {
+        let line = attachment(
+            "2026-01-01T00:00:01.000Z",
+            serde_json::json!({"type": "nested_memory", "path": "/tmp/example/rules/ts.md",
+                "content": {"type": "User", "globs": ["**/*.ts"]}}),
+        );
+        assert_eq!(extract_context_loads(&line)[0].class, FileClass::Rule);
+    }
+
+    #[test]
+    fn a_nested_claude_md_is_an_on_demand_claude_md_load() {
+        let line = attachment(
+            "2026-01-01T00:00:01.000Z",
+            serde_json::json!({"type": "nested_memory", "path": "/tmp/example/repo/sub/CLAUDE.md",
+                "content": {"type": "Project"}}),
+        );
+        let loads = extract_context_loads(&line);
+        assert_eq!(loads[0].class, FileClass::ClaudeMd);
+        assert_eq!(loads[0].trigger, LoadTrigger::OnDemand);
+    }
+
+    #[test]
+    fn a_nested_memory_falls_back_to_its_content_path() {
+        let line = attachment(
+            "2026-01-01T00:00:01.000Z",
+            serde_json::json!({"type": "nested_memory",
+                "content": {"path": "/tmp/example/rules/go.md", "globs": ["**/*.go"]}}),
+        );
+        assert_eq!(
+            extract_context_loads(&line)[0].path,
+            "/tmp/example/rules/go.md"
+        );
+    }
+
+    #[test]
+    fn other_attachments_and_records_yield_no_loads() {
+        let text = [
+            attachment(
+                "2026-01-01T00:00:00.000Z",
+                serde_json::json!({"type": "skill_listing", "content": "x"}),
+            ),
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"nested_memory instructions"}}"#.to_string(),
+            attachment(
+                "2026-01-01T00:00:00.000Z",
+                serde_json::json!({"type": "nested_memory", "content": {}}),
+            ),
+        ]
+        .join("\n");
+        assert!(extract_context_loads(&text).is_empty());
+    }
+
+    #[test]
+    fn a_load_carries_the_version_that_wrote_it() {
+        let line = serde_json::json!({"type": "attachment", "version": "2.1.302",
+            "timestamp": "2026-01-01T00:00:01.000Z",
+            "attachment": {"type": "nested_memory", "path": "/tmp/example/rules/go.md"}})
+        .to_string();
+        assert_eq!(
+            extract_context_loads(&line)[0].version.as_deref(),
+            Some("2.1.302")
+        );
+    }
+
+    #[test]
+    fn a_load_without_a_timestamp_is_skipped() {
+        let line = serde_json::json!({"type": "attachment", "attachment": {
+            "type": "nested_memory", "path": "/tmp/example/rules/go.md"}})
+        .to_string();
+        assert!(extract_context_loads(&line).is_empty());
     }
 }

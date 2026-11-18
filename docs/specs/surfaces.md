@@ -45,7 +45,7 @@ scope, and the effective join"). Scope is also the routing key for reports: a
 wedge on a project-scoped surface is that project's finding, not a global one
 (`cli.md` `--scope`).
 
-### Usage-measurable vs catalog-only surfaces
+### Usage-measurable, load-measurable, and catalog-only surfaces
 
 Not every surface kind emits a usage signal, and conflating the two is the
 fastest way to a wrong recommendation. Each kind is classified:
@@ -57,8 +57,8 @@ fastest way to a wrong recommendation. Each kind is classified:
 | `mcp_server` / `mcp_tool` | usage-measurable | `tool_use` |
 | `permission` | usage-measurable (partly heuristic) | `permission_prompt` from the denial marker, falling back to denial text — lower confidence |
 | `hook` | usage-measurable **where its trigger is countable** (estimated) | `tool_call` (or prompt / session) counts its matcher selects; `hook_runs` traces for what it did |
-| `rule` | **catalog-only** | none (injected context; no invocation event) |
-| `claude_md` | **catalog-only** | none (always-on; usage is not the question — static cost is) |
+| `rule` | **load-measurable** (gated) | `context_load`, joined by canonical path — only in sessions that carry load records |
+| `claude_md` | **load-measurable** (gated) | `context_load` (always-on; usage is not the question — static cost is, so the load confirms the cost rather than the use) |
 
 For a **catalog-only** surface, absence of events is *not* evidence of disuse —
 no event could ever appear. The join still lists it (with zero usage), but the
@@ -124,6 +124,14 @@ catalogued hook could have left is **orphaned usage**: a hook injected from
 outside the user's settings (a plugin, a wrapper that passes `--settings`) is
 real usage the catalog cannot see.
 
+A **load-measurable** surface sits in between. A load says the file entered the
+context, not that the model used it, so a load is never an invocation: these
+kinds stay out of **Unused** / **Costly + rare**, whose `uses` count would read
+"loaded every session" as heavy use. And the signal is only as old as the
+records behind it, so every load metric is measured against the **observed
+sessions** — the ones that could have shown a load (below) — never against the
+whole store.
+
 ## The join
 
 ```mermaid
@@ -150,7 +158,8 @@ its evidence; acting (or the future AI layer proposing) is downstream.
 | **Unused** | installed, **zero** events (over the window); for a hook, zero triggering occurrences | usage-measurable kind only (a hook only when its trigger is countable) | delete / disable (a hook: fix or drop the matcher) |
 | **Costly + rare** | high static or runtime cost, low usage | usage-measurable kind | trim, or make on-demand |
 | **Always-on heavy** | startup-full load mode, large static cost, confirmed against observed context (below) | static cost + observed `ctx_start` | slim, or move to a path-conditional rule / on-demand skill |
-| **Never-fires rule** | path-conditional rule whose `paths:` never matched session activity | rule paths × activity file-paths (see below) | narrow or delete |
+| **Never-fires rule** | path-conditional rule with **zero** loads across enough observed sessions | `context_load` + observed sessions (below) | narrow the globs, or delete |
+| **Effectively always-on** | path-conditional rule loaded in nearly every observed session | `context_load` + observed sessions (below) | drop `paths:` (load once at start), or narrow the globs |
 | **Redundant** | surfaces with overlapping purpose, usage splitting between them | a similarity signal (not in v1 schema — below) | merge |
 | **Recurring friction** | repeated permission denials for the same operation | `permission_prompt` (partly heuristic) | add an allow rule |
 | **Orphaned usage** | events with no matching surface | any usage event | re-add config, or ignore if intentional |
@@ -183,14 +192,65 @@ unlabelled number there becomes a fix proposal that frees nothing.
 
 The "Requires" column makes the coverage explicit: **Unused** and **Costly +
 rare** apply only to usage-measurable kinds — never to `rule` / `claude_md`, and
-to a `hook` only when its trigger is countable (above). A few wedges depend on signals the tool does not yet fully have:
+to a `hook` only when its trigger is countable (above).
 
-- **Never-fires rule** needs evidence a rule's `paths:` glob *could* have fired.
-  The only honest source is session activity — did any file matching the glob
-  appear as a `tool_use` target (Read/Edit/Write) in the window? That requires
-  extracting tool-use file targets, a usage signal **not in v1**; until then this
-  wedge is aspirational and labelled so, not computed from "zero events" (a rule
-  has no events regardless).
+### Rule loads: never-fires and effectively always-on
+
+A `paths:`-conditional rule loads only when a matching file is touched, and each
+load is a `context_load` record (`session-format.md`). Re-implementing Claude
+Code's glob matching against `tool_use` targets was the earlier plan; the load
+record makes it unnecessary and is strictly better evidence — it is the matcher's
+own verdict, it catches `Bash` touches a target scan would miss, and it needs no
+copy of the glob semantics that could drift from upstream. Unconditional rules
+and `CLAUDE.md` load at every start, so their records confirm the always-on cost
+but cannot flag anything; both wedges apply to conditional rules only.
+
+Per rule (`core::context_load`) the metrics are: **loads**, **sessions** loaded
+in, **tokens paid** (static weight × loads — a load re-pays the whole file),
+**last loaded**, and the **observed sessions** they are measured against.
+
+**Observed sessions are the gate.** A session can show a load only if its
+Claude Code version writes the records. A session counts as observed when it
+carries at least one load of any file (every session of a recording version
+loads its always-on files) **and** the newest version that wrote its loads is
+at or above the oldest version seen writing an on-demand load
+(`core::context_load::recording_floor`). The start-time records shipped a few
+versions before the on-demand ones, so a session from that gap shows startup
+loads it could not have paired with conditional ones. The gate is a version,
+not a date: an older install can keep writing transcripts after a newer one
+has (another machine sharing the config root, say), and a time cutoff would
+admit those sessions as observed. A session with no readable version is not
+observed.
+
+A row's reach follows the same attribution as its loads (`storage.md`
+`context_loads`), so its share is one population over one population: a
+project rule counts its own project's observed sessions; a global rule counts
+every observed session except those of a project that owns a row for the same
+file, whose loads land on that project's row instead. Two rows of one scope naming one
+file (a symlinked alias) can take a load on one row only, so the others are
+reported unmeasured rather than as never firing. A transcript written
+before the records existed therefore never contributes "zero loads" — it
+contributes nothing — and a rule with too few observed sessions is reported
+**unmeasured**, never never-fired.
+
+- **Never-fires rule**: zero loads over at least `MIN_OBSERVED_SESSIONS`
+  observed sessions. The glob matched nothing the work touched; narrow it to
+  what the rule is really about, or delete the rule. Ranked as declutter —
+  a conditional rule costs nothing until it loads — so this is hygiene and
+  a sign of a mis-targeted glob, not a token saving.
+- **Effectively always-on**: loaded in at least `ALWAYS_ON_SHARE` of its
+  observed sessions (with the same minimum). The condition buys nothing: the
+  rule is paid in nearly every session anyway, and mid-session, so it is
+  re-paid after each compaction. Either drop `paths:` so it loads once at
+  start, or narrow the globs if the rule was meant for a corner of the tree.
+
+Both thresholds are tuning constants injected into the core, like the other
+wedges' "high cost" / "low usage" figures. Window and scope semantics are the
+same as every wedge: the window is the store's history, and a project rule is
+that project's finding.
+
+A few wedges depend on signals the tool does not yet fully have:
+
 - **Redundant** needs a purpose/similarity signal (e.g. derived from each
   surface's `description`), which the v1 schema does not carry; it lands in
   `attrs_json` or is scoped out of v1 like the AI layer.

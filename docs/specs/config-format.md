@@ -182,20 +182,28 @@ any other surface; when it is not, the surface is recorded with an unknown
 static cost and the report flags it rather than reporting a false zero. The
 runtime side is unaffected — MCP `tool_use` still shows up in `events`.
 
-**Investigated and found unmeasurable from local data (the honest limit).** None
-of the would-be sources exist: `mcp.json` holds only launch config
-(`command`/`args`), no schema; there is no on-disk cache of advertised tool
-definitions (`mcp-needs-auth-cache.json` is auth state only); the transcript
-exposes only the tools that were *used*, so a server's full tool count is unknown
-and an *unused* server — exactly the one worth flagging — yields no signal at
-all. A differential (baseline with vs without a server) is also unavailable
-because every project shares the global `mcp.json`. A "tool count × average
-schema size" estimate would therefore be a fabrication for the cases that matter,
-so the tool does **not** invent one. The honest substitutes it does provide:
-per-server **call frequency** (`inventory` / `waste` — a used vs dead-weight
-signal), and the **residual** in `overhead` (an upper bound on system + built-in
-tools + all MCP schemas combined). Isolating one server's cost would need runtime
-schema access this tool does not have.
+**Unmeasurable from config, measurable from the request shape.** No config-side
+source exists: `mcp.json` holds only launch config (`command`/`args`), no
+schema; there is no on-disk cache of advertised tool definitions
+(`mcp-needs-auth-cache.json` is auth state only). So the config adapter still
+records `mcp_server` / `mcp_tool` with an unknown static cost — it never invents a
+"tool count × average schema size" figure.
+
+Transcripts from releases that record the request shape (`session-format.md`)
+close the gap from the usage side instead: every tool the server advertised
+reaches the transcript, eager ones as full definitions in the shape and deferred
+ones as a line in the deferred listing, plus the server's instructions block.
+The transcript adapter weighs those with the same estimator as config text
+(`approx_tokens`), and a server's **measured startup cost** is the sum over the
+latest session that saw it (`Store::measured_mcp_startup`): eager definitions +
+listing lines + instructions. Only a session whose startup shape was recorded counts, since
+without it the eager definitions are unknown rather than zero. Where that measurement exists it stands in for
+the unknown `startup_tokens` of the server's catalog row in the effective
+catalog (`inventory`, `waste`) — a project-scoped row reads only its own
+project's sessions, since two projects may configure one server name with
+different tools, and a global row reads the latest session anywhere — so the server ranks among measured always-on
+costs instead of as "schema?"; a server never seen in a recorded shape — an
+older transcript tree, or a server that never connected — stays unknown.
 
 ## Frontmatter the adapter reads
 

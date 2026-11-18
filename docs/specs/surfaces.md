@@ -177,8 +177,11 @@ The ranking (see `core::surface`):
 
 - **measured tokens** — always-on config (`startup_full`): removing it saves that
   many tokens every session. Ranked first, largest first.
-- **unknown schema** — an MCP server (`tool_schema`): a real every-session cost
-  the catalog cannot weigh; flagged, ranked next.
+  An MCP server (`tool_schema`) whose startup cost was measured from the request
+  shape (`config-format.md`) ranks here too, by that measured figure.
+- **unknown schema** — an MCP server (`tool_schema`) never seen in a recorded
+  request shape: a real every-session cost nothing could weigh; flagged, ranked
+  next.
 - **declutter** — on-demand / path-conditional bodies (skills, agents,
   conditional rules): ~no startup cost, so an unused one is namespace hygiene,
   not savings. Ranked last and labelled as such.
@@ -293,16 +296,62 @@ rather than a substitute.
 This is implemented as the `overhead` command (`cli.md`): it reports the observed
 floor, the readable config that accounts for part of it, and the **residual** —
 the floor minus the config — which is everything not in the user's files: the
-system prompt, built-in tools, and **MCP tool schemas** the catalog cannot weigh
-(`config-format.md` marks `mcp_tool` static cost unknown). The residual is how
-the tool gives an empirical handle on MCP cost despite not reading the schema:
-observed against a real tree, the readable config was a small fraction (~6%) of a
-much larger always-on floor, redirecting "what to slim" from rules toward the
-tool/MCP surface. Per-project floors are also shown, but they are confounded by
-how early in a session a skill was first invoked (a project whose skills only ran
-deep in long sessions shows an inflated floor), so the **global** floor is the
-trustworthy baseline; the per-project view is suggestive, not a clean per-server
-measurement.
+system prompt, built-in tools, and MCP tool schemas. Observed against a real
+tree, the readable config was a small fraction (~6%) of a much larger always-on
+floor, redirecting "what to slim" from rules toward the tool/MCP surface.
+Per-project floors are also shown, each with the session count behind it, since
+a project with few sessions may never have caught a fresh start; the **global**
+floor is the trustworthy baseline.
+
+### Decomposing the residual from the request shape
+
+Where transcripts record the request shape (`session-format.md`), the residual
+stops being one opaque number. `overhead` weighs the components of the **latest
+session's first main-loop shape** — the latest, because the question is what the
+current setup costs, and the floor is a minimum over history that an old,
+leaner setup may have set:
+
+| Component | Measured from |
+| --- | --- |
+| system prompt | the shape's system blocks |
+| built-in tools | eager (non-`defer_loading`) tool definitions whose name is not `mcp__…` |
+| MCP eager tools | eager `mcp__<server>__…` definitions, also split per server |
+| deferred tool listing | the deferred listing's lines, each tool counted once per session |
+| MCP instructions | each server's instructions block, once per session |
+
+The figures use the config estimator (`config-format.md`), so they are estimates
+on the same scale as `startup_tokens`, not billing figures. They are reported
+beside that session's observed start and the readable config, and what neither
+covers — the opening prompt, harness reminders, the estimator's error — is shown
+as the remainder rather than folded into a component. The listings arrive as
+messages, and MCP servers that connect after the first request add theirs later,
+so these components are counted over the whole session, not only before its
+first request: they are paid every session either way. Sessions whose transcript
+records no shape (older releases), or not the shape of their first request,
+contribute nothing to the decomposition, and
+`overhead` says so instead of reporting zeros.
+
+### Eager vs deferred tools
+
+Per tool, per session, the shape and listings say whether it was **eager** (its
+definition in the first main-loop shape) or **deferred** (announced in the
+listing, loadable through `ToolSearch`), and the transcript says whether it was
+**loaded** (a `ToolSearch` record names it) and how often it was **called**
+(`tool_use`). Aggregated across sessions (`core::tool_load`), that yields two
+wedges in opposite directions:
+
+| Wedge | Condition | Suggested move |
+| --- | --- | --- |
+| **Defer candidate** | an eager MCP tool called in few of the sessions that paid for it | defer it (tool search), so its schema is paid only when loaded |
+| **Eager candidate** | a deferred tool loaded in most of the sessions that listed it | load it eagerly: each `ToolSearch` load costs a turn, paid in nearly every session anyway |
+
+Both wedges are limited to MCP tools: a built-in tool's loading is upstream's
+choice, not config the user can change, so naming one would be a finding without
+a fix. A tool is judged only in the mode it is in now (its latest session):
+history from before a switch would otherwise flag it both ways at once. Both wedges need a minimum number of sessions before they
+fire, and both carry their evidence (sessions, calls or loads, schema weight) so
+the reader can judge the trade: deferring a schema saves its tokens every session
+but costs a turn whenever it is needed.
 
 ## Time and trend
 

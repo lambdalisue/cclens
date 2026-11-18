@@ -161,7 +161,7 @@ pub fn extract_usage_events(records: &[Record]) -> Vec<UsageEvent> {
 /// The MCP server name from a tool named `mcp__<server>__<tool>`. The server may
 /// contain single underscores; only the `__` delimiters are structural. Returns
 /// `None` for a non-MCP tool.
-fn mcp_server_of(tool: &str) -> Option<String> {
+pub fn mcp_server_of(tool: &str) -> Option<String> {
     let rest = tool.strip_prefix("mcp__")?;
     let server = rest.split("__").next()?;
     (!server.is_empty()).then(|| server.to_string())

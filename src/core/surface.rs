@@ -175,7 +175,8 @@ impl Wedge {
 pub enum StartupSavings {
     /// Real, measured: removing it saves this many tokens every session.
     Tokens(u64),
-    /// Real but unmeasured: an MCP tool schema loaded every session, weight unknown.
+    /// Real but unmeasured: an MCP tool schema loaded every session that no
+    /// recorded request shape has weighed.
     UnknownSchema,
     /// ~No startup cost (on-demand / path-conditional body) — removal is
     /// decluttering only.
@@ -200,7 +201,9 @@ pub fn on_demand_tokens(load_mode: LoadMode, static_tokens: Option<u64>) -> Opti
 pub fn startup_savings(load_mode: LoadMode, startup_tokens: Option<u64>) -> StartupSavings {
     match load_mode {
         LoadMode::StartupFull => StartupSavings::Tokens(startup_tokens.unwrap_or(0)),
-        LoadMode::ToolSchema => StartupSavings::UnknownSchema,
+        LoadMode::ToolSchema => {
+            startup_tokens.map_or(StartupSavings::UnknownSchema, StartupSavings::Tokens)
+        }
         LoadMode::StartupDescription | LoadMode::PathConditional | LoadMode::OnDemand => {
             StartupSavings::Declutter
         }
@@ -323,6 +326,14 @@ mod tests {
         assert_eq!(
             startup_savings(LoadMode::StartupDescription, Some(7)),
             StartupSavings::Declutter
+        );
+    }
+
+    #[test]
+    fn a_measured_mcp_schema_is_a_real_saving() {
+        assert_eq!(
+            startup_savings(LoadMode::ToolSchema, Some(1200)),
+            StartupSavings::Tokens(1200)
         );
     }
 }

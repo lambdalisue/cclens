@@ -39,6 +39,7 @@ pub fn skill_surface(id: &str, config_path: &str, content: &str, scope: &Scope) 
         static_tokens: Some(approx_tokens(content)),
         startup_tokens: Some(description_tokens(content)),
         load_mode: LoadMode::StartupDescription,
+        attrs: Vec::new(),
     }
 }
 
@@ -91,6 +92,7 @@ pub fn rule_surface(id: &str, config_path: &str, content: &str, scope: &Scope) -
         static_tokens: Some(tokens),
         startup_tokens: Some(startup_tokens),
         load_mode,
+        attrs: Vec::new(),
     }
 }
 
@@ -104,7 +106,60 @@ pub fn agent_surface(id: &str, config_path: &str, content: &str, scope: &Scope) 
         static_tokens: Some(approx_tokens(content)),
         startup_tokens: Some(description_tokens(content)),
         load_mode: LoadMode::StartupDescription,
+        attrs: agent_run_attrs(content),
     }
+}
+
+/// Frontmatter keys that change what a run of an agent costs, by the path they
+/// are reported under (`docs/specs/config-format.md`).
+const AGENT_RUN_KEYS: [&str; 4] = [
+    "model",
+    "omitClaudeMd",
+    "autoCompactWindow",
+    "experimental.cacheTtl",
+];
+
+/// The [`AGENT_RUN_KEYS`] an agent's frontmatter declares, as plain scalars
+/// kept verbatim and sorted by key. A nested key is read one level deep under
+/// its top-level parent; an indented key under any other parent belongs to that
+/// mapping, not to the agent.
+fn agent_run_attrs(content: &str) -> Vec<(String, String)> {
+    let Some(block) = frontmatter(content) else {
+        return Vec::new();
+    };
+    let mut parent: Option<&str> = None;
+    let mut attrs = Vec::new();
+    for line in block.lines() {
+        let indented = line.starts_with([' ', '\t']);
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let path = match (indented, parent) {
+            (false, _) => {
+                parent = Some(key);
+                key.to_string()
+            }
+            (true, Some(parent)) => format!("{parent}.{key}"),
+            (true, None) => continue,
+        };
+        let value = plain_scalar(value.trim());
+        if AGENT_RUN_KEYS.contains(&path.as_str()) && !value.is_empty() {
+            attrs.push((path, value.to_string()));
+        }
+    }
+    attrs.sort();
+    attrs
+}
+
+/// A one-line YAML scalar's value: a quoted one up to its closing quote (any
+/// comment after it dropped), a plain one with its trailing comment stripped.
+fn plain_scalar(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(rest) = value.strip_prefix(quote) {
+            return rest.find(quote).map_or(rest, |end| &rest[..end]);
+        }
+    }
+    strip_comment(value, false)
 }
 
 /// Build a `claude_md` surface — always-on context paid every session, so its
@@ -119,6 +174,7 @@ pub fn claude_md_surface(id: &str, config_path: &str, content: &str, scope: &Sco
         static_tokens: Some(tokens),
         startup_tokens: Some(tokens),
         load_mode: LoadMode::StartupFull,
+        attrs: Vec::new(),
     }
 }
 
@@ -428,6 +484,7 @@ pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: &Scope) -> Vec<Surface> 
             // from local config — unknown, never a false zero.
             startup_tokens: None,
             load_mode: LoadMode::ToolSchema,
+            attrs: Vec::new(),
         })
         .collect()
 }
@@ -637,6 +694,47 @@ mod tests {
         let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
         assert_eq!(surface.startup_tokens, Some(2));
         assert_eq!(surface.static_tokens, Some(approx_tokens(content)));
+    }
+
+    #[test]
+    fn an_agent_keeps_the_frontmatter_keys_that_shape_its_runs() {
+        let content = "---\nname: explorer\ndescription: looks around\nmodel: sonnet # cheap\n\
+                       omitClaudeMd: true\nautoCompactWindow: 50000\nexperimental:\n  cacheTtl: \"1h\"\n\
+                       color: blue\n---\nbody";
+        let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
+        assert_eq!(
+            surface.attrs,
+            vec![
+                ("autoCompactWindow".to_string(), "50000".to_string()),
+                ("experimental.cacheTtl".to_string(), "1h".to_string()),
+                ("model".to_string(), "sonnet".to_string()),
+                ("omitClaudeMd".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_agent_value_drops_the_comment_after_its_closing_quote() {
+        let content = "---\ndescription: x\nmodel: \"inherit\" # follow caller\n---\nbody";
+        let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
+        assert_eq!(
+            surface.attrs,
+            vec![("model".to_string(), "inherit".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_agent_declaring_none_of_those_keys_has_no_attrs() {
+        let content = "---\ndescription: looks around\n---\nmodel: not frontmatter";
+        let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
+        assert!(surface.attrs.is_empty());
+    }
+
+    #[test]
+    fn an_indented_model_key_belongs_to_a_nested_mapping() {
+        let content = "---\ndescription: x\nhooks:\n  model: haiku\n---\nbody";
+        let surface = agent_surface("explorer", "/c/explorer.md", content, &Scope::Global);
+        assert!(surface.attrs.is_empty());
     }
 
     #[test]

@@ -179,7 +179,7 @@ Each `agent-<agentId>.jsonl` has a sibling `agent-<agentId>.meta.json`:
 | `toolUseId` | The `id` of the `Agent` `tool_use` block that spawned this run — an **exact** join to one spawn. |
 | `parentAgentId` | For a subagent spawned by a subagent, the parent's `agentId`. Absent at depth 1. |
 | `spawnDepth` | 1 for a main-thread spawn, 2+ for a nested one. |
-| `model` | The model the run used. |
+| `model` | The model the spawning call **asked for**, as written (`opus`, `sonnet`, `inherit`) — absent when the call named none. It is not the model the run used: that is the `message.model` of the run's own assistant records. Observed to equal the `Agent` call's `model` input on every matched spawn. |
 
 The transcript side of the same join:
 

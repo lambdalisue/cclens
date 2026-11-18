@@ -41,6 +41,10 @@ pub enum RecordKind {
         agent: String,
         tool_use_id: Option<String>,
         prompt_id: Option<String>,
+        /// The model the call named, as written; `None` when it named none.
+        requested_model: Option<String>,
+        /// The model of the turn that made the call — the main loop's model.
+        caller_model: Option<String>,
     },
     /// A tool invocation by name — used to detect MCP tool usage.
     ToolUse { tool: String },
@@ -428,6 +432,8 @@ mod tests {
                     agent: "Explore".into(),
                     tool_use_id: Some("toolu_1".into()),
                     prompt_id: Some("p1".into()),
+                    requested_model: None,
+                    caller_model: None,
                 },
             ),
             at(3000, RecordKind::HumanTurn),
@@ -437,6 +443,8 @@ mod tests {
                     agent: "Explore".into(),
                     tool_use_id: Some("toolu_2".into()),
                     prompt_id: Some("p2".into()),
+                    requested_model: None,
+                    caller_model: None,
                 },
             ),
         ];

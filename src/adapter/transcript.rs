@@ -38,6 +38,43 @@ pub fn parse_session(jsonl: &str) -> Vec<Record> {
     records
 }
 
+/// The full prompt size (uncached + cache-read + cache-written input) summed
+/// over a transcript's API responses, each counted once.
+///
+/// One response is written as several lines sharing a `message.id`, each
+/// repeating its usage, so a per-line sum would bill a response once per
+/// content block. The largest figure seen for an id stands for the response; a
+/// line without an id has nothing to reconcile against and counts as is.
+pub fn prompt_tokens(jsonl: &str) -> u64 {
+    let mut by_response: HashMap<String, u64> = HashMap::new();
+    let mut unidentified = 0;
+    for line in jsonl.lines() {
+        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
+            continue;
+        };
+        if raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(message) = raw.message else {
+            continue;
+        };
+        let Some(usage) = message.usage else {
+            continue;
+        };
+        let size = usage.input_tokens.unwrap_or(0)
+            + usage.cache_read_input_tokens.unwrap_or(0)
+            + usage.cache_creation_input_tokens.unwrap_or(0);
+        match message.id {
+            Some(id) => {
+                let seen = by_response.entry(id).or_insert(0);
+                *seen = (*seen).max(size);
+            }
+            None => unidentified += size,
+        }
+    }
+    by_response.values().sum::<u64>() + unidentified
+}
+
 #[derive(Deserialize)]
 struct Raw {
     #[serde(rename = "type")]
@@ -138,7 +175,7 @@ fn assistant_records(
         .and_then(|content| content.as_array())
     {
         for block in blocks {
-            if let Some(kind) = tool_use_kind(block) {
+            if let Some(kind) = tool_use_kind(block, message.model.as_deref()) {
                 records.push(Record {
                     timestamp_ms: ts,
                     kind,
@@ -611,7 +648,10 @@ pub struct SubagentSidecar {
     pub parent_agent_id: Option<String>,
     #[serde(rename = "spawnDepth")]
     pub spawn_depth: Option<u32>,
-    pub model: Option<String>,
+    /// The model the spawning call asked for, as written — not the model the
+    /// run used, which only its own transcript records.
+    #[serde(rename = "model")]
+    pub requested_model: Option<String>,
 }
 
 /// Parse a subagent sidecar's JSON. `None` when the text is not readable JSON —
@@ -657,7 +697,7 @@ fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
 /// is a tool-path skill invocation, the Agent tool is a subagent spawn, and any
 /// other named tool is a `ToolUse` (the core decides which are MCP). Returns
 /// `None` for non-`tool_use` blocks.
-fn tool_use_kind(block: &Value) -> Option<RecordKind> {
+fn tool_use_kind(block: &Value, caller_model: Option<&str>) -> Option<RecordKind> {
     if block.get("type")?.as_str()? != "tool_use" {
         return None;
     }
@@ -671,11 +711,8 @@ fn tool_use_kind(block: &Value) -> Option<RecordKind> {
             })
         }
         "Agent" => {
-            let agent = block
-                .get("input")?
-                .get("subagent_type")?
-                .as_str()?
-                .to_string();
+            let input = block.get("input")?;
+            let agent = input.get("subagent_type")?.as_str()?.to_string();
             // The spawning turn's prompt id is threaded in by parse_session; the
             // Agent record itself does not carry it. The block's own id does
             // identify this call, and the spawned transcript names it back.
@@ -683,6 +720,14 @@ fn tool_use_kind(block: &Value) -> Option<RecordKind> {
                 agent,
                 tool_use_id: block.get("id").and_then(|id| id.as_str()).map(String::from),
                 prompt_id: None,
+                requested_model: input
+                    .get("model")
+                    .and_then(|model| model.as_str())
+                    .filter(|model| !model.is_empty())
+                    .map(String::from),
+                caller_model: caller_model
+                    .filter(|model| *model != SYNTHETIC_MODEL)
+                    .map(String::from),
             })
         }
         tool => Some(RecordKind::ToolUse {
@@ -1101,6 +1146,7 @@ mod tests {
             agent,
             tool_use_id,
             prompt_id,
+            ..
         } = &records[0].kind
         else {
             panic!("expected an agent spawn, got {:?}", records[0].kind);
@@ -1108,6 +1154,63 @@ mod tests {
         assert_eq!(agent, "Explore");
         assert_eq!(tool_use_id.as_deref(), Some("toolu_1"));
         assert_eq!(prompt_id.as_deref(), Some("p1"));
+    }
+
+    fn spawn_models(jsonl: &str) -> (Option<String>, Option<String>) {
+        let records = parse_session(jsonl);
+        let Some(RecordKind::AgentSpawn {
+            requested_model,
+            caller_model,
+            ..
+        }) = records.into_iter().map(|record| record.kind).next()
+        else {
+            panic!("expected an agent spawn first");
+        };
+        (requested_model, caller_model)
+    }
+
+    #[test]
+    fn an_agent_spawn_carries_the_model_its_call_requested_and_the_callers_model() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"model":"claude-big-1","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"subagent_type":"Explore","model":"sonnet"}}]}}"#;
+        assert_eq!(
+            spawn_models(jsonl),
+            (Some("sonnet".into()), Some("claude-big-1".into()))
+        );
+    }
+
+    #[test]
+    fn an_agent_spawn_naming_no_model_requests_none() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"model":"claude-big-1","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"subagent_type":"Explore"}}]}}"#;
+        assert_eq!(spawn_models(jsonl), (None, Some("claude-big-1".into())));
+    }
+
+    #[test]
+    fn a_synthetic_caller_model_is_no_caller_model() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"model":"<synthetic>","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"subagent_type":"Explore"}}]}}"#;
+        assert_eq!(spawn_models(jsonl), (None, None));
+    }
+
+    #[test]
+    fn prompt_tokens_count_each_response_once() {
+        // Two lines of one response repeat its usage; a second response adds its own.
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"msg_a","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":5,"output_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"id":"msg_a","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":5,"output_tokens":9}}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":"next"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"id":"msg_b","usage":{"input_tokens":1,"cache_read_input_tokens":200,"output_tokens":3}}}"#,
+        ]
+        .join("\n");
+        assert_eq!(prompt_tokens(&jsonl), 105 + 201);
+    }
+
+    #[test]
+    fn prompt_tokens_without_a_response_id_count_every_line() {
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"usage":{"input_tokens":10}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"usage":{"input_tokens":20}}}"#,
+        ]
+        .join("\n");
+        assert_eq!(prompt_tokens(&jsonl), 30);
     }
 
     #[test]
@@ -1120,7 +1223,7 @@ mod tests {
                 tool_use_id: Some("toolu_1".into()),
                 parent_agent_id: Some("a1".into()),
                 spawn_depth: Some(2),
-                model: Some("sonnet".into()),
+                requested_model: Some("sonnet".into()),
             })
         );
     }

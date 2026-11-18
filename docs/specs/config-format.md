@@ -24,6 +24,28 @@ was deleted since its sessions ran simply contributes no project surfaces.
 variable names a non-empty path, because Claude Code relocates the whole tree
 under it (`claude_config_dir` in `config.rs`); an empty value is treated as unset.
 
+A session started in the home directory has `$HOME` as its project root, and
+`$HOME/.claude` is then the global config root itself. Reading it again as that
+project's `<project>/.claude` would catalogue every global skill, rule and agent
+a second time as a project row, which shadows the global row for that project's
+sessions (`storage.md`): usage splits across two copies of one file and both
+come out looking unused. So `read_project_surfaces` skips a project's `.claude`
+when it resolves to the same directory as `~/.claude` — compared after
+resolving symlinks and path separators, so `$CLAUDE_CONFIG_DIR` pointing at it,
+or a symlinked `~/.claude`, counts as the same root, while a `$CLAUDE_CONFIG_DIR`
+elsewhere leaves `$HOME/.claude` an ordinary project directory, as it is to
+Claude Code. The project itself stays: its sessions are real and still route
+usage, they just resolve to the global rows. The in-repo files outside `.claude`
+are still read, since they are not global config: `$HOME/CLAUDE.md` is a
+distinct file Claude Code loads in addition to `~/.claude/CLAUDE.md`, and
+`$HOME/.mcp.json` is a project MCP file. What the global `CLAUDE.md` already
+weighs — the file itself and everything it imports — is not counted again
+under any project, whether the project reaches it through a symlinked
+top-level `CLAUDE.md` or through an import of its own. Such a file's imports
+are still followed from the project, though, since a relative import resolves
+against the path it was reached by and can lead to a file the global side never
+reads.
+
 | Surface kind | Global | Project-local |
 | --- | --- | --- |
 | `skill` | `~/.claude/skills/<name>/SKILL.md` (+ plugin skills) | `<project>/.claude/skills/<name>/SKILL.md` |

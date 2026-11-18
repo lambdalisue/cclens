@@ -319,23 +319,39 @@ pub fn read_claude_md_surfaces(
     scope: &Scope,
     home: Option<&Path>,
 ) -> Vec<Surface> {
+    walk_claude_md(files, scope, home, &HashSet::new())
+}
+
+/// `read_claude_md_surfaces`, except that a file whose resolved path is in
+/// `weighed_elsewhere` is not catalogued — another scope already weighs it —
+/// while its imports are still followed, because a relative import resolves
+/// against the path it was reached by and can lead to files the other scope
+/// never reads.
+fn walk_claude_md(
+    files: &[(&Path, &str)],
+    scope: &Scope,
+    home: Option<&Path>,
+    weighed_elsewhere: &HashSet<PathBuf>,
+) -> Vec<Surface> {
     let mut seen = HashSet::new();
     let mut surfaces = Vec::new();
     let mut pending = Vec::new();
     for &(path, id) in files {
         let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if !seen.insert(resolved) {
+        if !seen.insert(resolved.clone()) {
             continue;
         }
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
-        surfaces.push(claude_md_surface(
-            id,
-            &path.display().to_string(),
-            &content,
-            scope,
-        ));
+        if !weighed_elsewhere.contains(&resolved) {
+            surfaces.push(claude_md_surface(
+                id,
+                &path.display().to_string(),
+                &content,
+                scope,
+            ));
+        }
         let root = path.parent().unwrap_or(Path::new("")).to_path_buf();
         pending.push((path.to_path_buf(), content, root, 0));
     }
@@ -355,19 +371,21 @@ pub fn read_claude_md_surfaces(
             let Ok(resolved) = fs::canonicalize(&target) else {
                 continue;
             };
-            if !resolved.is_file() || !seen.insert(resolved) {
+            if !resolved.is_file() || !seen.insert(resolved.clone()) {
                 continue;
             }
             let Ok(imported) = fs::read_to_string(&target) else {
                 continue;
             };
-            let shown = target.strip_prefix(&root).unwrap_or(&target);
-            surfaces.push(claude_md_surface(
-                &format!("@{}", shown.display()),
-                &target.display().to_string(),
-                &imported,
-                scope,
-            ));
+            if !weighed_elsewhere.contains(&resolved) {
+                let shown = target.strip_prefix(&root).unwrap_or(&target);
+                surfaces.push(claude_md_surface(
+                    &format!("@{}", shown.display()),
+                    &target.display().to_string(),
+                    &imported,
+                    scope,
+                ));
+            }
             pending.push((target, imported, root.clone(), hops + 1));
         }
     }
@@ -379,23 +397,64 @@ pub fn read_claude_md_surfaces(
 /// the in-repo `CLAUDE.md` / `AGENTS.md` (with their `@import`s) and
 /// `.mcp.json` (`docs/specs/config-format.md`). `home` resolves a `~/` import.
 /// A root with none of these yields nothing.
-pub fn read_project_surfaces(root: &Path, project: &str, home: Option<&Path>) -> Vec<Surface> {
+///
+/// `config_root` is the global config root (`claude_config_dir`). Whatever in
+/// the project resolves to it — the whole `.claude` of a session run from the
+/// home directory, or a file the global `CLAUDE.md` already puts in context —
+/// is global config already and is not catalogued a second time under the
+/// project.
+pub fn read_project_surfaces(
+    root: &Path,
+    project: &str,
+    home: Option<&Path>,
+    config_root: Option<&Path>,
+) -> Vec<Surface> {
     let scope = Scope::Project(project.to_string());
     let claude = root.join(".claude");
-    let mut surfaces = read_skill_surfaces(&claude.join("skills"), &scope);
-    surfaces.extend(read_rule_surfaces(&claude.join("rules"), &scope));
-    surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
+    let mut surfaces = Vec::new();
+    if !config_root.is_some_and(|config| same_file(&claude, config)) {
+        surfaces.extend(read_skill_surfaces(&claude.join("skills"), &scope));
+        surfaces.extend(read_rule_surfaces(&claude.join("rules"), &scope));
+        surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
+    }
     surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
     // A repo that serves both agent conventions usually ships `AGENTS.md` as a
     // symlink to `CLAUDE.md`; listing `CLAUDE.md` first makes it the one that
     // is reported when the pair resolves to one file.
     let (claude_md, agents_md) = (root.join("CLAUDE.md"), root.join("AGENTS.md"));
-    surfaces.extend(read_claude_md_surfaces(
+    surfaces.extend(walk_claude_md(
         &[(&claude_md, "CLAUDE.md"), (&agents_md, "AGENTS.md")],
         &scope,
         home,
+        &global_claude_md_files(config_root, home),
     ));
     surfaces
+}
+
+/// The resolved paths of every file the global `CLAUDE.md` puts in context —
+/// itself and its imports — which the global scope already weighs.
+fn global_claude_md_files(config_root: Option<&Path>, home: Option<&Path>) -> HashSet<PathBuf> {
+    let Some(config_root) = config_root else {
+        return HashSet::new();
+    };
+    read_claude_md_surfaces(
+        &[(&config_root.join("CLAUDE.md"), "global")],
+        &Scope::Global,
+        home,
+    )
+    .iter()
+    .filter_map(|surface| fs::canonicalize(&surface.config_path).ok())
+    .collect()
+}
+
+/// Whether two paths name one file or directory once symlinks, `..` and
+/// separator spelling are resolved. A path that does not exist names nothing,
+/// so it matches nothing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Read MCP server declarations from an `mcp.json` (top-level `mcpServers`
@@ -723,7 +782,7 @@ mod tests {
         )
         .unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha", None);
+        let surfaces = read_project_surfaces(&root, "alpha", None, None);
         fs::remove_dir_all(&root).ok();
 
         let has = |kind: &str, id: &str| surfaces.iter().any(|s| s.kind == kind && s.id == id);
@@ -757,7 +816,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
         std::os::unix::fs::symlink("CLAUDE.md", root.join("AGENTS.md")).unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha", None);
+        let surfaces = read_project_surfaces(&root, "alpha", None, None);
         fs::remove_dir_all(&root).ok();
 
         let claude_mds: Vec<_> = surfaces.iter().filter(|s| s.kind == "claude_md").collect();
@@ -782,7 +841,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "project claude md").unwrap();
         fs::write(root.join("AGENTS.md"), "project agents md").unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha", None);
+        let surfaces = read_project_surfaces(&root, "alpha", None, None);
         fs::remove_dir_all(&root).ok();
 
         let mut ids: Vec<_> = surfaces
@@ -804,6 +863,146 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A synthetic home whose `.claude` holds one skill, rule and agent, plus a
+    /// `CLAUDE.md` of its own at the home root.
+    fn home_with_global_config(name: &str) -> PathBuf {
+        let home = scratch_dir(name);
+        let claude = home.join(".claude");
+        fs::create_dir_all(claude.join("skills/deploy")).unwrap();
+        fs::write(claude.join("skills/deploy/SKILL.md"), "deploy skill").unwrap();
+        fs::create_dir_all(claude.join("rules")).unwrap();
+        fs::write(claude.join("rules/tdd.md"), "# tdd").unwrap();
+        fs::create_dir_all(claude.join("agents")).unwrap();
+        fs::write(claude.join("agents/explorer.md"), "explorer agent").unwrap();
+        fs::write(claude.join("CLAUDE.md"), "global claude md").unwrap();
+        home
+    }
+
+    fn kinds_and_ids(surfaces: &[Surface]) -> Vec<(&str, &str)> {
+        let mut pairs: Vec<_> = surfaces
+            .iter()
+            .map(|s| (s.kind.as_str(), s.id.as_str()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn a_project_whose_claude_dir_is_the_config_root_adds_no_copy_of_it() {
+        // A session run from $HOME has $HOME as its root; reading $HOME/.claude
+        // as project config would duplicate every global surface as a project
+        // row that shadows the global one for that project's sessions.
+        let home = home_with_global_config("home-root");
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&home.join(".claude")));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(kinds_and_ids(&surfaces), []);
+    }
+
+    #[test]
+    fn the_home_project_keeps_its_own_files_outside_the_config_root() {
+        // $HOME/CLAUDE.md is a different file from ~/.claude/CLAUDE.md and is
+        // loaded on top of it, so it remains that project's surface.
+        let home = home_with_global_config("home-own-files");
+        fs::write(home.join("CLAUDE.md"), "home claude md").unwrap();
+        fs::write(
+            home.join(".mcp.json"),
+            r#"{"mcpServers":{"playwright":{}}}"#,
+        )
+        .unwrap();
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&home.join(".claude")));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            kinds_and_ids(&surfaces),
+            [("claude_md", "CLAUDE.md"), ("mcp_server", "playwright")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_root_named_through_a_symlink_is_still_the_same_root() {
+        // CLAUDE_CONFIG_DIR may name the tree through a symlink; the project's
+        // `.claude` is the same directory all the same.
+        let home = home_with_global_config("home-symlink");
+        let link = home.join("config-link");
+        std::os::unix::fs::symlink(home.join(".claude"), &link).unwrap();
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&link));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(kinds_and_ids(&surfaces), []);
+    }
+
+    #[test]
+    fn a_home_claude_dir_is_project_config_when_the_config_root_is_elsewhere() {
+        // With CLAUDE_CONFIG_DIR pointing elsewhere, Claude Code treats
+        // $HOME/.claude as an ordinary project directory, and so do we.
+        let home = home_with_global_config("home-elsewhere");
+        let elsewhere = home.join("relocated");
+        fs::create_dir_all(&elsewhere).unwrap();
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&elsewhere));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            kinds_and_ids(&surfaces),
+            [("agent", "explorer"), ("rule", "tdd"), ("skill", "deploy")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_claude_md_linked_to_the_global_one_is_not_counted_again() {
+        // A symlink into the config root is the global CLAUDE.md, which the
+        // global scope already weighs.
+        let home = home_with_global_config("home-md-link");
+        std::os::unix::fs::symlink(".claude/CLAUDE.md", home.join("CLAUDE.md")).unwrap();
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&home.join(".claude")));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(kinds_and_ids(&surfaces), []);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_of_a_project_link_to_the_global_claude_md_are_still_followed() {
+        // A relative import resolves against the link's own directory, so from
+        // the project it can reach a file the global side never does.
+        let home = home_with_global_config("home-md-link-import");
+        fs::write(home.join(".claude/CLAUDE.md"), "@instructions.md").unwrap();
+        fs::write(home.join("instructions.md"), "home instructions").unwrap();
+        std::os::unix::fs::symlink(".claude/CLAUDE.md", home.join("CLAUDE.md")).unwrap();
+
+        let surfaces = read_project_surfaces(&home, "home", None, Some(&home.join(".claude")));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            kinds_and_ids(&surfaces),
+            [("claude_md", "@instructions.md")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_global_claude_md_already_imports_is_not_counted_again() {
+        // A `~/` import resolves to one file from either side; the global scope
+        // weighs it, so the project must not book it a second time.
+        let home = home_with_global_config("home-md-link-shared");
+        fs::write(home.join(".claude/CLAUDE.md"), "@~/shared.md").unwrap();
+        fs::write(home.join("shared.md"), "shared instructions").unwrap();
+        std::os::unix::fs::symlink(".claude/CLAUDE.md", home.join("CLAUDE.md")).unwrap();
+
+        let surfaces =
+            read_project_surfaces(&home, "home", Some(&home), Some(&home.join(".claude")));
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(kinds_and_ids(&surfaces), []);
     }
 
     #[test]
@@ -905,7 +1104,7 @@ mod tests {
         fs::write(root.join("CLAUDE.md"), "@AGENTS.md").unwrap();
         fs::write(root.join("AGENTS.md"), "project agents md").unwrap();
 
-        let surfaces = read_project_surfaces(&root, "alpha", None);
+        let surfaces = read_project_surfaces(&root, "alpha", None, None);
         fs::remove_dir_all(&root).ok();
 
         let mut ids: Vec<_> = surfaces

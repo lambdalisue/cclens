@@ -4,6 +4,7 @@
 pub mod bucket;
 pub mod cache;
 pub mod context_load;
+pub mod effect;
 pub mod friction;
 pub mod hook;
 pub mod metrics;

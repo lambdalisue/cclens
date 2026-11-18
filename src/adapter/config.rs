@@ -246,6 +246,54 @@ fn frontmatter_description(content: &str) -> Option<String> {
     Some(unquote(&value).to_string())
 }
 
+/// The friction categories a surface declares it targets, from cclens's own
+/// `cclens-targets:` frontmatter key — an inline `[a, b]` list, a block list,
+/// or one scalar (`docs/specs/config-format.md`). Empty when undeclared.
+pub fn frontmatter_targets(content: &str) -> Vec<String> {
+    const KEY: &str = "cclens-targets:";
+    let Some(block) = frontmatter(content) else {
+        return Vec::new();
+    };
+    let mut lines = block.lines().skip_while(|line| !line.starts_with(KEY));
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let value = target_scalar(first[KEY.len()..].trim());
+    let items: Vec<&str> =
+        if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            inner.split(',').collect()
+        } else if value.is_empty() {
+            // Blank and comment lines are legal inside a YAML block sequence;
+            // only another key ends it.
+            lines
+                .map(str::trim_start)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map_while(|line| line.strip_prefix("- "))
+                .map(target_scalar)
+                .collect()
+        } else {
+            vec![value]
+        };
+    items
+        .into_iter()
+        .map(|item| unquote(item.trim()).to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// One target value without its trailing comment. A quoted value ends at its
+/// closing quote, so a comment after it goes too — `strip_comment` keeps a
+/// quoted value whole, because a description's quotes may span lines.
+fn target_scalar(value: &str) -> &str {
+    let value = value.trim();
+    match value.chars().next() {
+        Some(quote @ ('"' | '\'')) => value[1..]
+            .find(quote)
+            .map_or(value, |close| &value[..close + 2]),
+        _ => strip_comment(value, false),
+    }
+}
+
 /// Drop a plain scalar's trailing YAML comment — a `#` that opens the value or
 /// follows whitespace is comment syntax, and no session ever loads it. Inside a
 /// block scalar (`block`) or quotes, a `#` is literal text and stays.
@@ -1049,6 +1097,35 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, ["AGENTS.md", "CLAUDE.md"]);
+    }
+
+    #[test]
+    fn declared_targets_read_as_an_inline_list_a_block_list_or_a_scalar() {
+        let inline = "---\ncclens-targets: [edit-precondition, \"path-not-found\"]\n---\nbody";
+        assert_eq!(
+            frontmatter_targets(inline),
+            ["edit-precondition", "path-not-found"]
+        );
+        let block = "---\npaths:\n  - \"src/**\"\ncclens-targets:\n  - blocked-by-hook # sed/awk\n  - timeout\ndescription: x\n---\n";
+        assert_eq!(frontmatter_targets(block), ["blocked-by-hook", "timeout"]);
+        let quoted = "---\ncclens-targets:\n  - \"timeout\" # why\n  - 'path-not-found'\n---\n";
+        assert_eq!(frontmatter_targets(quoted), ["timeout", "path-not-found"]);
+        let quoted_scalar = "---\ncclens-targets: \"timeout\" # why\n---\n";
+        assert_eq!(frontmatter_targets(quoted_scalar), ["timeout"]);
+        let commented = "---\ncclens-targets:\n  # what the rule is for\n  - timeout\n\n  - path-not-found\nname: x\n---\n";
+        assert_eq!(
+            frontmatter_targets(commented),
+            ["timeout", "path-not-found"]
+        );
+        let scalar = "---\ncclens-targets: timeout\n---\n";
+        assert_eq!(frontmatter_targets(scalar), ["timeout"]);
+    }
+
+    #[test]
+    fn no_declaration_means_no_targets() {
+        assert!(frontmatter_targets("# rule body").is_empty());
+        assert!(frontmatter_targets("---\npaths:\n  - x\n---\n").is_empty());
+        assert!(frontmatter_targets("---\ncclens-targets: []\n---\n").is_empty());
     }
 
     /// An empty scratch directory unique to the calling test.

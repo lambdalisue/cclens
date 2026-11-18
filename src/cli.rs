@@ -12,18 +12,22 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_hook_surfaces,
     read_mcp_server_surfaces, read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
+use crate::adapter::history::config_changes;
 use crate::adapter::prompt_cache::extract_prompt_cache;
 use crate::adapter::request_shape::extract_tool_context;
 use crate::adapter::transcript::{
-    HookActivity, count_permission_denials, extract_context_loads, extract_hook_activity,
-    extract_prompt_pointers, extract_tool_errors, extract_work_events, parse_session,
-    parse_subagent_sidecar, prompt_tokens, session_cwd, subagent_id_from_file_name,
+    HookActivity, count_permission_denials, count_tool_calls, extract_context_loads,
+    extract_hook_activity, extract_prompt_pointers, extract_tool_errors, extract_work_events,
+    parse_session, parse_subagent_sidecar, prompt_tokens, session_cwd, subagent_id_from_file_name,
     subagent_prompt_id, subagent_sidecar_path, subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::cache::{DEFAULT_MIN_REUSE, observe_cache};
 use crate::core::context_load::{
     ContextLoad, LoadTuning, LoadVerdict, load_verdict, load_wedge, tokens_paid,
+};
+use crate::core::effect::{
+    Effect, Flag, Params as EffectParams, Verdict, compare as compare_effect,
 };
 use crate::core::friction::ErrorCategory;
 use crate::core::hook::{
@@ -248,6 +252,26 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Did a config change reduce the failures it was written for? Friction
+    /// rates in the sessions before vs after each rule's last change.
+    Effect {
+        /// Surface kind to compare: rule (default), skill, claude_md, or
+        /// all.
+        #[arg(long, default_value = "rule")]
+        kind: String,
+        /// Longest span compared on each side of the change, in days.
+        #[arg(long, default_value_t = 28)]
+        window: i64,
+        /// Output format: table | markdown | json.
+        #[arg(long)]
+        format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// The health check — what to fix first, what your sessions cost, and
     /// what is fine as-is. Start here.
     Doctor {
@@ -396,6 +420,19 @@ pub fn run() -> Result<()> {
         Command::Stuck { format, frozen, db } => {
             stuck(parse_format(format.as_deref())?, frozen, &resolve_db(db)?)
         }
+        Command::Effect {
+            kind,
+            window,
+            format,
+            frozen,
+            db,
+        } => effect(
+            &kind,
+            window,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db)?,
+        ),
         Command::Doctor {
             scope,
             format,
@@ -1865,6 +1902,278 @@ fn hooks(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
     Ok(())
 }
 
+/// Before/after each config change: the friction rates in the sessions before
+/// vs after the surface last changed (`core::effect`). Declared targets get a
+/// verdict and, when they did not improve, a hook-candidate flag; undeclared
+/// surfaces show every category that occurred and are left to the reader.
+fn effect(kind: &str, window_days: i64, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    const MAX_UNDECLARED_ROWS: usize = 5;
+    const MAX_CONFOUNDERS: usize = 5;
+    anyhow::ensure!(
+        window_days > 0,
+        "--window must be a positive number of days"
+    );
+    let store = open_for_read(db, frozen)?;
+    let changes = store.surface_changes()?;
+    let samples = store.session_samples()?;
+    let params = EffectParams {
+        window_secs: window_days * 86_400,
+        ..EffectParams::default()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut effects: Vec<Effect> = changes
+        .iter()
+        .filter(|c| kind == "all" || c.kind == kind)
+        .map(|c| compare_effect(c, &changes, &samples, now, &params))
+        .filter(|e| !e.change.targets.is_empty() || !e.categories.is_empty())
+        .collect();
+    // Declared surfaces first — they carry verdicts — then the newest change.
+    effects.sort_by_key(|e| {
+        (
+            e.change.targets.is_empty(),
+            std::cmp::Reverse(e.change.changed_epoch),
+        )
+    });
+
+    if format == Format::Json {
+        let rows: Vec<serde_json::Value> = effects.iter().map(effect_json).collect();
+        return emit_json(&serde_json::json!({
+            "window_days": window_days,
+            "min_sessions": params.min_sessions,
+            "alpha": params.alpha,
+            "effects": rows,
+        }));
+    }
+    if effects.is_empty() {
+        println!(
+            "no {kind} change has friction around it to compare — run analyze, or declare \
+             `cclens-targets:` in a rule's frontmatter"
+        );
+        return Ok(());
+    }
+    preamble(
+        format,
+        "Did a config change reduce the failures it was written for? For each surface,\n\
+         the failure rates in the sessions that started before its last change vs the\n\
+         sessions after it, over equal windows. A rule that declares `cclens-targets:`\n\
+         gets a verdict on those categories; one that does not shows every category\n\
+         that occurred, for you to judge.",
+    );
+    let style = Style::stdout();
+    for e in &effects {
+        let date = |epoch: i64| local_time(epoch, "%Y-%m-%d %H:%M");
+        let day = |epoch: i64| local_time(epoch, "%m-%d");
+        let calls = |w: &crate::core::effect::Window| {
+            w.tool_calls
+                .map_or_else(|| "calls unknown".to_string(), |c| format!("{c} calls"))
+        };
+        // Two projects can each have their own `rule/x`; the scope tells the
+        // reader which copy a verdict belongs to.
+        let owner = match &e.change.scope {
+            Scope::Global => "global".to_string(),
+            Scope::Project(project) => format!("project {project}"),
+        };
+        println!(
+            "{} [{owner}]  changed {} ({}; introduced {})",
+            style.bold(&e.change.name()),
+            date(e.change.changed_epoch),
+            e.change.date_source.label(),
+            local_time(e.change.introduced_epoch, "%Y-%m-%d"),
+        );
+        println!(
+            "  before {}–{}: {} session(s), {}   after {}–{}: {} session(s), {}",
+            day(e.before.start),
+            day(e.before.end),
+            e.before.sessions,
+            calls(&e.before),
+            day(e.after.start),
+            day(e.after.end),
+            e.after.sessions,
+            calls(&e.after),
+        );
+        if e.change.targets.is_empty() {
+            println!(
+                "  {}",
+                style.dim("targets: undeclared — every category shown")
+            );
+        } else {
+            println!("  targets: {}", e.change.targets.join(", "));
+        }
+        if !e.change.always_on {
+            println!(
+                "  {}",
+                style.dim(
+                    "loads only on demand: sessions it never reached dilute the rate, \
+                     so no verdict here raises a flag"
+                )
+            );
+        }
+        if !e.unknown_targets.is_empty() {
+            println!(
+                "  {}",
+                style.warn(&format!(
+                    "unknown target categories (not compared): {}",
+                    e.unknown_targets.join(", ")
+                ))
+            );
+        }
+        if !e.concurrent.is_empty() {
+            println!(
+                "  {}",
+                style.warn(&format!(
+                    "also changed inside this span ({}, nearest first): {}{}",
+                    e.concurrent.len(),
+                    e.concurrent[..e.concurrent.len().min(MAX_CONFOUNDERS)].join(", "),
+                    if e.concurrent.len() > MAX_CONFOUNDERS {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                ))
+            );
+        }
+        let shown = if e.change.targets.is_empty() {
+            MAX_UNDECLARED_ROWS
+        } else {
+            usize::MAX
+        };
+        let fmt_rate = |r: Option<f64>| r.map_or_else(|| "-".to_string(), |r| format!("{r:.2}"));
+        let rows: Vec<Vec<String>> = e
+            .categories
+            .iter()
+            .take(shown)
+            .map(|c| {
+                let verdict = if let Some(flag) = c.flag {
+                    style.warn(match flag {
+                        Flag::ReplaceWithHook => "no-improvement → replace the rule with a hook?",
+                        Flag::HookAlreadyBlocks => {
+                            "no-improvement → the hook blocks it; the rule doesn't prevent it"
+                        }
+                    })
+                } else if c.verdict == Verdict::Improved {
+                    style.good(c.verdict.label())
+                } else {
+                    c.verdict.label().to_string()
+                };
+                vec![
+                    c.category.clone(),
+                    format!("{} → {}", c.before, c.after),
+                    format!(
+                        "{} → {}",
+                        fmt_rate(c.before_per_100_calls),
+                        fmt_rate(c.after_per_100_calls)
+                    ),
+                    format!(
+                        "{} → {}",
+                        fmt_rate(c.before_per_session),
+                        fmt_rate(c.after_per_session)
+                    ),
+                    c.p_value
+                        .map_or_else(|| "-".to_string(), |p| format!("{p:.3}")),
+                    verdict,
+                ]
+            })
+            .collect();
+        println!();
+        render(
+            &[
+                "category",
+                "failures",
+                "per 100 calls",
+                "per session",
+                "p",
+                "verdict",
+            ],
+            &[
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            &rows,
+            format,
+        );
+        if e.categories.len() > shown {
+            println!(
+                "{}",
+                style.dim(&format!(
+                    "  … {} more categories (`--format json` has them all)",
+                    e.categories.len() - shown
+                ))
+            );
+        }
+        println!();
+    }
+    note(&format!(
+        "Sessions are assigned whole to the side they started on (config loads at\n\
+         session start). The verdict uses the per-call rate when every session has a\n\
+         call count, else per session; `p` is the one-sided exact chance of seeing this\n\
+         few failures after the change if the rate were unchanged. `too-few` means fewer\n\
+         than {} sessions on a side. Before/after is not causation: the model, the\n\
+         Claude Code version and the kind of work also change over time, and changes\n\
+         listed as \"also changed\" share whatever effect is seen.",
+        params.min_sessions
+    ));
+    Ok(())
+}
+
+fn effect_json(e: &Effect) -> serde_json::Value {
+    let window = |w: &crate::core::effect::Window| {
+        serde_json::json!({
+            "start_epoch": w.start,
+            "end_epoch": w.end,
+            "sessions": w.sessions,
+            "tool_calls": w.tool_calls,
+        })
+    };
+    let categories: Vec<serde_json::Value> = e
+        .categories
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "category": c.category,
+                "before": c.before,
+                "after": c.after,
+                "before_per_session": c.before_per_session,
+                "after_per_session": c.after_per_session,
+                "before_per_100_calls": c.before_per_100_calls,
+                "after_per_100_calls": c.after_per_100_calls,
+                "p_value": c.p_value,
+                "verdict": c.verdict.label(),
+                "declared": c.declared,
+                "flag": c.flag.map(Flag::label),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": e.change.kind,
+        "id": e.change.id,
+        "scope": e.change.scope.label(),
+        "project": e.change.scope.project(),
+        "changed_epoch": e.change.changed_epoch,
+        "introduced_epoch": e.change.introduced_epoch,
+        "date_source": e.change.date_source.label(),
+        "targets": e.change.targets,
+        "always_on": e.change.always_on,
+        "unknown_targets": e.unknown_targets,
+        "concurrent_changes": e.concurrent,
+        "basis": e.basis.label(),
+        "before": window(&e.before),
+        "after": window(&e.after),
+        "categories": categories,
+    })
+}
+
+/// An epoch shown in the presentation zone (JST, as bucketing uses).
+fn local_time(epoch: i64, pattern: &str) -> String {
+    use chrono::TimeZone;
+    chrono::FixedOffset::east_opt(JST_OFFSET_SECS)
+        .and_then(|tz| tz.timestamp_opt(epoch, 0).single())
+        .map_or_else(|| epoch.to_string(), |t| t.format(pattern).to_string())
+}
+
 /// A dimmed footnote under a table — context, not data.
 fn note(text: &str) {
     println!("\n{}", Style::stdout().dim(text));
@@ -2473,6 +2782,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             session_start(&records),
         );
         store.ingest_session(&meta, &spans, &usage)?;
+        store.set_session_tool_calls(&meta.id, count_tool_calls(&text))?;
         store.ingest_subagent_runs(&meta.id, &meta.source_path, &runs)?;
         let prompts: Vec<(usize, i64, &str)> = extract_prompt_pointers(&text)
             .into_iter()
@@ -2590,6 +2900,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
     }
     let surface_count = surfaces.len();
     store.replace_surfaces(&surfaces)?;
+    store.replace_surface_changes(&config_changes(&surfaces))?;
 
     store.record_analyzer_version()?;
     store.set_meta("analyzed_at", &chrono::Utc::now().to_rfc3339())?;

@@ -23,6 +23,7 @@ CREATE TABLE sessions (
     sub_tokens      INTEGER NOT NULL,   -- the session's exact subagent output total (events.md)
     sub_agent_count INTEGER NOT NULL,   -- subagent runs the session spawned, nested included
     hook_scanned    INTEGER NOT NULL,   -- 1 once hook activity (hook_runs, tool_call) was extracted; hook triggers count only these sessions
+    tool_calls      INTEGER,            -- main-thread tool calls (the friction denominator); NULL when analysed before it was recorded
     version         TEXT                -- Claude Code version, when present
 );
 
@@ -38,6 +39,22 @@ CREATE TABLE surfaces (
     startup_tokens INTEGER,         -- weight of the slice loaded into every session (description for a skill/agent); NULL if unknown
     load_mode     TEXT NOT NULL,    -- startup_full | startup_description | path_conditional | on_demand | tool_schema
     attrs_json    TEXT,             -- kind-specific extras (paths glob, hook matcher, …)
+    PRIMARY KEY (kind, id, scope, project)
+);
+
+-- When each file-backed surface last changed, and what friction it says it
+-- targets. Rebuilt with the catalog on every analyze (config-format.md
+-- "Change dates"); read by the before/after comparison (surfaces.md).
+CREATE TABLE surface_changes (
+    kind             TEXT NOT NULL,
+    id               TEXT NOT NULL,
+    scope            TEXT NOT NULL,
+    project          TEXT NOT NULL,
+    changed_epoch    INTEGER NOT NULL, -- UTC unix seconds of the last change
+    introduced_epoch INTEGER NOT NULL, -- UTC unix seconds of the first commit (= changed_epoch without history)
+    date_source      TEXT NOT NULL,    -- git | uncommitted | mtime
+    targets          TEXT NOT NULL,    -- comma-separated friction categories the surface declares; '' when none
+    always_on        INTEGER NOT NULL, -- 1 when every session loads it (startup_full); 0 for a paths: rule or a skill
     PRIMARY KEY (kind, id, scope, project)
 );
 

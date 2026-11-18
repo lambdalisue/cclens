@@ -14,7 +14,7 @@ use crate::adapter::config::{
 };
 use crate::adapter::transcript::{
     count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
-    parse_session, parse_subagent_sidecar, session_cwd, subagent_id_from_file_name,
+    parse_session, parse_subagent_sidecar, prompt_tokens, session_cwd, subagent_id_from_file_name,
     subagent_prompt_id, subagent_sidecar_path, subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
@@ -22,14 +22,17 @@ use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
-use crate::core::subagent::{SplitCoverage, SubagentRun, link_runs};
+use crate::core::subagent::{
+    AgentModelChoice, ModelChoice, SplitCoverage, SubagentRun, caller_models, link_runs,
+    model_choice_by_agent,
+};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     on_demand_tokens, startup_savings,
 };
 use crate::core::thrash::detect_thrash;
-use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens};
-use crate::store::{SessionMeta, Store};
+use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens, run_model};
+use crate::store::{AgentModelCost, SessionMeta, Store};
 
 #[derive(Parser)]
 #[command(
@@ -1905,9 +1908,11 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
             tool_use_id: sidecar.tool_use_id,
             parent_agent_id: sidecar.parent_agent_id,
             spawn_depth: sidecar.spawn_depth.unwrap_or(1),
-            model: sidecar.model,
+            model: run_model(&records),
+            requested_model: sidecar.requested_model,
             prompt_id: subagent_prompt_id(&text),
             out_tokens: output_tokens(&records),
+            prompt_tokens: prompt_tokens(&text),
             started_epoch_ms: records.first().map(|r| r.timestamp_ms).unwrap_or_default(),
             root_tool_use_id: None,
         });
@@ -1952,6 +1957,13 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
     // beside a nonzero total needs the reason as much as a human does, and it
     // goes to stderr precisely so it can be given to both.
     warn_missing_agent_split(&agent_split);
+    // Which tier the subagent tokens were spent on, and who picked it: the
+    // per-agent split says whose cost it is, these say what a model choice
+    // would change (`docs/specs/events.md` "Model choice at spawn").
+    let agent_models = store.subagent_by_agent_model()?;
+    let spawns = store.spawn_models()?;
+    let spawn_models = model_choice_by_agent(&spawns);
+    let main_models = caller_models(&spawns);
     if format == Format::Json {
         return emit_json(&serde_json::json!({
             "tokens": {
@@ -1961,13 +1973,17 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
             },
             "agent_split": agent_split,
             "agents": agents,
+            "agent_models": agent_models,
+            "spawn_models": spawn_models,
+            "main_models": main_models,
             "skills": skills,
         }));
     }
     // A subagent total with neither table behind it is not "nothing happened" —
     // it is a store whose per-agent split has not been extracted yet, and saying
     // "no usage" there would be false.
-    if skills.is_empty() && agents.is_empty() && sub_tokens == 0 {
+    // Spawns count too: a spawn whose run was pruned still says who chose its model.
+    if skills.is_empty() && agents.is_empty() && sub_tokens == 0 && spawn_models.is_empty() {
         println!("no skill usage found — run `cclens analyze` first");
         return Ok(());
     }
@@ -2010,6 +2026,7 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
         );
         println!();
     }
+    print_model_mix(&agent_models, &spawn_models, &main_models, format);
 
     if skills.is_empty() {
         return Ok(());
@@ -2039,6 +2056,103 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
         format,
     );
     Ok(())
+}
+
+/// The subagent model tables of `usage`: what each agent type ran on, then who
+/// chose that model at spawn, read against the main loop's own models.
+fn print_model_mix(
+    agent_models: &[AgentModelCost],
+    spawn_models: &[AgentModelChoice],
+    main_models: &[(String, i64)],
+    format: Format,
+) {
+    let unknown = |value: &Option<String>| value.clone().unwrap_or_else(|| "(unknown)".to_string());
+    if !main_models.is_empty() {
+        println!(
+            "main loop models (per subagent spawn): {}",
+            tally_list(main_models)
+        );
+        println!();
+    }
+    if !agent_models.is_empty() {
+        let rows: Vec<Vec<String>> = agent_models
+            .iter()
+            .map(|row| {
+                vec![
+                    unknown(&row.agent),
+                    unknown(&row.model),
+                    row.runs.to_string(),
+                    row.out_tokens.to_string(),
+                    row.prompt_tokens
+                        .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+                ]
+            })
+            .collect();
+        render(
+            &["agent", "ran on", "runs", "out tokens", "prompt tokens"],
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+            ],
+            &rows,
+            format,
+        );
+        println!();
+    }
+    if !spawn_models.is_empty() {
+        let rows: Vec<Vec<String>> = spawn_models
+            .iter()
+            .map(|row| {
+                vec![
+                    row.agent.clone(),
+                    row.spawns.to_string(),
+                    row.explicit.to_string(),
+                    row.inherited.to_string(),
+                    row.agent_default.to_string(),
+                    row.unknown.to_string(),
+                    tally_list(&row.requested),
+                ]
+            })
+            .collect();
+        render(
+            &[
+                "agent",
+                "spawns",
+                ModelChoice::Explicit.label(),
+                ModelChoice::Inherited.label(),
+                ModelChoice::AgentDefault.label(),
+                ModelChoice::Unknown.label(),
+                "requested",
+            ],
+            &[
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            &rows,
+            format,
+        );
+        println!();
+    }
+}
+
+/// `name ×count` pairs, comma-separated; `-` for none.
+fn tally_list(counts: &[(String, i64)]) -> String {
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+    counts
+        .iter()
+        .map(|(name, count)| format!("{name} ×{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Skill usage rolled up per time bucket (JST). A long span is assigned whole to

@@ -19,7 +19,15 @@ The adapter reads config into one `surface` per configurable thing, each with:
   startup-description / path-conditional / on-demand / tool-schema — see
   `config-format.md`). Load mode is what separates always-on tax from per-use
   cost, and which slice of the text each cost covers;
-- its scope (global vs project) and `config_path`.
+- its scope (global vs project) and `config_path`;
+- kind-specific **attributes** (`attrs_json`) — settings that do not change what
+  the surface weighs but do change what *using* it costs. An agent carries the
+  frontmatter keys that shape its runs (`config-format.md`): the `model` tier it
+  runs on, whether it `omitClaudeMd` (its runs start lighter), its
+  `autoCompactWindow` and its prompt-cache TTL. They are what explains a cost
+  row rather than a cost of their own: an agent whose runs show up `inherited`
+  in the spawn model-choice rollup (`events.md`) and whose definition has no
+  `model` is the configuration to pin.
 
 The catalog is the denominator of every optimization question: you cannot call a
 surface "unused" without knowing it was installed in the first place. A surface

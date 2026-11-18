@@ -167,7 +167,14 @@ schema access this tool does not have.
   Presence of `paths:` sets the load mode to path-conditional; its absence means
   the rule is always loaded. `description:` is frequently absent on real rules —
   read it defensively, do not rely on it.
-- `agent`: `name`, `description` (weighed like a skill's), `tools`, `model`.
+- `agent`: `name`, `description` (weighed like a skill's), `tools`, and the
+  keys that change what a run of it costs, kept as surface attributes
+  (`surfaces.md`): `model` (the tier it runs on unless the call overrides it),
+  `omitClaudeMd` (its runs start without the `CLAUDE.md` context — a smaller
+  floor; Claude Code 2.1.271+), `autoCompactWindow` (when its context compacts;
+  2.1.296+) and `experimental.cacheTtl` (its prompt-cache lifetime; 2.1.248+).
+  Each is read as a plain scalar and kept verbatim; an absent key is simply not
+  recorded, so an older definition carries no attributes rather than defaults.
 
 Parsing is defensive: unknown frontmatter keys are ignored, missing optional
 keys tolerated. A surface the adapter cannot fully parse is still catalogued

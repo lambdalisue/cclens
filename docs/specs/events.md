@@ -207,9 +207,22 @@ spawn counts can differ by an order of magnitude in output, and the spawn count
 alone cannot tell them apart; without runs, the largest figure in the report is
 the one nothing can be done about.
 
-A run carries the agent type, its own output tokens, its model, its depth in the
-spawn tree, and the ids that link it back: its own `tool_use_id`, its parent
-run, and the **root** `tool_use_id` its tree started at (`core::subagent`).
+A run carries the agent type, its own output tokens and prompt tokens, the model
+it **ran on** and the model it was **asked for**, its depth in the spawn tree,
+and the ids that link it back: its own `tool_use_id`, its parent run, and the
+**root** `tool_use_id` its tree started at (`core::subagent`).
+
+- **Ran on vs asked for are two facts.** The sidecar records the model the
+  spawning call named (an alias such as `opus`, or `inherit`, or nothing); the
+  run's own transcript records the model that actually answered. Only the second
+  says what the tokens cost; only the first says whether anyone chose it.
+  Collapsing them would hide exactly the case worth seeing — a run that nobody
+  pinned and that silently ran on the main loop's model.
+- **Prompt tokens are summed once per response.** A run's `prompt_tokens` is the
+  sum, over its API responses, of the full prompt each one was sent (uncached,
+  cache-read and cache-written input together). Output alone undersells a
+  subagent: most of what it costs is re-reading its own growing context, and
+  that is where a cheaper model tier pays off.
 
 - **Every run counts once, at its own cost, whatever its depth.** A nested run
   is the agent that wrote those tokens; folding it into its parent's type would
@@ -282,6 +295,41 @@ whose run is missing keeps zeros rather than borrowing another's figures.
 This is why the spawn stays a point event rather than growing a window: its cost
 is measured in the subagent's transcript, not inferred from main-thread records
 inside a guessed boundary.
+
+### Model choice at spawn
+
+Every subagent runs on *some* model; the question a configuration can act on is
+**who chose it**. An `agent_spawn` event therefore keeps two models of its own:
+the one its call **requested** (the `Agent` input's model, as the caller wrote
+it — absent when the call named none) and the **caller's** model, the
+main-loop model of the turn that made the call. Joined to its run's model and to
+the `model` its agent's definition pins (the catalog's agent attributes,
+`surfaces.md`), each spawn is classified (`core::subagent::ModelChoice`):
+
+| Choice | When |
+| --- | --- |
+| `explicit` | The call named a model. |
+| `agent_default` | The call named none and the agent's definition pins one — or, with no pin on record, the run ran on a model other than the caller's, so a built-in default picked it. |
+| `inherited` | The call named none (or asked to `inherit`), no definition pins one, and the run ran on the caller's model — the main loop's tier was spent on the subagent by default. |
+| `unknown` | The call named none, nothing pins one, and there is nothing to compare — no run is left to say what it ran on, or the caller's model is unknown. |
+
+The pin is consulted before the model comparison because the comparison alone
+cannot tell a definition that pins the main loop's own tier from no pin at all:
+both run on the caller's model. The pin is read from today's definition (the
+effective one for the spawn's project) — the catalog keeps no history, so a pin
+added later reclassifies earlier spawns.
+
+`inherited` is the share that matters: it is main-loop spend nobody decided on,
+and the place a per-task tier (an explicit `model`, or one pinned in the agent's
+definition — `surfaces.md`) would cut cost. The classification compares full
+model ids, never tier names, so it holds for any model family. The requested
+model is kept as written — not the run's sidecar — because the call is what the
+caller controls; a hook that rewrites the input before launch shows up as a run
+whose sidecar names a model the call did not.
+
+Only main-thread calls are classified: a nested spawn's call lives in its
+parent's transcript, outside the events spine. Nested runs still appear in the
+per-agent × model cost rollup, which is built from runs.
 
 ### Per-span attribution is window-bounded, not authoritative
 

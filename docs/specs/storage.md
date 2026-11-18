@@ -47,7 +47,7 @@ CREATE TABLE events (
     kind                 TEXT NOT NULL,   -- skill_invocation | session_start | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
     surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL); for file_edit: the basename hotspots group on (the full path is in target)
-    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); NULL otherwise
+    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); the model the call requested (agent_spawn); NULL otherwise
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
     duration_sec         REAL NOT NULL,
@@ -59,7 +59,7 @@ CREATE TABLE events (
     sub_tokens           INTEGER NOT NULL,
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
-    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error)
+    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error); the calling turn's model (agent_spawn)
     target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit); the Agent call's id (agent_spawn), joining subagent_runs
     attrs_json           TEXT
 );
@@ -80,9 +80,11 @@ CREATE TABLE subagent_runs (
     root_tool_use_id TEXT,            -- the main-thread call its spawn tree started at
     parent_agent_id  TEXT,            -- the run that spawned it, for a nested run
     spawn_depth      INTEGER NOT NULL,-- 1 main-thread, 2+ nested
-    model            TEXT,
+    model            TEXT,            -- the model the run ran on (its transcript's representative model)
+    requested_model  TEXT,            -- the model the spawning call asked for (sidecar); NULL when it named none. A store from before this column held that alias in `model`; migration moves it here and leaves `model` NULL, since no ran-on model was recorded
     prompt_id        TEXT,            -- the spawning turn (the fallback join key)
     out_tokens       INTEGER NOT NULL,
+    prompt_tokens    INTEGER,         -- full prompt size summed once per API response (events.md); NULL for a run stored before it was measured
     started_at       TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch    INTEGER NOT NULL
 );
@@ -115,6 +117,18 @@ SELECT e.session_id, s.project,
        e.target, e.started_epoch
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
+
+-- The same for agent_spawn events: the requested model rides in `source` and the
+-- caller's (main-loop) model in `model`; the view names both and joins the run
+-- the spawn started, so "which spawns inherited the main loop's model" is one
+-- query (events.md "Model choice at spawn").
+CREATE VIEW agent_spawns AS
+SELECT e.session_id, s.project, e.surface_id AS agent,
+       e.source AS requested_model, e.model AS caller_model,
+       r.model AS run_model, e.target AS tool_use_id, e.started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+LEFT JOIN subagent_runs r ON r.source_path = e.source_path AND r.tool_use_id = e.target
+WHERE e.kind = 'agent_spawn';
 ```
 
 The `REFERENCES` annotations above record which column joins which table; they
@@ -276,8 +290,12 @@ routine additive changes do not bump it; it exists to catch what reconciliation
 cannot express. A store stamped **newer** than this build is refused rather than
 written to — this build's shape would overwrite changes it does not understand,
 in a file the newer binary still reads correctly. The version is also the seam
-for a future change that reconciliation cannot cover (a column removed, retyped,
-or given a new meaning). Reconciliation now *fails* on such drift rather than
+for a change that reconciliation cannot cover (a column removed, retyped, or
+given a new meaning). v2 is the first: `subagent_runs.model` went from the model
+a spawn requested to the model its run ran on, so the v1→v2 step moves every
+stored value into `requested_model` and leaves `model` NULL — discarding nothing,
+since no ran-on model was ever recorded — and a v1 build refuses the store
+rather than writing the old meaning back. Reconciliation now *fails* on such drift rather than
 ignoring it, so the seam cannot be skipped by accident; the migration written to
 fill it must state what it discards, because the answer is no longer "nothing".
 

@@ -98,6 +98,10 @@ pub struct Surface {
     /// (`docs/specs/surfaces.md`).
     pub startup_tokens: Option<u64>,
     pub load_mode: LoadMode,
+    /// Kind-specific settings that change what *using* the surface costs, not
+    /// what it weighs — an agent's model tier, say. Sorted by key; empty when
+    /// the kind has none or the definition declares none.
+    pub attrs: Vec<(String, String)>,
 }
 
 /// Whether a surface kind can ever acquire usage events. Absence of events is

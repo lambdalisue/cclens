@@ -4,6 +4,7 @@
 //! catalog so agents and MCP servers are not stuck at "usage n/a". See
 //! `docs/specs/events.md`, `surfaces.md`.
 
+use crate::core::metrics::representative_model;
 use crate::core::span::{Record, RecordKind, Span};
 use crate::core::subagent::SubagentRun;
 
@@ -16,6 +17,10 @@ pub struct UsageEvent {
     /// For an agent spawn, the `Agent` call's id — persisted so a stored spawn
     /// joins the subagent run it started. `None` for every other surface.
     pub tool_use_id: Option<String>,
+    /// For an agent spawn, the model its call named and the calling turn's
+    /// model (`docs/specs/events.md` "Model choice at spawn"). `None` otherwise.
+    pub requested_model: Option<String>,
+    pub caller_model: Option<String>,
 }
 
 /// Total assistant output tokens across a record stream — used to sum a
@@ -28,6 +33,18 @@ pub fn output_tokens(records: &[Record]) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// The model a subagent run ran on: its first real (non-synthetic) model.
+pub fn run_model(records: &[Record]) -> Option<String> {
+    let models: Vec<&str> = records
+        .iter()
+        .filter_map(|record| match &record.kind {
+            RecordKind::Assistant { model, .. } => Some(model.as_str()),
+            _ => None,
+        })
+        .collect();
+    representative_model(&models).map(String::from)
 }
 
 /// Attribute subagent costs to the spans that spawned them.
@@ -115,18 +132,26 @@ pub fn extract_usage_events(records: &[Record]) -> Vec<UsageEvent> {
         .iter()
         .filter_map(|record| match &record.kind {
             RecordKind::AgentSpawn {
-                agent, tool_use_id, ..
+                agent,
+                tool_use_id,
+                requested_model,
+                caller_model,
+                ..
             } => Some(UsageEvent {
                 surface_kind: "agent".to_string(),
                 surface_id: agent.clone(),
                 started_epoch_ms: record.timestamp_ms,
                 tool_use_id: tool_use_id.clone(),
+                requested_model: requested_model.clone(),
+                caller_model: caller_model.clone(),
             }),
             RecordKind::ToolUse { tool } => mcp_server_of(tool).map(|server| UsageEvent {
                 surface_kind: "mcp_server".to_string(),
                 surface_id: server,
                 started_epoch_ms: record.timestamp_ms,
                 tool_use_id: None,
+                requested_model: None,
+                caller_model: None,
             }),
             _ => None,
         })
@@ -159,6 +184,8 @@ mod tests {
                 agent: "Explore".into(),
                 tool_use_id: Some("toolu_1".into()),
                 prompt_id: None,
+                requested_model: Some("sonnet".into()),
+                caller_model: Some("m-big".into()),
             },
         )];
         let events = extract_usage_events(&records);
@@ -169,8 +196,36 @@ mod tests {
                 surface_id: "Explore".into(),
                 started_epoch_ms: 100,
                 tool_use_id: Some("toolu_1".into()),
+                requested_model: Some("sonnet".into()),
+                caller_model: Some("m-big".into()),
             }]
         );
+    }
+
+    fn assistant(model: &str) -> Record {
+        at(
+            1,
+            RecordKind::Assistant {
+                prompt_size: 0,
+                out_tokens: 0,
+                model: model.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_run_ran_on_its_first_real_model() {
+        let records = [
+            assistant("<synthetic>"),
+            assistant("m-mid"),
+            assistant("m-big"),
+        ];
+        assert_eq!(run_model(&records).as_deref(), Some("m-mid"));
+    }
+
+    #[test]
+    fn a_run_with_only_synthetic_records_has_no_model() {
+        assert_eq!(run_model(&[assistant("<synthetic>")]), None);
     }
 
     #[test]
@@ -245,8 +300,10 @@ mod tests {
             parent_agent_id: None,
             spawn_depth: 1,
             model: None,
+            requested_model: None,
             prompt_id: Some(prompt_id.to_string()),
             out_tokens,
+            prompt_tokens: 0,
             started_epoch_ms: 0,
             root_tool_use_id: root.map(String::from),
         }

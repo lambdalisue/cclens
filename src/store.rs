@@ -2,8 +2,8 @@
 //! layer knows SQL but nothing about raw Claude Code formats. See
 //! `docs/specs/storage.md`.
 //!
-//! The schema tracks the spec's `events` table; `attrs_json` is the one column
-//! deferred until a report needs it.
+//! The schema tracks the spec's `events` table; its `attrs_json` is the one
+//! column deferred until a report needs it (surfaces already carry theirs).
 
 use std::collections::BTreeMap;
 
@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::core::span::{SessionStart, Source, Span};
-use crate::core::subagent::SubagentRun;
+use crate::core::subagent::{SpawnModels, SubagentRun};
 use crate::core::surface::Surface;
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
@@ -24,7 +24,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "3";
+const ANALYZER_VERSION: &str = "4";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -76,8 +76,10 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     parent_agent_id   TEXT,
     spawn_depth       INTEGER NOT NULL DEFAULT 1,
     model             TEXT,
+    requested_model   TEXT,
     prompt_id         TEXT,
     out_tokens        INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER,
     started_at        TEXT NOT NULL,
     started_epoch     INTEGER NOT NULL
 );
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS surfaces (
     static_tokens INTEGER,
     startup_tokens INTEGER,
     load_mode     TEXT NOT NULL,
+    attrs_json    TEXT,
     PRIMARY KEY (kind, id, scope, project)
 );
 -- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
@@ -138,18 +141,38 @@ SELECT e.session_id        AS session_id,
        e.started_epoch      AS started_epoch
 FROM events e JOIN sessions s ON e.session_id = s.id
 WHERE e.kind = 'tool_error';
+-- The same for agent spawns: the requested model rides in `source` and the
+-- calling turn's model in `model`. Joined to the run the spawn started, it is one
+-- query to ask which spawns ran on the main loop's model by default.
+CREATE VIEW agent_spawns AS
+SELECT e.session_id, s.project, e.surface_id AS agent,
+       e.source AS requested_model, e.model AS caller_model,
+       r.model AS run_model, e.target AS tool_use_id, e.started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+LEFT JOIN subagent_runs r ON r.source_path = e.source_path AND r.tool_use_id = e.target
+WHERE e.kind = 'agent_spawn';
 ";
 
 /// Stamped into `PRAGMA user_version`. Bumped only for a change `migrate` cannot
 /// reconcile — an existing column removed, retyped, or given a new meaning.
 /// Additive drift (a new column, table, or view) needs no bump: `migrate`
 /// converges any older store onto the declared schema in place.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2: `subagent_runs.model` changed from the model a spawn *requested* to the
+/// model its run *ran on*; the requested alias moved to `requested_model`. A v1
+/// build would keep writing the alias into `model`, so it must refuse the store.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Tables holding analysis history. Claude Code prunes transcripts on its own
 /// retention schedule, after which these rows are the only surviving record of
 /// those sessions — so a shape change adds columns in place, never rebuilds.
-const MIGRATED_TABLES: [&str; 4] = ["sessions", "events", "ingested_files", "meta"];
+const MIGRATED_TABLES: [&str; 5] = [
+    "sessions",
+    "events",
+    "subagent_runs",
+    "ingested_files",
+    "meta",
+];
 
 /// Tables regenerated wholesale from live config on every analyze
 /// (`replace_surfaces`), so a shape change costs nothing to drop and recreate.
@@ -220,6 +243,19 @@ pub struct AgentCost {
     pub agent: Option<String>,
     pub runs: i64,
     pub out_tokens: i64,
+}
+
+/// What one agent type cost on one model: its runs, the output they wrote and
+/// the prompt they re-read. `model` is the model the runs ran on.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct AgentModelCost {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub runs: i64,
+    pub out_tokens: i64,
+    /// `None` when any of the runs was stored before prompt tokens were
+    /// measured: a partial sum would pass for the whole.
+    pub prompt_tokens: Option<i64>,
 }
 
 /// One skill event's cost, with its UTC start, for time bucketing.
@@ -479,21 +515,24 @@ impl Store {
                 "tool_use"
             };
             // An agent spawn keeps its call id in `target` — the join key to the
-            // subagent run it started (`ingest_subagent_runs`).
+            // subagent run it started (`ingest_subagent_runs`) — the model its
+            // call requested in `source`, and the calling turn's model in `model`.
             tx.execute(
                 "INSERT INTO events
                    (session_id, source_path, kind, surface_kind, surface_id, source,
                     started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
                     ctx_start, ctx_peak, model, target)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, 0, 0, 0, 0, NULL, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, 0, ?9, ?10)",
                 (
                     &session.id,
                     &session.source_path,
                     kind,
                     &event.surface_kind,
                     &event.surface_id,
+                    &event.requested_model,
                     epoch_ms_to_rfc3339(event.started_epoch_ms),
                     event.started_epoch_ms / 1000,
+                    &event.caller_model,
                     &event.tool_use_id,
                 ),
             )?;
@@ -561,9 +600,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO subagent_runs
                    (session_id, source_path, run_path, agent, agent_id, tool_use_id,
-                    root_tool_use_id, parent_agent_id, spawn_depth, model, prompt_id,
-                    out_tokens, started_at, started_epoch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    root_tool_use_id, parent_agent_id, spawn_depth, model, requested_model,
+                    prompt_id, out_tokens, prompt_tokens, started_at, started_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 (
                     session_id,
                     source_path,
@@ -575,8 +614,10 @@ impl Store {
                     &run.parent_agent_id,
                     run.spawn_depth,
                     &run.model,
+                    &run.requested_model,
                     &run.prompt_id,
                     run.out_tokens,
+                    run.prompt_tokens,
                     epoch_ms_to_rfc3339(run.started_epoch_ms),
                     run.started_epoch_ms / 1000,
                 ),
@@ -940,6 +981,71 @@ impl Store {
         Ok(rows)
     }
 
+    /// Subagent runs per agent type × the model they ran on, costliest first.
+    /// Built from runs like `subagent_by_agent`, nested runs included, so the
+    /// rows sum the same way.
+    pub fn subagent_by_agent_model(&self) -> Result<Vec<AgentModelCost>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, model, COUNT(*), COALESCE(SUM(out_tokens), 0),
+                    CASE WHEN COUNT(prompt_tokens) = COUNT(*) THEN SUM(prompt_tokens) END
+             FROM subagent_runs
+             GROUP BY agent, model
+             ORDER BY COALESCE(SUM(out_tokens), 0) DESC, COUNT(*) DESC, agent, model",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AgentModelCost {
+                    agent: row.get(0)?,
+                    model: row.get(1)?,
+                    runs: row.get(2)?,
+                    out_tokens: row.get(3)?,
+                    prompt_tokens: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every main-thread spawn with the models around it — what its call
+    /// requested, what its agent's definition pins, what the calling turn ran
+    /// on, and what its run ran on — in spawn order, for
+    /// `core::subagent::model_choice_by_agent`.
+    ///
+    /// The pin is read from the **effective** definition for the spawn's
+    /// project, as the catalog join resolves it: a project's own copy shadows
+    /// the global one even when it pins nothing. It is today's definition, not
+    /// the one in force at spawn time — the catalog keeps no history.
+    pub fn spawn_models(&self) -> Result<Vec<SpawnModels>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.agent, a.requested_model,
+                    CASE WHEN EXISTS (SELECT 1 FROM surfaces f
+                                       WHERE f.kind = 'agent' AND f.id = a.agent
+                                         AND f.scope = 'project' AND f.project = a.project)
+                         THEN (SELECT json_extract(f.attrs_json, '$.model') FROM surfaces f
+                                WHERE f.kind = 'agent' AND f.id = a.agent
+                                  AND f.scope = 'project' AND f.project = a.project)
+                         ELSE (SELECT json_extract(f.attrs_json, '$.model') FROM surfaces f
+                                WHERE f.kind = 'agent' AND f.id = a.agent
+                                  AND f.scope = 'global')
+                    END,
+                    a.caller_model, a.run_model
+             FROM agent_spawns a
+             ORDER BY a.started_epoch, a.tool_use_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SpawnModels {
+                    agent: row.get(0)?,
+                    requested: row.get(1)?,
+                    pinned: row.get(2)?,
+                    caller: row.get(3)?,
+                    ran: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Invocation counts per surface `(kind, id)` across all event kinds — the
     /// usage side of the catalog join for every surface, not just skills.
     pub fn usage_counts(&self) -> Result<Vec<(String, String, i64)>> {
@@ -1039,8 +1145,8 @@ impl Store {
             tx.execute(
                 "INSERT OR REPLACE INTO surfaces
                    (kind, id, scope, project, config_path, static_tokens,
-                    startup_tokens, load_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    startup_tokens, load_mode, attrs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 (
                     &surface.kind,
                     &surface.id,
@@ -1050,6 +1156,7 @@ impl Store {
                     surface.static_tokens,
                     surface.startup_tokens,
                     surface.load_mode.label(),
+                    attrs_json(&surface.attrs),
                 ),
             )?;
         }
@@ -1168,9 +1275,17 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             rebuilt = true;
         }
     }
+    // Before v2, `subagent_runs.model` held the sidecar's requested alias.
+    let runs_predate_requested_model = version < 2 && table_exists(&tx, "subagent_runs")?;
     tx.execute_batch(SCHEMA)?;
     for table in MIGRATED_TABLES {
         reconcile_columns(&tx, &desired, table)?;
+    }
+    if runs_predate_requested_model {
+        // A run whose transcript is gone is never re-extracted, so its alias
+        // would otherwise be reported as the model it ran on — which that store
+        // never recorded.
+        tx.execute_batch("UPDATE subagent_runs SET requested_model = model, model = NULL")?;
     }
     // Indexes and views come last: both reference columns the step above may
     // have just added.
@@ -1316,6 +1431,18 @@ fn epoch_ms_to_rfc3339(epoch_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// A surface's attributes as one JSON object, or NULL when it has none.
+fn attrs_json(attrs: &[(String, String)]) -> Option<String> {
+    if attrs.is_empty() {
+        return None;
+    }
+    let object: BTreeMap<&str, &str> = attrs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    serde_json::to_string(&object).ok()
+}
+
 /// A SQLite cell as a typed JSON value, for the `--format json` surface.
 fn value_to_json(v: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
     use rusqlite::types::ValueRef;
@@ -1429,6 +1556,8 @@ mod tests {
             surface_id: surface_id.to_string(),
             started_epoch_ms: 1_700_000_000_000,
             tool_use_id: Some(tool_use_id.to_string()),
+            requested_model: None,
+            caller_model: None,
         }
     }
 
@@ -1441,8 +1570,10 @@ mod tests {
             parent_agent_id: None,
             spawn_depth: 1,
             model: Some("sonnet".to_string()),
+            requested_model: None,
             prompt_id: Some("p1".to_string()),
             out_tokens,
+            prompt_tokens: 0,
             started_epoch_ms: 1_700_000_000_000,
             root_tool_use_id: Some(root.to_string()),
         }
@@ -1480,6 +1611,251 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn subagent_cost_splits_per_agent_type_and_the_model_it_ran_on() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        let on = |model: &str, mut run: SubagentRun| {
+            run.model = Some(model.to_string());
+            run.prompt_tokens = run.out_tokens * 10;
+            run
+        };
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[
+                    on("m-big", subagent_run("Explore", "a1", "toolu_a1", 400)),
+                    on("m-small", subagent_run("Explore", "a2", "toolu_a2", 100)),
+                    on("m-big", subagent_run("Explore", "a3", "toolu_a3", 200)),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.subagent_by_agent_model().unwrap(),
+            vec![
+                AgentModelCost {
+                    agent: Some("Explore".to_string()),
+                    model: Some("m-big".to_string()),
+                    runs: 2,
+                    out_tokens: 600,
+                    prompt_tokens: Some(6000),
+                },
+                AgentModelCost {
+                    agent: Some("Explore".to_string()),
+                    model: Some("m-small".to_string()),
+                    runs: 1,
+                    out_tokens: 100,
+                    prompt_tokens: Some(1000),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_holding_an_unmeasured_run_has_no_prompt_total() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[
+                    subagent_run("Explore", "a1", "toolu_a1", 400),
+                    subagent_run("Explore", "a2", "toolu_a2", 100),
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("UPDATE subagent_runs SET prompt_tokens = NULL WHERE agent_id = 'a2'")
+            .unwrap();
+
+        let rows = store.subagent_by_agent_model().unwrap();
+        assert_eq!((rows[0].out_tokens, rows[0].prompt_tokens), (500, None));
+    }
+
+    #[test]
+    fn a_spawn_keeps_the_model_its_call_requested_beside_its_callers_and_its_runs() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        let mut pinned = agent_spawn("Explore", "toolu_a1");
+        pinned.requested_model = Some("small".to_string());
+        pinned.caller_model = Some("m-big".to_string());
+        let mut unpinned = agent_spawn("Plan", "toolu_a2");
+        unpinned.caller_model = Some("m-big".to_string());
+        store.ingest_session(&s1, &[], &[pinned, unpinned]).unwrap();
+        let mut run = subagent_run("Explore", "a1", "toolu_a1", 10);
+        run.model = Some("m-small".to_string());
+        store
+            .ingest_subagent_runs(&s1.id, &s1.source_path, &[run])
+            .unwrap();
+
+        assert_eq!(
+            store.spawn_models().unwrap(),
+            vec![
+                SpawnModels {
+                    agent: "Explore".to_string(),
+                    requested: Some("small".to_string()),
+                    pinned: None,
+                    caller: Some("m-big".to_string()),
+                    ran: Some("m-small".to_string()),
+                },
+                SpawnModels {
+                    agent: "Plan".to_string(),
+                    requested: None,
+                    pinned: None,
+                    caller: Some("m-big".to_string()),
+                    ran: None,
+                },
+            ]
+        );
+    }
+
+    fn agent_pinned(id: &str, scope: Scope, model: Option<&str>) -> Surface {
+        let mut agent = surface(id, scope, 1);
+        agent.kind = "agent".to_string();
+        agent.attrs = model
+            .map(|model| vec![("model".to_string(), model.to_string())])
+            .unwrap_or_default();
+        agent
+    }
+
+    #[test]
+    fn a_spawn_reads_its_agents_pin_from_the_effective_definition() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store
+            .ingest_session(
+                &s1,
+                &[],
+                &[
+                    agent_spawn("writer", "toolu_a1"),
+                    agent_spawn("reviewer", "toolu_a2"),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_surfaces(&[
+                agent_pinned("writer", Scope::Global, Some("big")),
+                // The project's own copy shadows the global pin with none.
+                agent_pinned("reviewer", Scope::Global, Some("big")),
+                agent_pinned("reviewer", Scope::Project("demo".to_string()), None),
+            ])
+            .unwrap();
+
+        let pins: Vec<(String, Option<String>)> = store
+            .spawn_models()
+            .unwrap()
+            .into_iter()
+            .map(|spawn| (spawn.agent, spawn.pinned))
+            .collect();
+        assert_eq!(
+            pins,
+            vec![
+                ("writer".to_string(), Some("big".to_string())),
+                ("reviewer".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_agent_spawns_view_names_the_overloaded_model_columns() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        let mut spawn = agent_spawn("Explore", "toolu_a1");
+        spawn.requested_model = Some("small".to_string());
+        spawn.caller_model = Some("m-big".to_string());
+        store.ingest_session(&s1, &[], &[spawn]).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT agent, requested_model, caller_model, run_model FROM agent_spawns")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["Explore", "small", "m-big", ""]]);
+    }
+
+    #[test]
+    fn a_runs_table_predating_requested_model_moves_its_model_there() {
+        // Before the split, `model` held the sidecar's *requested* alias. A run
+        // whose transcript is gone is never re-extracted, so left in place that
+        // alias would be reported as the model the run ran on.
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE subagent_runs DROP COLUMN requested_model;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT model, requested_model FROM subagent_runs")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["", "sonnet"]]);
+    }
+
+    #[test]
+    fn a_runs_table_already_holding_requested_model_keeps_both_on_reopen() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        let mut run = subagent_run("Explore", "a1", "toolu_a1", 400);
+        run.requested_model = Some("small".to_string());
+        store
+            .ingest_subagent_runs(&s1.id, &s1.source_path, &[run])
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).unwrap();
+
+        let (_, rows) = store
+            .query("SELECT model, requested_model FROM subagent_runs")
+            .unwrap();
+        assert_eq!(rows, vec![vec!["sonnet", "small"]]);
+    }
+
+    #[test]
+    fn a_runs_table_predating_the_model_columns_gains_them_without_losing_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = session("s1");
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        store
+            .ingest_subagent_runs(
+                &s1.id,
+                &s1.source_path,
+                &[subagent_run("Explore", "a1", "toolu_a1", 400)],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE subagent_runs DROP COLUMN requested_model;
+                 ALTER TABLE subagent_runs DROP COLUMN prompt_tokens;",
+            )
+            .unwrap();
+
+        let store = Store::from_connection(store.conn).expect("must migrate, not refuse");
+
+        let (_, rows) = store
+            .query("SELECT agent, out_tokens, prompt_tokens FROM subagent_runs")
+            .unwrap();
+        // Never measured, so unknown — not a measured zero.
+        assert_eq!(rows, vec![vec!["Explore", "400", ""]]);
     }
 
     #[test]
@@ -1667,6 +2043,7 @@ mod tests {
             static_tokens: Some(static_tokens),
             startup_tokens: Some(startup_tokens),
             load_mode: LoadMode::StartupDescription,
+            attrs: Vec::new(),
         }
     }
 
@@ -2022,7 +2399,7 @@ mod tests {
             .unwrap()
             .into_keys()
             .collect();
-        assert_eq!(views, vec!["stray".to_string(), "tool_errors".to_string()]);
+        assert_eq!(views, ["agent_spawns", "stray", "tool_errors"]);
     }
 
     #[test]
@@ -2261,6 +2638,7 @@ mod tests {
                     static_tokens: Some(600),
                     startup_tokens: Some(600),
                     load_mode: LoadMode::StartupFull,
+                    attrs: Vec::new(),
                 },
                 Surface {
                     kind: "rule".to_string(),
@@ -2270,6 +2648,7 @@ mod tests {
                     static_tokens: Some(900),
                     startup_tokens: Some(900),
                     load_mode: LoadMode::StartupFull,
+                    attrs: Vec::new(),
                 },
                 // A skill contributes its description, never its 1000-token body.
                 skill_surface("git-commit", Scope::Global, 1000, 8),
@@ -2283,6 +2662,7 @@ mod tests {
                     static_tokens: None,
                     startup_tokens: None,
                     load_mode: LoadMode::ToolSchema,
+                    attrs: Vec::new(),
                 },
                 // Another project's CLAUDE.md is always-on *there*, not globally.
                 Surface {
@@ -2293,6 +2673,7 @@ mod tests {
                     static_tokens: Some(400),
                     startup_tokens: Some(400),
                     load_mode: LoadMode::StartupFull,
+                    attrs: Vec::new(),
                 },
             ])
             .unwrap();
@@ -2313,6 +2694,31 @@ mod tests {
         let catalog = store.effective_catalog().unwrap();
         assert_eq!(catalog[0].static_tokens, Some(1015));
         assert_eq!(catalog[0].startup_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_surfaces_attributes_are_stored_as_a_json_object() {
+        let mut store = Store::in_memory().unwrap();
+        let mut agent = surface("explorer", Scope::Global, 1);
+        agent.kind = "agent".to_string();
+        agent.attrs = vec![
+            ("model".to_string(), "sonnet".to_string()),
+            ("omitClaudeMd".to_string(), "true".to_string()),
+        ];
+        store
+            .replace_surfaces(&[agent, surface("plain", Scope::Global, 1)])
+            .unwrap();
+
+        let (_, rows) = store
+            .query("SELECT id, attrs_json FROM surfaces ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["explorer", r#"{"model":"sonnet","omitClaudeMd":"true"}"#],
+                vec!["plain", ""],
+            ]
+        );
     }
 
     #[test]

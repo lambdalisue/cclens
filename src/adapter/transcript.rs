@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::adapter::config::approx_tokens;
 use crate::core::friction::{ErrorCategory, classify_error};
+use crate::core::hook::{CallResult, HookOutcome, HookTrace, Step};
 use crate::core::path::basename;
 use crate::core::prompt::{PromptBehavior, classify_prompt};
 use crate::core::span::{Record, RecordKind, Source};
@@ -567,6 +569,286 @@ pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
         }
     }
     events
+}
+
+/// A session's hook traces, plus the ordered calls and human turns a block's
+/// retry cost is measured over (`core::hook::retry_calls`).
+#[derive(Debug, Default, PartialEq)]
+pub struct HookActivity {
+    pub traces: Vec<HookTrace>,
+    pub steps: Vec<Step>,
+}
+
+/// The fields of a raw entry that hook traces live in.
+#[derive(Deserialize)]
+struct RawHookEntry {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    subtype: Option<String>,
+    timestamp: Option<String>,
+    #[serde(rename = "isMeta")]
+    is_meta: Option<bool>,
+    attachment: Option<Value>,
+    #[serde(rename = "hookInfos")]
+    hook_infos: Option<Vec<Value>>,
+    #[serde(rename = "preventedContinuation")]
+    prevented_continuation: Option<bool>,
+    #[serde(rename = "toolDenialKind")]
+    denial_kind: Option<String>,
+    message: Option<RawMessage>,
+}
+
+/// Extract the traces hooks left, and the session's call/turn sequence. Only
+/// what Claude Code recorded is read: a hook that passed silently left nothing
+/// (`docs/specs/session-format.md` "Hook traces").
+pub fn extract_hook_activity(jsonl: &str) -> HookActivity {
+    let mut activity = HookActivity::default();
+    // Call id -> its index in `steps`, so a later result can mark it failed.
+    let mut call_at: HashMap<String, usize> = HashMap::new();
+    for line in jsonl.lines() {
+        let Ok(raw) = serde_json::from_str::<RawHookEntry>(line) else {
+            continue;
+        };
+        let Some(ts) = raw.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+            continue;
+        };
+        let blocks = raw
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .and_then(|content| content.as_array());
+        match (raw.kind.as_deref(), raw.subtype.as_deref()) {
+            (Some("assistant"), _) => {
+                for block in blocks.into_iter().flatten() {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    if let (Some(id), Some(tool)) = (
+                        block.get("id").and_then(|v| v.as_str()),
+                        block.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        call_at.insert(id.to_string(), activity.steps.len());
+                        activity.steps.push(Step::Call {
+                            epoch_ms: ts,
+                            id: id.to_string(),
+                            tool: tool.to_string(),
+                            result: CallResult::Pending,
+                        });
+                    }
+                }
+            }
+            (Some("user"), _) => {
+                let results: Vec<&Value> = blocks
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+                    .collect();
+                if results.is_empty() {
+                    // Decided by structure: a prompt that merely mentions a
+                    // tool result in its text is still the human's turn.
+                    if raw.is_meta != Some(true) {
+                        activity.steps.push(Step::HumanTurn);
+                    }
+                    continue;
+                }
+                // The marker names no block, so — as for friction — it is only
+                // attributed when the entry holds a single failed result.
+                let marked = raw.denial_kind.is_some()
+                    && results.iter().filter(|r| is_failed_result(r)).count() == 1;
+                for result in results {
+                    let id = result.get("tool_use_id").and_then(|v| v.as_str());
+                    let block = block_trace(ts, result);
+                    // Refused before it ran — by a hook, a rule, or the user — is
+                    // not a failure of the tool, and reaches no post-execution hook.
+                    let outcome = if block.is_some()
+                        || (marked && is_failed_result(result))
+                        || is_unmarked_denial(result)
+                    {
+                        CallResult::Denied
+                    } else if is_failed_result(result) {
+                        CallResult::Failed
+                    } else {
+                        CallResult::Succeeded
+                    };
+                    if let Some(Step::Call {
+                        result: answered, ..
+                    }) = id
+                        .and_then(|id| call_at.get(id))
+                        .and_then(|&at| activity.steps.get_mut(at))
+                    {
+                        *answered = outcome;
+                    }
+                    activity.traces.extend(block);
+                }
+            }
+            (Some("attachment"), _) => {
+                if let Some(trace) = raw
+                    .attachment
+                    .as_ref()
+                    .and_then(|a| attachment_trace(ts, a))
+                {
+                    activity.traces.push(trace);
+                }
+            }
+            (Some("system"), Some("stop_hook_summary")) => {
+                let runs: Vec<(&str, Option<i64>)> = raw
+                    .hook_infos
+                    .iter()
+                    .flatten()
+                    .filter_map(|info| {
+                        let command = info.get("command").and_then(|c| c.as_str())?;
+                        let duration = info.get("durationMs").and_then(|d| d.as_i64());
+                        Some((command, duration))
+                    })
+                    // Claude Code's own stop handling, not a configured hook.
+                    .filter(|(command, _)| *command != "callback")
+                    .collect();
+                // The summary says the stop was prevented, not by which hook: it
+                // is one hook's block only when there was one hook to do it.
+                let prevented = raw.prevented_continuation == Some(true);
+                if prevented && runs.len() != 1 {
+                    activity.traces.push(HookTrace {
+                        epoch_ms: ts,
+                        event: "Stop".to_string(),
+                        subject: None,
+                        command: None,
+                        outcome: HookOutcome::Blocked,
+                        exit_code: None,
+                        duration_ms: None,
+                        context_tokens: 0,
+                        tool_use_id: None,
+                    });
+                }
+                let outcome = if prevented && runs.len() == 1 {
+                    HookOutcome::Blocked
+                } else {
+                    HookOutcome::Ok
+                };
+                for (command, duration_ms) in runs {
+                    activity.traces.push(HookTrace {
+                        epoch_ms: ts,
+                        event: "Stop".to_string(),
+                        subject: None,
+                        command: named_command(command),
+                        outcome,
+                        exit_code: None,
+                        duration_ms,
+                        context_tokens: 0,
+                        tool_use_id: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    activity
+}
+
+/// A refusal in a transcript that predates the `toolDenialKind` marker, read
+/// from upstream's fixed wording for a rule's or the user's refusal — the same
+/// fallback `is_rule_denial` uses.
+fn is_unmarked_denial(result: &Value) -> bool {
+    const REFUSALS: [&str; 2] = [
+        "Permission for this action was denied",
+        "The user doesn't want to proceed with this tool use",
+    ];
+    is_failed_result(result)
+        && result.get("content").is_some_and(|content| {
+            let text = content.to_string();
+            REFUSALS.iter().any(|refusal| text.contains(refusal))
+        })
+}
+
+/// The text Claude Code writes ahead of a hook's own message when the hook
+/// blocked a call: `<Event>:<subject> hook error: [<command>]`.
+const BLOCK_MARKER: &str = " hook error: [";
+
+/// A block trace from a failed `tool_result`, read from upstream's fixed prefix
+/// alone — the hook's message after it is never parsed.
+fn block_trace(ts: i64, result: &Value) -> Option<HookTrace> {
+    if !is_failed_result(result) {
+        return None;
+    }
+    let text = match result.get("content")? {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|b| b.get("text").and_then(|t| t.as_str()))?
+            .to_string(),
+        _ => return None,
+    };
+    let (name, rest) = text.split_once(BLOCK_MARKER)?;
+    let (event, subject) = name.split_once(':')?;
+    if event.is_empty() || !event.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let command = rest
+        .find("]: ")
+        .or_else(|| rest.rfind(']'))
+        .map(|end| &rest[..end])?;
+    Some(HookTrace {
+        epoch_ms: ts,
+        event: event.to_string(),
+        subject: Some(subject.to_string()).filter(|s| !s.is_empty()),
+        command: named_command(command),
+        outcome: HookOutcome::Blocked,
+        exit_code: None,
+        duration_ms: None,
+        context_tokens: 0,
+        tool_use_id: result
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+/// A trace from a hook attachment (`hook_success`, `hook_non_blocking_error`,
+/// `hook_additional_context`). One whose `hookName` does not begin with its
+/// event is Claude Code's own injection, not a hook, and yields nothing.
+fn attachment_trace(ts: i64, attachment: &Value) -> Option<HookTrace> {
+    let field = |key: &str| attachment.get(key).and_then(|v| v.as_str());
+    let outcome = match field("type")? {
+        "hook_success" => HookOutcome::Ok,
+        "hook_non_blocking_error" => HookOutcome::Error,
+        "hook_additional_context" => HookOutcome::Context,
+        _ => return None,
+    };
+    let event = field("hookEvent")?;
+    let subject = match field("hookName")?.strip_prefix(event)? {
+        "" => None,
+        rest => Some(rest.strip_prefix(':')?.to_string()),
+    };
+    let context_tokens = match outcome {
+        HookOutcome::Context => attachment
+            .get("content")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str())
+            .map(approx_tokens)
+            .sum(),
+        _ => 0,
+    };
+    Some(HookTrace {
+        epoch_ms: ts,
+        event: event.to_string(),
+        subject,
+        command: field("command").and_then(named_command),
+        outcome,
+        exit_code: attachment.get("exitCode").and_then(|v| v.as_i64()),
+        duration_ms: attachment.get("durationMs").and_then(|v| v.as_i64()),
+        context_tokens,
+        tool_use_id: field("toolUseID").map(String::from),
+    })
+}
+
+/// The command a trace names, or `None` for the anonymous placeholder Claude
+/// Code sometimes writes instead (`command hook`, `command hook 2`).
+fn named_command(command: &str) -> Option<String> {
+    let anonymous = command
+        .strip_prefix("command hook")
+        .is_some_and(|rest| rest.trim().chars().all(|ch| ch.is_ascii_digit()));
+    (!anonymous && !command.is_empty()).then(|| command.to_string())
 }
 
 /// Count the denials an allow rule could have prevented — the friction signal
@@ -1270,5 +1552,195 @@ mod tests {
             errors[0].excerpt,
             "String to replace not found in /tmp/example/bar.rs"
         );
+    }
+
+    /// A synthetic main-thread session exercising every hook trace shape.
+    fn hook_session() -> String {
+        [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"run it"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-01-01T00:00:00.100Z","attachment":{"type":"hook_additional_context","hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit","toolUseID":"hook-1","content":["twelve chars"]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sed -i x"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.500Z","toolDenialKind":"permission-rule","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"PreToolUse:Bash hook error: [/tmp/example/guard.sh]: use perl instead"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/tmp/example/a"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.500Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"perl -pi x"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.500Z","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"done"}]}}"#,
+            r#"{"type":"attachment","timestamp":"2026-01-01T00:00:03.600Z","attachment":{"type":"hook_non_blocking_error","hookName":"PostToolUse:Write","hookEvent":"PostToolUse","toolUseID":"t3","command":"command hook","exitCode":127,"durationMs":42,"stdout":"","stderr":"not found"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-01-01T00:00:03.700Z","attachment":{"type":"hook_additional_context","hookName":"tool.call","hookEvent":"PostToolUse","toolUseID":"t3","content":["internal"]}}"#,
+            r#"{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-01-01T00:00:04.000Z","hookCount":2,"hookInfos":[{"command":"/tmp/example/notify","durationMs":15},{"command":"callback"}],"preventedContinuation":false}"#,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn a_block_is_read_from_the_hook_error_prefix() {
+        let activity = extract_hook_activity(&hook_session());
+        let block = activity
+            .traces
+            .iter()
+            .find(|t| t.outcome == HookOutcome::Blocked)
+            .unwrap();
+        assert_eq!(block.event, "PreToolUse");
+        assert_eq!(block.subject.as_deref(), Some("Bash"));
+        assert_eq!(block.command.as_deref(), Some("/tmp/example/guard.sh"));
+        assert_eq!(block.tool_use_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn a_non_blocking_error_keeps_its_exit_and_duration_but_not_a_placeholder_command() {
+        let activity = extract_hook_activity(&hook_session());
+        let error = activity
+            .traces
+            .iter()
+            .find(|t| t.outcome == HookOutcome::Error)
+            .unwrap();
+        assert_eq!(error.subject.as_deref(), Some("Write"));
+        assert_eq!(error.command, None);
+        assert_eq!(error.exit_code, Some(127));
+        assert_eq!(error.duration_ms, Some(42));
+    }
+
+    #[test]
+    fn injected_context_is_weighed_and_internal_injections_are_skipped() {
+        let activity = extract_hook_activity(&hook_session());
+        let contexts: Vec<_> = activity
+            .traces
+            .iter()
+            .filter(|t| t.outcome == HookOutcome::Context)
+            .collect();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].event, "UserPromptSubmit");
+        assert_eq!(contexts[0].subject, None);
+        assert_eq!(contexts[0].context_tokens, 3); // "twelve chars" = 12 chars
+    }
+
+    #[test]
+    fn a_stop_summary_yields_one_run_per_user_hook() {
+        let activity = extract_hook_activity(&hook_session());
+        let stops: Vec<_> = activity
+            .traces
+            .iter()
+            .filter(|t| t.event == "Stop")
+            .collect();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].command.as_deref(), Some("/tmp/example/notify"));
+        assert_eq!(stops[0].outcome, HookOutcome::Ok);
+        assert_eq!(stops[0].duration_ms, Some(15));
+    }
+
+    const EPOCH_T1: i64 = 1_767_225_601_000;
+    const EPOCH_T2: i64 = 1_767_225_602_000;
+    const EPOCH_T3: i64 = 1_767_225_603_000;
+
+    #[test]
+    fn the_steps_record_calls_their_failure_and_human_turns_in_order() {
+        let activity = extract_hook_activity(&hook_session());
+        assert_eq!(
+            activity.steps,
+            [
+                Step::HumanTurn,
+                Step::Call {
+                    epoch_ms: EPOCH_T1,
+                    id: "t1".into(),
+                    tool: "Bash".into(),
+                    result: CallResult::Denied
+                },
+                Step::Call {
+                    epoch_ms: EPOCH_T2,
+                    id: "t2".into(),
+                    tool: "Read".into(),
+                    result: CallResult::Succeeded
+                },
+                Step::Call {
+                    epoch_ms: EPOCH_T3,
+                    id: "t3".into(),
+                    tool: "Bash".into(),
+                    result: CallResult::Succeeded
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_without_a_result_yet_is_pending() {
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 60"}}]}}"#;
+        let activity = extract_hook_activity(jsonl);
+        assert_eq!(
+            activity.steps,
+            [Step::Call {
+                epoch_ms: EPOCH_T1,
+                id: "t1".into(),
+                tool: "Bash".into(),
+                result: CallResult::Pending,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_prevented_stop_with_several_hooks_blames_none_of_them() {
+        let jsonl = r#"{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-01-01T00:00:04.000Z","hookInfos":[{"command":"/tmp/example/a"},{"command":"/tmp/example/b"}],"preventedContinuation":true}"#;
+        let traces = extract_hook_activity(jsonl).traces;
+        let blocked: Vec<_> = traces
+            .iter()
+            .filter(|t| t.outcome == HookOutcome::Blocked)
+            .collect();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].command, None);
+        assert_eq!(
+            traces
+                .iter()
+                .filter(|t| t.outcome == HookOutcome::Ok)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_prevented_stop_with_one_hook_is_that_hooks_block() {
+        let jsonl = r#"{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-01-01T00:00:04.000Z","hookInfos":[{"command":"/tmp/example/a"},{"command":"callback"}],"preventedContinuation":true}"#;
+        let traces = extract_hook_activity(jsonl).traces;
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].outcome, HookOutcome::Blocked);
+        assert_eq!(traces[0].command.as_deref(), Some("/tmp/example/a"));
+    }
+
+    #[test]
+    fn an_unmarked_refusal_is_a_denial_not_a_failure() {
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm x"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.500Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Permission for this action was denied."}]}}"#,
+        ]
+        .join("\n");
+        let steps = extract_hook_activity(&jsonl).steps;
+        assert!(matches!(
+            steps[0],
+            Step::Call {
+                result: CallResult::Denied,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_prompt_that_mentions_tool_result_is_still_a_human_turn() {
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"explain tool_result instead"}}"#;
+        assert_eq!(extract_hook_activity(jsonl).steps, [Step::HumanTurn]);
+    }
+    #[test]
+    fn a_denial_marker_is_not_spread_onto_a_successful_result_beside_it() {
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"a"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/tmp/example/b"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.500Z","toolDenialKind":"permission-rule","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"refused"},{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ]
+        .join("\n");
+        let results: Vec<CallResult> = extract_hook_activity(&jsonl)
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Call { result, .. } => Some(*result),
+                Step::HumanTurn => None,
+            })
+            .collect();
+        assert_eq!(results, [CallResult::Denied, CallResult::Succeeded]);
     }
 }

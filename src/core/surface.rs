@@ -104,9 +104,11 @@ pub struct Surface {
     pub attrs: Vec<(String, String)>,
 }
 
-/// Whether a surface kind can ever acquire usage events. Absence of events is
-/// only evidence of disuse for usage-measurable kinds; for catalog-only kinds
-/// (rules, hooks, CLAUDE.md) it means nothing (`docs/specs/surfaces.md`).
+/// Whether a surface kind's events alone count its uses. Absence of events is
+/// only evidence of disuse for these kinds; for catalog-only kinds (rules,
+/// CLAUDE.md) it means nothing. A hook is neither: its traces are no fire count,
+/// so whether a hook row is measurable depends on its trigger being countable
+/// (`core::hook::trigger_count`, `docs/specs/surfaces.md`).
 pub fn is_usage_measurable(kind: &str) -> bool {
     matches!(
         kind,

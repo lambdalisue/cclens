@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::core::hook::HookDef;
 use crate::core::surface::{LoadMode, Scope, Surface};
 
 /// The Claude Code config root: `$CLAUDE_CONFIG_DIR` when it names a non-empty
@@ -474,6 +475,13 @@ pub fn read_project_surfaces(
         surfaces.extend(read_agent_surfaces(&claude.join("agents"), &scope));
     }
     surfaces.extend(read_mcp_server_surfaces(&root.join(".mcp.json"), &scope));
+    surfaces.extend(read_hook_surfaces(
+        &[
+            claude.join("settings.json"),
+            claude.join("settings.local.json"),
+        ],
+        &scope,
+    ));
     // A repo that serves both agent conventions usually ships `AGENTS.md` as a
     // symlink to `CLAUDE.md`; listing `CLAUDE.md` first makes it the one that
     // is reported when the pair resolves to one file.
@@ -545,6 +553,98 @@ pub fn read_mcp_server_surfaces(mcp_json: &Path, scope: &Scope) -> Vec<Surface> 
             load_mode: LoadMode::ToolSchema,
             attrs: Vec::new(),
         })
+        .collect()
+}
+
+/// Parse the `hooks` of one `settings.json` into surfaces, one per entry of
+/// `hooks.<Event>[].hooks[]`. The id is the core's `<Event>[<matcher>]
+/// <command>` (`HookDef::id`); an entry with no `command` is named by its type.
+/// A hook injects no text of its own, so its weight is unknown and its startup
+/// cost zero (`docs/specs/config-format.md`). Unreadable text yields nothing.
+pub fn hook_surfaces(settings: &str, config_path: &str, scope: &Scope) -> Vec<Surface> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(settings) else {
+        return Vec::new();
+    };
+    let Some(events) = value.get("hooks").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut surfaces = Vec::new();
+    for (event, groups) in events {
+        for group in groups.as_array().into_iter().flatten() {
+            let matcher = group
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .map(String::from);
+            for hook in group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let command = match hook.get("command").and_then(|c| c.as_str()) {
+                    Some(command) => command.to_string(),
+                    // Named by what it runs, so two such hooks in one place stay
+                    // two surfaces rather than collapsing into one type label.
+                    None => {
+                        let kind = hook.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        let body = ["prompt", "url"]
+                            .into_iter()
+                            .find_map(|key| hook.get(key).and_then(|v| v.as_str()))
+                            .unwrap_or_default();
+                        format!("({kind}) {}", hook_body_label(body))
+                            .trim_end()
+                            .to_string()
+                    }
+                };
+                let def = HookDef {
+                    event: event.clone(),
+                    matcher: matcher.clone(),
+                    command,
+                };
+                surfaces.push(Surface {
+                    kind: "hook".to_string(),
+                    id: def.id(),
+                    scope: scope.clone(),
+                    config_path: config_path.to_string(),
+                    static_tokens: None,
+                    startup_tokens: Some(0),
+                    load_mode: LoadMode::OnDemand,
+                    attrs: Vec::new(),
+                });
+            }
+        }
+    }
+    surfaces
+}
+
+/// A no-command hook's definition as an id fragment: whitespace-collapsed, and
+/// past 80 characters cut and suffixed with a hash of the whole text, so two
+/// definitions sharing a long opening stay two hooks. The hash need not be
+/// stable across releases — ids are rebuilt from config on every analyze and
+/// nothing stored is keyed by them.
+fn hook_body_label(body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    const SHOWN: usize = 80;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= SHOWN {
+        return collapsed;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    collapsed.hash(&mut hasher);
+    let shown: String = collapsed.chars().take(SHOWN).collect();
+    format!("{shown}… #{:08x}", hasher.finish() as u32)
+}
+
+/// Read the hooks of every settings file of one scope, in order. A hook
+/// declared in more than one of them (a project's shared and local settings)
+/// is one surface, kept from the first file.
+pub fn read_hook_surfaces(settings_files: &[PathBuf], scope: &Scope) -> Vec<Surface> {
+    let mut seen = HashSet::new();
+    settings_files
+        .iter()
+        .filter_map(|path| Some((path, fs::read_to_string(path).ok()?)))
+        .flat_map(|(path, text)| hook_surfaces(&text, &path.display().to_string(), scope))
+        .filter(|surface| seen.insert(surface.id.clone()))
         .collect()
 }
 
@@ -1224,5 +1324,100 @@ mod tests {
             agent_surface("explorer", "/c/explorer.md", "x", &Scope::Global).load_mode,
             LoadMode::StartupDescription
         );
+    }
+
+    #[test]
+    fn every_hook_command_is_its_own_surface() {
+        let settings = r#"{"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "/tmp/example/a.sh"},
+                {"type": "command", "command": "/tmp/example/b.sh"}]},
+            {"matcher": "Edit|Write", "hooks": [
+                {"type": "command", "command": "/tmp/example/a.sh"}]}],
+          "Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}}"#;
+        let mut ids: Vec<String> = hook_surfaces(settings, "/c/settings.json", &Scope::Global)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "PreToolUse[Bash] /tmp/example/a.sh",
+                "PreToolUse[Bash] /tmp/example/b.sh",
+                "PreToolUse[Edit|Write] /tmp/example/a.sh",
+                "Stop[*] notify",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_costs_nothing_at_startup_and_loads_on_demand() {
+        let settings =
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}}"#;
+        let surface = &hook_surfaces(settings, "/c/settings.json", &Scope::Global)[0];
+        assert_eq!(surface.kind, "hook");
+        assert_eq!(surface.load_mode, LoadMode::OnDemand);
+        assert_eq!(surface.startup_tokens, Some(0));
+        assert_eq!(surface.static_tokens, None);
+    }
+
+    #[test]
+    fn a_hook_without_a_command_is_named_by_its_type_and_definition() {
+        let settings = r#"{"hooks": {"Stop": [{"hooks": [{"type": "prompt", "prompt": "check  the\nwork"}]}]}}"#;
+        let surfaces = hook_surfaces(settings, "/c/settings.json", &Scope::Global);
+        assert_eq!(surfaces[0].id, "Stop[*] (prompt) check the work");
+    }
+
+    #[test]
+    fn two_different_prompt_hooks_stay_two_surfaces() {
+        let settings = r#"{"hooks": {"Stop": [{"hooks": [
+            {"type": "prompt", "prompt": "check tests"},
+            {"type": "prompt", "prompt": "check docs"}]}]}}"#;
+        let surfaces = read_hook_surfaces_from_text(settings);
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[test]
+    fn prompt_hooks_sharing_a_long_opening_stay_two_surfaces() {
+        let opening = "check ".repeat(20);
+        let settings = format!(
+            r#"{{"hooks": {{"Stop": [{{"hooks": [
+                {{"type": "prompt", "prompt": "{opening} tests"}},
+                {{"type": "prompt", "prompt": "{opening} docs"}}]}}]}}}}"#
+        );
+        assert_eq!(read_hook_surfaces_from_text(&settings).len(), 2);
+    }
+
+    fn read_hook_surfaces_from_text(settings: &str) -> Vec<Surface> {
+        let dir = scratch_dir("hooks-prompt-pair");
+        let path = dir.join("settings.json");
+        fs::write(&path, settings).unwrap();
+        let surfaces = read_hook_surfaces(&[path], &Scope::Global);
+        fs::remove_dir_all(&dir).ok();
+        surfaces
+    }
+
+    #[test]
+    fn settings_without_hooks_or_unreadable_yield_nothing() {
+        assert!(hook_surfaces(r#"{"permissions": {}}"#, "s", &Scope::Global).is_empty());
+        assert!(hook_surfaces("not json", "s", &Scope::Global).is_empty());
+    }
+
+    #[test]
+    fn a_hook_in_both_project_settings_files_is_one_surface() {
+        let root = scratch_dir("hooks-shared-and-local");
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        let settings =
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}}"#;
+        fs::write(root.join(".claude/settings.json"), settings).unwrap();
+        fs::write(root.join(".claude/settings.local.json"), settings).unwrap();
+
+        let surfaces = read_project_surfaces(&root, "alpha", None, None);
+        fs::remove_dir_all(&root).ok();
+
+        let hooks: Vec<_> = surfaces.iter().filter(|s| s.kind == "hook").collect();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].scope, Scope::Project("alpha".into()));
     }
 }

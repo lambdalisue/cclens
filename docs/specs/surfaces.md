@@ -56,14 +56,73 @@ fastest way to a wrong recommendation. Each kind is classified:
 | `agent` | usage-measurable | `agent_spawn` |
 | `mcp_server` / `mcp_tool` | usage-measurable | `tool_use` |
 | `permission` | usage-measurable (partly heuristic) | `permission_prompt` from the denial marker, falling back to denial text — lower confidence |
+| `hook` | usage-measurable **where its trigger is countable** (estimated) | `tool_call` (or prompt / session) counts its matcher selects; `hook_runs` traces for what it did |
 | `rule` | **catalog-only** | none (injected context; no invocation event) |
-| `hook` | **catalog-only** | none (no structured transcript trace) |
 | `claude_md` | **catalog-only** | none (always-on; usage is not the question — static cost is) |
 
 For a **catalog-only** surface, absence of events is *not* evidence of disuse —
 no event could ever appear. The join still lists it (with zero usage), but the
-wedges below gate on this class so a rule or hook is never flagged "unused →
-delete" merely for emitting nothing.
+wedges below gate on this class so a rule or `CLAUDE.md` is never flagged
+"unused → delete" merely for emitting nothing.
+
+### Hooks are measured by their trigger, not their trace
+
+A hook's own trace cannot count how often it ran: Claude Code records a hook
+only when it *did* something visible — blocked a call, failed, or injected
+context (`hook_runs`, `session-format.md`). A guard that passes silently, which
+is what a healthy `PreToolUse` guard does almost every time, leaves nothing.
+Counting traces would call the most-exercised guard "unused".
+
+What *is* countable is the trigger. A hook fires on every occurrence of its event
+that its matcher selects, so its **uses** are those occurrences in the window
+(`core::hook::trigger_count`):
+
+- a tool event — the `tool_call` events whose tool name the matcher selects,
+  among the calls that event fires on: every call for `PreToolUse`, the
+  successful ones for `PostToolUse`, the ones that ran and failed for
+  `PostToolUseFailure` (a call refused before it ran — by a hook, a permission
+  rule, or the user — reaches no post-execution hook).
+  Calls made inside subagents count too, because hooks run there as well;
+- `UserPromptSubmit` — the prompts; `SessionStart` — the sessions.
+
+A matcher is read the way Claude Code reads it: names and `|` only are an exact
+list; any other character makes the whole matcher a regex searched anywhere in
+the tool name, so `Edit.*` also selects `NotebookEdit`.
+
+Every other event (`Stop`, `Notification`, `PermissionRequest` — which fires only
+on calls that raised a prompt, a fact no call records — …), and a matcher too intricate to
+evaluate without guessing, leaves the trigger **unknown**: the row is listed but
+never judged, exactly like a catalog-only kind. The figure is an estimate
+because the catalog is read *now*: a hook added last week is credited with the
+matching calls of the whole window. That direction is safe for the one verdict
+built on it — zero matching calls means the hook could not have fired whenever
+it was added — so **Unused** for a hook reads "its matcher never matched", the
+same signal Claude Code's own `/status` reports, but across history.
+
+Triggers are counted only over sessions whose hook activity was extracted. A
+session stored by an older analyzer whose transcript Claude Code has since
+pruned holds no calls; counting it would turn "not observed" into "never
+fired", so it is left out, and a scope with no such session at all leaves every
+trigger unknown rather than zero (the store's report-the-gap rule,
+`storage.md`).
+
+A hook is also not shadowed like a skill. Global and project hooks all run, so
+each row's trigger counts the sessions its own scope covers — every session for
+a global hook, that project's sessions for a project hook.
+
+Traces are joined to the catalog in the core, not by id (`core::hook::resolve`):
+a trace names its event, the value its matcher was tested against (the tool
+name), and — when Claude Code recorded it — the command. It resolves only when
+exactly one catalogued hook qualifies: the same event, a matcher that selects
+that value, and the same command when one is named. A trace that several hooks
+qualify for is **unattributed** — one of the user's hooks left it, but nothing
+says which, and splitting it would invent a precision the transcript does not
+hold. That covers an unnamed command, and also one command wired under two
+matchers that both select the call: Claude Code runs identical handlers once, so
+the single trace belongs to neither entry more than the other. A trace no
+catalogued hook could have left is **orphaned usage**: a hook injected from
+outside the user's settings (a plugin, a wrapper that passes `--settings`) is
+real usage the catalog cannot see.
 
 ## The join
 
@@ -88,7 +147,7 @@ its evidence; acting (or the future AI layer proposing) is downstream.
 
 | Wedge | Condition | Requires | Suggested move |
 | --- | --- | --- | --- |
-| **Unused** | installed, **zero** events (over the window) | usage-measurable kind only | delete / disable |
+| **Unused** | installed, **zero** events (over the window); for a hook, zero triggering occurrences | usage-measurable kind only (a hook only when its trigger is countable) | delete / disable (a hook: fix or drop the matcher) |
 | **Costly + rare** | high static or runtime cost, low usage | usage-measurable kind | trim, or make on-demand |
 | **Always-on heavy** | startup-full load mode, large static cost, confirmed against observed context (below) | static cost + observed `ctx_start` | slim, or move to a path-conditional rule / on-demand skill |
 | **Never-fires rule** | path-conditional rule whose `paths:` never matched session activity | rule paths × activity file-paths (see below) | narrow or delete |
@@ -123,8 +182,8 @@ invoked)`, because the seeded session acts on those figures and a single
 unlabelled number there becomes a fix proposal that frees nothing.
 
 The "Requires" column makes the coverage explicit: **Unused** and **Costly +
-rare** apply only to usage-measurable kinds — never to `rule` / `hook` /
-`claude_md`. A few wedges depend on signals the tool does not yet fully have:
+rare** apply only to usage-measurable kinds — never to `rule` / `claude_md`, and
+to a `hook` only when its trigger is countable (above). A few wedges depend on signals the tool does not yet fully have:
 
 - **Never-fires rule** needs evidence a rule's `paths:` glob *could* have fired.
   The only honest source is session activity — did any file matching the glob

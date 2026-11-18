@@ -9,16 +9,21 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::adapter::config::{
-    claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_mcp_server_surfaces,
-    read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
+    claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_hook_surfaces,
+    read_mcp_server_surfaces, read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
 use crate::adapter::transcript::{
-    count_permission_denials, extract_prompt_pointers, extract_tool_errors, extract_work_events,
-    parse_session, parse_subagent_sidecar, prompt_tokens, session_cwd, subagent_id_from_file_name,
-    subagent_prompt_id, subagent_sidecar_path, subagents_dir,
+    HookActivity, count_permission_denials, extract_hook_activity, extract_prompt_pointers,
+    extract_tool_errors, extract_work_events, parse_session, parse_subagent_sidecar, prompt_tokens,
+    session_cwd, subagent_id_from_file_name, subagent_prompt_id, subagent_sidecar_path,
+    subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
 use crate::core::friction::ErrorCategory;
+use crate::core::hook::{
+    CallResult, CatalogHook, HookDef, HookOutcome, HookTrace, HookUsage, Step, Unattributed,
+    retry_calls, rollup, standing_context, trigger_count,
+};
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
@@ -27,8 +32,8 @@ use crate::core::subagent::{
     model_choice_by_agent,
 };
 use crate::core::surface::{
-    LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
-    on_demand_tokens, startup_savings,
+    LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, on_demand_tokens,
+    startup_savings,
 };
 use crate::core::thrash::detect_thrash;
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens, run_model};
@@ -162,6 +167,23 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// What each configured hook costs and catches: how often its matcher
+    /// selected a call, how often it blocked, its run time, the context it
+    /// injected, and how many calls each block cost before the work moved on.
+    Hooks {
+        /// Show one config layer only: global, project, or project:<slug>.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output format: table | markdown | json.
+        #[arg(long)]
+        format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Files Claude kept re-editing in rapid bursts — where it got stuck
     /// retrying instead of making progress.
     Stuck {
@@ -282,6 +304,17 @@ pub fn run() -> Result<()> {
             frozen,
             db,
         } => failures(
+            &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db)?,
+        ),
+        Command::Hooks {
+            scope,
+            format,
+            frozen,
+            db,
+        } => hooks(
             &parse_scope(scope.as_deref())?,
             parse_format(format.as_deref())?,
             frozen,
@@ -690,7 +723,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
         global: WedgeRefs::default(),
         projects: std::collections::HashMap::new(),
     };
-    for entry in store.effective_catalog()? {
+    for entry in catalog_with_hook_uses(store)? {
         let refs = if entry.scope == "global" {
             &mut scoped.global
         } else {
@@ -698,7 +731,7 @@ fn config_wedges(store: &Store) -> Result<ScopedWedges> {
         };
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|t| t as u64);
-        if is_usage_measurable(&entry.kind) && entry.uses == 0 {
+        if entry.measurable && entry.uses == 0 {
             refs.unused.push(surface_ref(&entry, load_mode));
         }
         if load_mode.is_always_on() && static_tokens.is_some_and(|t| t >= HEAVY_TOKENS) {
@@ -1239,6 +1272,273 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a block cost, when the trace is a block of a known call.
+fn block_cost(trace: &HookTrace, steps: &[Step]) -> Option<u32> {
+    if trace.outcome != HookOutcome::Blocked {
+        return None;
+    }
+    retry_calls(steps, trace.tool_use_id.as_deref()?, trace.epoch_ms)
+}
+
+/// Every catalogued hook row with its usage, and the traces no catalogued hook
+/// claimed (`core::hook::rollup`). Rows are the whole effective catalog's hook
+/// rows, unfiltered, so a project hook never loses its traces to orphans just
+/// because a report is scoped elsewhere.
+struct HookReport {
+    hooks: Vec<(crate::store::CatalogEntry, HookUsage)>,
+    orphans: Vec<Unattributed>,
+}
+
+fn hook_report(store: &Store) -> Result<HookReport> {
+    let mut triggers_by_scope: std::collections::HashMap<String, crate::core::hook::Triggers> =
+        std::collections::HashMap::new();
+    let mut entries = Vec::new();
+    let mut catalog = Vec::new();
+    for entry in store.effective_catalog()? {
+        if entry.kind != "hook" {
+            continue;
+        }
+        let Some(def) = HookDef::parse(&entry.id) else {
+            continue;
+        };
+        let project = (entry.scope == "project").then(|| entry.project.clone());
+        let key = project.clone().unwrap_or_default();
+        if !triggers_by_scope.contains_key(&key) {
+            let triggers = store.hook_triggers(project.as_deref())?;
+            triggers_by_scope.insert(key.clone(), triggers);
+        }
+        let triggers = trigger_count(&def, &triggers_by_scope[&key]);
+        catalog.push(CatalogHook {
+            def,
+            project,
+            triggers,
+        });
+        entries.push(entry);
+    }
+    let traces = store.hook_traces()?;
+    let refs: Vec<_> = traces.iter().collect();
+    let (usages, orphans) = rollup(&catalog, &refs);
+    Ok(HookReport {
+        hooks: entries.into_iter().zip(usages).collect(),
+        orphans,
+    })
+}
+
+/// The effective catalog with each hook row's uses set to its trigger count —
+/// measurable only once that count is known (`docs/specs/surfaces.md`).
+fn catalog_with_hook_uses(store: &Store) -> Result<Vec<crate::store::CatalogEntry>> {
+    let report = hook_report(store)?;
+    let mut catalog = store.effective_catalog()?;
+    for entry in catalog.iter_mut().filter(|e| e.kind == "hook") {
+        let usage = report.hooks.iter().find(|(hook, _)| {
+            hook.id == entry.id && hook.scope == entry.scope && hook.project == entry.project
+        });
+        let triggers = usage.and_then(|(_, usage)| usage.triggers);
+        entry.uses = triggers.map_or(0, |t| t as i64);
+        entry.measurable = triggers.is_some();
+    }
+    Ok(catalog)
+}
+
+/// A millisecond figure in the largest unit that keeps it readable.
+fn fmt_ms(ms: i64) -> String {
+    match ms {
+        ms if ms >= 60_000 => format!("{:.1}m", ms as f64 / 60_000.0),
+        ms if ms >= 1_000 => format!("{:.1}s", ms as f64 / 1_000.0),
+        ms => format!("{ms}ms"),
+    }
+}
+
+/// Per-hook cost and catch: uses (the triggers its matcher selected), blocks,
+/// its own errors, run time, injected context and what each block cost. The
+/// figures other than uses come from the traces Claude Code recorded, so they
+/// cover the runs that did something visible (`docs/specs/events.md`).
+fn hooks(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
+    let store = open_for_read(db, frozen)?;
+    let report = hook_report(&store)?;
+    let mut rows: Vec<_> = report
+        .hooks
+        .iter()
+        .filter(|(entry, _)| in_scope(filter, &entry.scope, &entry.project))
+        .collect();
+    // What the hook costs or catches first; then how much it is exercised.
+    rows.sort_by_key(|(entry, usage)| {
+        (
+            std::cmp::Reverse(usage.blocks),
+            std::cmp::Reverse(usage.context_tokens),
+            std::cmp::Reverse(usage.duration_total_ms),
+            std::cmp::Reverse(usage.triggers.unwrap_or(0)),
+            entry.id.clone(),
+        )
+    });
+    let orphans = if *filter == ScopeFilter::All {
+        report.orphans.as_slice()
+    } else {
+        &[]
+    };
+    let status = |event: &str, usage: &HookUsage| -> &'static str {
+        if usage.never_matched() {
+            "NEVER MATCHED"
+        } else if standing_context(event).is_some() && usage.context_injections > 0 {
+            "STANDING CONTEXT"
+        } else {
+            ""
+        }
+    };
+
+    if format == Format::Json {
+        let hooks: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(entry, usage)| {
+                let def = HookDef::parse(&entry.id);
+                serde_json::json!({
+                    "id": entry.id,
+                    "scope": entry.scope,
+                    "project": if entry.project.is_empty() { None } else { Some(&entry.project) },
+                    "event": def.as_ref().map(|d| &d.event),
+                    "matcher": def.as_ref().and_then(|d| d.matcher.as_ref()),
+                    "command": def.as_ref().map(|d| &d.command),
+                    "usage": usage,
+                    "block_rate": usage.block_rate(),
+                    "mean_retry_calls": usage.mean_retry_calls(),
+                    "status": def.as_ref().map_or("", |d| status(&d.event, usage)),
+                })
+            })
+            .collect();
+        let orphans: Vec<serde_json::Value> = orphans
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "trace": o.key,
+                    "ambiguous": o.ambiguous,
+                    "usage": o.usage,
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "hooks": hooks, "orphans": orphans }));
+    }
+    if rows.is_empty() && orphans.is_empty() {
+        println!("no hooks configured or traced — run `cclens analyze` first");
+        return Ok(());
+    }
+
+    preamble(
+        format,
+        "Every hook in your settings, with what it costs and what it catches. \"uses\" is\n\
+         how many calls (or prompts / sessions) its matcher selected — an estimate against\n\
+         today's config, \"?\" when its trigger cannot be counted. A hook that passes\n\
+         silently leaves no trace, so blocks, errors, time and context cover only the runs\n\
+         Claude Code recorded. NEVER MATCHED marks a hook that cannot have fired.",
+    );
+    let cells = |event: &str, usage: &HookUsage| -> Vec<String> {
+        let blocked = match (usage.blocks, usage.block_rate()) {
+            (0, _) => "-".to_string(),
+            (n, Some(rate)) if rate < 0.001 => format!("{n} (<0.1%)"),
+            (n, Some(rate)) => format!("{n} ({:.1}%)", rate * 100.0),
+            (n, None) => n.to_string(),
+        };
+        let time = match (usage.duration_p50_ms, usage.duration_p95_ms) {
+            (Some(p50), Some(p95)) => format!(
+                "{} (p50 {} / p95 {}, n={})",
+                fmt_ms(usage.duration_total_ms),
+                fmt_ms(p50),
+                fmt_ms(p95),
+                usage.measured_runs
+            ),
+            _ => "-".to_string(),
+        };
+        let context = match usage.mean_context_tokens() {
+            Some(mean) => {
+                let per = standing_context(event).unwrap_or("injection");
+                format!(
+                    "{} tok (~{mean}/{per}, {}x)",
+                    fmt_tokens(usage.context_tokens as i64),
+                    usage.context_injections
+                )
+            }
+            None => "-".to_string(),
+        };
+        let retries = match (
+            usage.mean_retry_calls(),
+            usage.blocks - usage.resolved_blocks,
+        ) {
+            (None, 0) => "-".to_string(),
+            (None, open) => format!("{open} unresolved"),
+            (Some(mean), 0) => format!("{mean:.1} calls"),
+            (Some(mean), open) => format!("{mean:.1} calls, {open} unresolved"),
+        };
+        let errors = match usage.errors {
+            0 => "-".to_string(),
+            n => n.to_string(),
+        };
+        vec![blocked, errors, time, context, retries]
+    };
+    let mut table: Vec<Vec<String>> = Vec::new();
+    for (entry, usage) in &rows {
+        let event = HookDef::parse(&entry.id)
+            .map(|d| d.event)
+            .unwrap_or_default();
+        let mut row = vec![
+            entry.id.clone(),
+            scope_cell(&entry.scope, &entry.project),
+            usage
+                .triggers
+                .map_or_else(|| "?".to_string(), |t| t.to_string()),
+        ];
+        row.extend(cells(&event, usage));
+        row.push(status(&event, usage).to_string());
+        table.push(row);
+    }
+    for orphan in orphans {
+        let event = orphan.key.split([':', ' ']).next().unwrap_or_default();
+        let mut row = vec![orphan.key.clone(), "-".to_string(), "-".to_string()];
+        row.extend(cells(event, &orphan.usage));
+        row.push(
+            if orphan.ambiguous {
+                "UNATTRIBUTED"
+            } else {
+                "ORPHANED"
+            }
+            .to_string(),
+        );
+        table.push(row);
+    }
+    render(
+        &[
+            "hook",
+            "scope",
+            "uses",
+            "blocked",
+            "errors",
+            "time",
+            "context",
+            "cost per block",
+            "status",
+        ],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Left,
+        ],
+        &table,
+        format,
+    );
+    note(
+        "cost per block: tool calls after a block until the same tool next succeeded —\n\
+         a heuristic for \"until the same intent passed\"; a block followed by a human\n\
+         turn or the session's end is unresolved. UNATTRIBUTED: Claude Code recorded no\n\
+         command, and several of your hooks could have left it. ORPHANED: traces of hooks\n\
+         not in your settings (a plugin, or a wrapper passing --settings).",
+    );
+    Ok(())
+}
+
 /// A dimmed footnote under a table — context, not data.
 fn note(text: &str) {
     println!("\n{}", Style::stdout().dim(text));
@@ -1653,7 +1953,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
         let records = parse_session(&text);
         let mut spans = extract_spans(&records, DEFAULT_IDLE_GAP_MS);
         let usage = extract_usage_events(&records);
-        let runs = subagent_runs(&transcript);
+        let (runs, subagent_hooks) = subagent_runs(&transcript);
         attribute_subagents(&mut spans, &runs);
         let sub_tokens: i64 = runs.iter().map(|run| run.out_tokens as i64).sum();
         let root = session_cwd(&text).map(|cwd| normalize_root(&cwd));
@@ -1693,6 +1993,34 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
             .collect();
         store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
+        // The main thread and every subagent: hooks fire in both. A block's cost
+        // is measured within the transcript it happened in.
+        let activities: Vec<HookActivity> = std::iter::once(extract_hook_activity(&text))
+            .chain(subagent_hooks)
+            .collect();
+        let hook_rows: Vec<(HookTrace, Option<u32>)> = activities
+            .iter()
+            .flat_map(|activity| {
+                activity
+                    .traces
+                    .iter()
+                    .map(|trace| (trace.clone(), block_cost(trace, &activity.steps)))
+            })
+            .collect();
+        let calls: Vec<(i64, &str, CallResult)> = activities
+            .iter()
+            .flat_map(|activity| &activity.steps)
+            .filter_map(|step| match step {
+                Step::Call {
+                    epoch_ms,
+                    tool,
+                    result,
+                    ..
+                } => Some((*epoch_ms, tool.as_str(), *result)),
+                Step::HumanTurn => None,
+            })
+            .collect();
+        store.ingest_hook_activity(&meta.id, &meta.source_path, &hook_rows, &calls)?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.
@@ -1881,11 +2209,16 @@ fn normalize_root(cwd: &str) -> String {
 /// main-thread spawn its tree started at. A run whose sidecar is missing keeps
 /// an unknown agent type and only the turn-level join key — it still counts,
 /// with the gap visible, rather than being guessed at or dropped.
-fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
+///
+/// Each run's hook activity comes back beside the runs: hooks fire inside
+/// subagents too, so their calls are triggers and their traces are uses of the
+/// same configured hooks (`docs/specs/surfaces.md`).
+fn subagent_runs(transcript: &Path) -> (Vec<SubagentRun>, Vec<HookActivity>) {
     let Ok(entries) = fs::read_dir(subagents_dir(transcript)) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut runs = Vec::new();
+    let mut hooks = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "jsonl") {
@@ -1898,6 +2231,7 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
             .ok()
             .and_then(|json| parse_subagent_sidecar(&json))
             .unwrap_or_default();
+        hooks.push(extract_hook_activity(&text));
         let records = parse_session(&text);
         runs.push(SubagentRun {
             agent: sidecar.agent_type,
@@ -1926,7 +2260,7 @@ fn subagent_runs(transcript: &Path) -> Vec<SubagentRun> {
             .then_with(|| a.agent_id.cmp(&b.agent_id))
     });
     link_runs(&mut runs);
-    runs
+    (runs, hooks)
 }
 
 fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()> {
@@ -2235,6 +2569,10 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
         &config_dir.join("mcp.json"),
         &scope,
     ));
+    surfaces.extend(read_hook_surfaces(
+        &[config_dir.join("settings.json")],
+        &scope,
+    ));
     surfaces.extend(read_claude_md_surfaces(
         &[(&config_dir.join("CLAUDE.md"), "global")],
         &scope,
@@ -2248,8 +2586,7 @@ fn read_global_surfaces() -> Result<Vec<Surface>> {
 /// flagged. Usage with no matching surface is shown as orphaned.
 fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
-    let catalog: Vec<_> = store
-        .effective_catalog()?
+    let catalog: Vec<_> = catalog_with_hook_uses(&store)?
         .into_iter()
         .filter(|e| in_scope(filter, &e.scope, &e.project))
         .collect();
@@ -2263,7 +2600,7 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
         let mut items: Vec<serde_json::Value> = catalog
             .iter()
             .map(|entry| {
-                let measurable = is_usage_measurable(&entry.kind);
+                let measurable = entry.measurable;
                 serde_json::json!({
                     "kind": entry.kind,
                     "id": entry.id,
@@ -2299,18 +2636,20 @@ fn inventory(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> R
 
     preamble(
         format,
-        "Everything installed in your config — skills, rules, agents, MCP servers,\n\
+        "Everything installed in your config — skills, rules, agents, hooks, MCP servers,\n\
          CLAUDE.md — with where it is installed (scope) and whether it was ever used.\n\
          \"start tok\" is what every session pays for having it installed; \"static tok\"\n\
          is the whole definition, which for a skill or agent is paid only on invocation.\n\
          UNUSED marks delete candidates; rules and CLAUDE.md are catalog-only because\n\
-         using them leaves no trace in transcripts.",
+         using them leaves no trace in transcripts. A hook's uses are the calls its\n\
+         matcher selected (see `cclens hooks`).",
     );
     let mut rows: Vec<Vec<String>> = Vec::new();
     for entry in &catalog {
-        let measurable = is_usage_measurable(&entry.kind);
-        // "unused" is only meaningful for usage-measurable kinds; catalog-only
-        // kinds (rules, hooks, CLAUDE.md) emit no events, so 0 means nothing.
+        let measurable = entry.measurable;
+        // "unused" is only meaningful for a measurable row: catalog-only kinds
+        // (rules, CLAUDE.md) emit no events, and a hook whose trigger cannot be
+        // counted has no uses figure, so 0 means nothing for either.
         let (uses_cell, status) = if measurable {
             (
                 entry.uses.to_string(),
@@ -2406,8 +2745,7 @@ fn scope_cell(scope: &str, project: &str) -> String {
 /// and how to optimize" view, honest about which removals save context.
 fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Result<()> {
     let store = open_for_read(db, frozen)?;
-    let catalog: Vec<_> = store
-        .effective_catalog()?
+    let catalog: Vec<_> = catalog_with_hook_uses(&store)?
         .into_iter()
         .filter(|e| in_scope(filter, &e.scope, &e.project))
         .collect();
@@ -2419,6 +2757,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
         scope: &'a str,
         project: &'a str,
         uses: i64,
+        measurable: bool,
         savings: StartupSavings,
         /// What every session pays for having it installed.
         startup_tokens: Option<u64>,
@@ -2428,7 +2767,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
 
     let mut found: Vec<Row> = Vec::new();
     for entry in &catalog {
-        let measurable = is_usage_measurable(&entry.kind);
+        let measurable = entry.measurable;
         let load_mode = LoadMode::from_label(&entry.load_mode).unwrap_or(LoadMode::OnDemand);
         let static_tokens = entry.static_tokens.map(|tokens| tokens as u64);
         let startup_tokens = entry.startup_tokens.map(|tokens| tokens as u64);
@@ -2446,6 +2785,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                 scope: &entry.scope,
                 project: &entry.project,
                 uses: entry.uses,
+                measurable,
                 savings: startup_savings(load_mode, startup_tokens),
                 startup_tokens,
                 on_demand_tokens: on_demand_tokens(load_mode, static_tokens),
@@ -2476,8 +2816,8 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                     "savings_tokens": savings_tokens,
                     "startup_tokens": row.startup_tokens,
                     "on_demand_tokens": row.on_demand_tokens,
-                    "uses": if is_usage_measurable(row.kind) { Some(row.uses) } else { None },
-                    "suggestion": savings_suggestion(row.wedge, row.savings, row.on_demand_tokens),
+                    "uses": if row.measurable { Some(row.uses) } else { None },
+                    "suggestion": waste_suggestion(row.kind, row.wedge, row.savings, row.on_demand_tokens),
                 })
             })
             .collect();
@@ -2497,7 +2837,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
     let rows: Vec<Vec<String>> = found
         .iter()
         .map(|row| {
-            let uses_cell = if is_usage_measurable(row.kind) {
+            let uses_cell = if row.measurable {
                 row.uses.to_string()
             } else {
                 "-".to_string()
@@ -2508,7 +2848,7 @@ fn waste(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resul
                 scope_cell(row.scope, row.project),
                 savings_cell(row.savings, row.startup_tokens),
                 uses_cell,
-                savings_suggestion(row.wedge, row.savings, row.on_demand_tokens),
+                waste_suggestion(row.kind, row.wedge, row.savings, row.on_demand_tokens),
             ]
         })
         .collect();
@@ -2553,6 +2893,20 @@ fn savings_cell(savings: StartupSavings, startup_tokens: Option<u64>) -> String 
         // description every session, and that is all removing it reclaims.
         StartupSavings::Declutter => format!("~{}/sess", startup_tokens.unwrap_or(0)),
     }
+}
+
+/// The suggestion for one wedge row. An unused hook is not clutter but a
+/// matcher that selected nothing, which is what the reader has to fix.
+fn waste_suggestion(
+    kind: &str,
+    wedge: Wedge,
+    savings: StartupSavings,
+    on_demand: Option<u64>,
+) -> String {
+    if kind == "hook" && wedge == Wedge::Unused {
+        return "its matcher never matched a call: fix the matcher, or drop the hook".to_string();
+    }
+    savings_suggestion(wedge, savings, on_demand)
 }
 
 /// A suggestion honest about whether removal saves context or only declutters —

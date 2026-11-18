@@ -113,6 +113,7 @@ becomes an event). The adapter recognises at least:
 | Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. Categorised from the entry's `toolDenialKind` where that marker can be attributed to it (below), else from the text (`core::friction`); a short readable excerpt is kept. Linking the result's `tool_use_id` to the assistant `tool_use` block recovers both the **originating tool** and the call's **target** (its `input.file_path` / `command`) — so a report shows which tool produced each failure and which file/command it hit, even when the error text omits the path (e.g. edit-precondition names no file) |
 | Permission denial | `toolDenialKind` on the entry that carries the denied `tool_result`, else the denial text inside it (`"Permission for this action was denied"`). Structural where the marker is present; a low-confidence heuristic where it is not — see note below |
 | Compaction | `system` `subtype == compact_boundary` |
+| Hook run | see "Hook traces" below |
 
 These map to configuration surfaces (`surfaces.md`): a `Skill` invocation to a
 `skill` surface, an MCP `tool_use` to an `mcp_tool`/`mcp_server` surface, and so
@@ -126,13 +127,60 @@ string appearing anywhere in content. Quoted text (a transcript that discusses
 skills, a prompt containing the literal tags) must not be mis-read as an
 invocation. The adapter matches on record structure and field position.
 
-**Not every surface emits a usage signal.** `rule`, `hook`, and `claude_md` have
-no discrete invocation in the transcript — they are injected context, not
-events. They appear in the catalog (`config-format.md`) but acquire no events;
+**Not every surface emits a usage signal.** `rule` and `claude_md` have no
+discrete invocation in the transcript — they are injected context, not events.
+They appear in the catalog (`config-format.md`) but acquire no events;
 `surfaces.md` classifies surface kinds as usage-measurable vs catalog-only so the
-join does not mistake "no event possible" for "unused". The permission-denial
-signal above is the one partly heuristic signal, and is flagged as
-lower-confidence wherever it is used.
+join does not mistake "no event possible" for "unused". A `hook` leaves traces
+only when it does something visible (below), which is why its uses are counted
+from its trigger instead. The permission-denial signal above is the one partly
+heuristic signal, and is flagged as lower-confidence wherever it is used.
+
+### Hook traces
+
+> Observed against a real tree on 2026-11-18, Claude Code `2.1.302`–`2.1.325`.
+
+A hook that runs and prints nothing leaves **no record**. What is written, in
+the main transcript and in every subagent transcript alike — hooks run in both
+(`extract_hook_activity` in `transcript.rs`):
+
+| Record | Fields read | Outcome |
+| --- | --- | --- |
+| `attachment`, `attachment.type == hook_non_blocking_error` | `hookEvent`, `hookName`, `command`, `exitCode`, `durationMs` | `error` |
+| `attachment`, `attachment.type == hook_success` | same | `ok` |
+| `attachment`, `attachment.type == hook_additional_context` | `hookEvent`, `hookName`, `content[]` (no command, no duration) | `context` |
+| `system`, `subtype == stop_hook_summary` | `hookInfos[].command`, `hookInfos[].durationMs`, `preventedContinuation` | `ok` per hook; event `Stop`. `preventedContinuation` belongs to the stop, not to a hook: it makes the sole hook's run `blocked`, and with several hooks becomes one extra unnamed `blocked` trace |
+| a `user` entry's failed `tool_result` whose text opens `<Event>:<subject> hook error: [<command>]` | the prefix; the result's `tool_use_id` | `blocked` |
+
+`hookName` is `<Event>:<subject>` — the subject being what the matcher was tested
+against (the tool name for tool events, the source such as `clear` for
+`SessionStart`) — or the bare event name when there is none. A record whose
+`hookName` does not begin with its `hookEvent` is not a user hook but Claude
+Code's own injection (observed: `tool.call`, which adds a worktree's `AGENTS.md`
+after a tool call) and is skipped, as is the internal `callback` command in a
+stop summary.
+
+The command is not always the user's text. Claude Code sometimes writes an
+anonymous placeholder (`command hook`, `command hook 2`); that is read as *no
+command*, so the trace resolves by event and matcher alone (`surfaces.md`). A
+successful hook that also injected context writes both a `hook_success` and a
+`hook_additional_context` for the one run; they are kept as two traces, since
+one is a run and the other its context, and no figure counts traces as fires.
+
+The block prefix is upstream's fixed wording, written ahead of whatever the
+hook printed, so reading it is structural even though it sits in text — the
+hook's own message after it is never parsed. It appears with
+`toolDenialKind == permission-rule` where that marker exists, but is matched on
+its own so older transcripts are read the same way.
+
+Each tool call's result is recorded with it (`ok` / `failed` / `denied` /
+`pending`), because the post-execution hook events fire on different results
+(`surfaces.md`). A call is `denied` — refused before it ran — when its result is
+a hook block, its entry carries `toolDenialKind`, or, in a transcript older than
+that marker, its text is upstream's fixed refusal wording (the fallback the
+permission-denial signal already uses). A user entry with no `tool_result`
+block is a human turn by structure alone; a prompt that merely mentions a tool
+result in its text is still one.
 
 ### Why a denial is read from its marker, not its words
 

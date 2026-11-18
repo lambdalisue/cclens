@@ -155,6 +155,7 @@ cclens failures --scope global          # failures no project owns (a cross-proj
 cclens failures --scope project:<slug>  # one project's failures (fix lands in its config)
 cclens prompts                # how you steer the session (steer/correct/question/instruct)
 cclens stuck                 # files Claude got stuck re-editing in rapid bursts
+cclens hooks                 # per hook: matched calls, blocks, run time, injected context, cost per block
 ```
 
 ### `sql` — query the store directly
@@ -179,14 +180,18 @@ derived store.
 
 ## What it covers
 
-- **Every configuration surface** — skills, rules, agents, MCP servers,
-  `CLAUDE.md` — catalogued with its startup and on-demand token costs and load
+- **Every configuration surface** — skills, rules, agents, hooks, MCP
+  servers, `CLAUDE.md` — catalogued with its startup and on-demand token costs and load
   mode, joined
   against actual usage to flag unused (delete), always-on heavy (slim), and
   costly+rare (trim).
 - **Where the work stumbles** — recurring tool failures by category and
   originating tool (`failures`), files Claude got stuck re-editing (`stuck`),
   each with concrete examples and the project it concentrates in.
+- **What each hook costs and catches** — how many calls its matcher selected
+  (and which never matched any), how often it blocked and what each block cost
+  in retried calls, its measured run time, and the context a prompt- or
+  session-start hook injects every turn (`hooks`).
 - **Where tokens go** — main-thread skill output vs. subagent cost, the subagent
   half split per agent type (which agents actually spent it, nested spawns
   included), and the always-on context floor reconciled against your readable

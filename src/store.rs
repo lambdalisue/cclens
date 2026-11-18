@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::core::hook::{CallResult, HookOutcome, HookTrace, StoredTrace, ToolCalls, Triggers};
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::{SpawnModels, SubagentRun};
-use crate::core::surface::Surface;
+use crate::core::surface::{Surface, is_usage_measurable};
 use crate::core::thrash::FileEdit;
 use crate::core::usage::UsageEvent;
 
@@ -24,7 +25,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "4";
+const ANALYZER_VERSION: &str = "5";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -35,7 +36,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_path     TEXT NOT NULL,
     started_at      TEXT NOT NULL,
     sub_tokens      INTEGER NOT NULL DEFAULT 0,
-    sub_agent_count INTEGER NOT NULL DEFAULT 0
+    sub_agent_count INTEGER NOT NULL DEFAULT 0,
+    -- 1 once this session's hook activity (hook_runs, tool_call events) was
+    -- extracted; a session stored earlier holds none and must not count as
+    -- one where no hook fired.
+    hook_scanned    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY,
@@ -95,6 +100,26 @@ CREATE TABLE IF NOT EXISTS surfaces (
     attrs_json    TEXT,
     PRIMARY KEY (kind, id, scope, project)
 );
+-- One row per hook trace. Not a fire count: a hook that passes silently leaves
+-- no row, so a hook's uses come from its trigger (`tool_call` events and the
+-- like) instead. Traces carry no catalog id — which catalogued hook a trace
+-- belongs to depends on the matchers installed now — so the core resolves them
+-- at read time (docs/specs/surfaces.md; events.md, Hook runs).
+CREATE TABLE IF NOT EXISTS hook_runs (
+    id             INTEGER PRIMARY KEY,
+    session_id     TEXT NOT NULL,
+    source_path    TEXT NOT NULL,
+    started_at     TEXT NOT NULL,
+    started_epoch  INTEGER NOT NULL,
+    event          TEXT NOT NULL,
+    subject        TEXT,
+    command        TEXT,
+    outcome        TEXT NOT NULL,
+    exit_code      INTEGER,
+    duration_ms    INTEGER,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
+    retry_calls    INTEGER
+);
 -- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
 -- commands can report freshness and re-run the analysis with the same roots,
 -- plus analyzer_version, which invalidates the ingest fingerprints above.
@@ -119,6 +144,7 @@ const INDEX_SCHEMA: &str = "
 CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
 CREATE INDEX subagent_runs_by_agent ON subagent_runs(agent);
 CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
+CREATE INDEX hook_runs_by_source ON hook_runs(source_path);
 ";
 
 /// Views are pure definitions over the tables, declared apart from them for the
@@ -166,10 +192,11 @@ const SCHEMA_VERSION: i64 = 2;
 /// Tables holding analysis history. Claude Code prunes transcripts on its own
 /// retention schedule, after which these rows are the only surviving record of
 /// those sessions — so a shape change adds columns in place, never rebuilds.
-const MIGRATED_TABLES: [&str; 5] = [
+const MIGRATED_TABLES: [&str; 6] = [
     "sessions",
     "events",
     "subagent_runs",
+    "hook_runs",
     "ingested_files",
     "meta",
 ];
@@ -234,6 +261,10 @@ pub struct CatalogEntry {
     pub startup_tokens: Option<i64>,
     pub load_mode: String,
     pub uses: i64,
+    /// Whether `uses` can be read as evidence: true for usage-measurable kinds,
+    /// and for a hook only once its trigger has been counted
+    /// (`docs/specs/surfaces.md`). Zero uses of an unmeasurable row means nothing.
+    pub measurable: bool,
 }
 
 /// What one agent type cost: how many times it ran and the output tokens those
@@ -710,6 +741,155 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist a session's hook activity: its traces, each with the retry cost
+    /// of a block (`core::hook::retry_calls`), and a `tool_call` event per tool
+    /// call `(epoch_ms, tool)` — the trigger a tool-event hook is counted
+    /// against. Traces replace on `source_path` like `subagent_runs`; the
+    /// `tool_call` rows rely on `ingest_session`'s delete having run first.
+    pub fn ingest_hook_activity(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        traces: &[(HookTrace, Option<u32>)],
+        calls: &[(i64, &str, CallResult)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM hook_runs WHERE source_path = ?1",
+            (source_path,),
+        )?;
+        tx.execute(
+            "UPDATE sessions SET hook_scanned = 1 WHERE id = ?1",
+            (session_id,),
+        )?;
+        for (trace, retry_calls) in traces {
+            tx.execute(
+                "INSERT INTO hook_runs
+                   (session_id, source_path, started_at, started_epoch, event, subject,
+                    command, outcome, exit_code, duration_ms, context_tokens, retry_calls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    session_id,
+                    source_path,
+                    epoch_ms_to_rfc3339(trace.epoch_ms),
+                    trace.epoch_ms / 1000,
+                    &trace.event,
+                    &trace.subject,
+                    &trace.command,
+                    trace.outcome.label(),
+                    trace.exit_code,
+                    trace.duration_ms,
+                    trace.context_tokens as i64,
+                    retry_calls,
+                ],
+            )?;
+        }
+        for (epoch_ms, tool, result) in calls {
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, surface_id, source,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak)
+                 VALUES (?1, ?2, 'tool_call', ?3, ?4, '', ?5, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    *tool,
+                    result.label(),
+                    epoch_ms / 1000,
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every hook trace with its session's project, oldest first. The trace's
+    /// `epoch_ms` comes back at the stored second's resolution.
+    pub fn hook_traces(&self) -> Result<Vec<StoredTrace>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT h.started_epoch, h.event, h.subject, h.command, h.outcome, h.exit_code,
+                    h.duration_ms, h.context_tokens, h.retry_calls, s.project
+             FROM hook_runs h JOIN sessions s ON h.session_id = s.id
+             ORDER BY h.started_epoch, h.id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let outcome: String = row.get(4)?;
+                Ok(StoredTrace {
+                    trace: HookTrace {
+                        epoch_ms: row.get::<_, i64>(0)? * 1000,
+                        event: row.get(1)?,
+                        subject: row.get(2)?,
+                        command: row.get(3)?,
+                        outcome: HookOutcome::from_label(&outcome).unwrap_or(HookOutcome::Ok),
+                        exit_code: row.get(5)?,
+                        duration_ms: row.get(6)?,
+                        context_tokens: row.get::<_, i64>(7)? as u64,
+                        tool_use_id: None,
+                    },
+                    project: row.get(9)?,
+                    retry_calls: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// What hooks installed in `project` (`None` = globally, so every session)
+    /// can be triggered by: tool calls per tool, prompts, and sessions.
+    pub fn hook_triggers(&self, project: Option<&str>) -> Result<Triggers> {
+        let in_scope = "s.hook_scanned = 1 AND (?1 IS NULL OR s.project = ?1)";
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT e.surface_id, e.source, COUNT(*) FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.kind = 'tool_call' AND {in_scope}
+             GROUP BY e.surface_id, e.source ORDER BY e.surface_id"
+        ))?;
+        let rows = stmt
+            .query_map([project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut tool_calls: Vec<ToolCalls> = Vec::new();
+        for (tool, result, count) in rows {
+            if tool_calls.last().is_none_or(|calls| calls.tool != tool) {
+                tool_calls.push(ToolCalls {
+                    tool,
+                    ..ToolCalls::default()
+                });
+            }
+            let calls = tool_calls.last_mut().expect("pushed above");
+            match result.as_deref().and_then(CallResult::from_label) {
+                Some(CallResult::Succeeded) => calls.succeeded += count,
+                Some(CallResult::Failed) => calls.failed += count,
+                Some(CallResult::Denied) => calls.denied += count,
+                Some(CallResult::Pending) | None => calls.pending += count,
+            }
+        }
+        let prompts: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM events e JOIN sessions s ON e.session_id = s.id
+                 WHERE e.kind = 'prompt' AND {in_scope}"
+            ),
+            [project],
+            |row| row.get(0),
+        )?;
+        let sessions: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM sessions s WHERE {in_scope}"),
+            [project],
+            |row| row.get(0),
+        )?;
+        Ok(Triggers {
+            tool_calls,
+            prompts: prompts as u64,
+            sessions: sessions as u64,
+        })
     }
 
     /// Every file edit as a `FileEdit`, time-ordered — the input to thrash
@@ -1197,6 +1377,7 @@ impl Store {
                     startup_tokens: row.get(5)?,
                     load_mode: row.get(6)?,
                     uses: row.get(7)?,
+                    measurable: is_usage_measurable(&row.get::<_, String>(0)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3042,5 +3223,137 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    fn hook_trace(outcome: HookOutcome, command: Option<&str>) -> HookTrace {
+        HookTrace {
+            epoch_ms: 1_700_000_000_000,
+            event: "PreToolUse".to_string(),
+            subject: Some("Bash".to_string()),
+            command: command.map(String::from),
+            outcome,
+            exit_code: Some(2),
+            duration_ms: Some(30),
+            context_tokens: 5,
+            tool_use_id: Some("t1".to_string()),
+        }
+    }
+
+    #[test]
+    fn hook_runs_round_trip_with_their_project_and_block_cost() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        let blocked = hook_trace(HookOutcome::Blocked, Some("/tmp/example/guard.sh"));
+        store
+            .ingest_hook_activity("a1", &alpha.source_path, &[(blocked.clone(), Some(3))], &[])
+            .unwrap();
+
+        // The call id only matters while the block cost is measured at ingest.
+        let blocked = HookTrace {
+            tool_use_id: None,
+            ..blocked
+        };
+        let traces = store.hook_traces().unwrap();
+
+        assert_eq!(
+            traces,
+            vec![StoredTrace {
+                trace: blocked,
+                project: "alpha".to_string(),
+                retry_calls: Some(3),
+            }]
+        );
+    }
+
+    #[test]
+    fn re_ingesting_a_session_replaces_its_hook_runs() {
+        let mut store = Store::in_memory().unwrap();
+        let meta = session("s1");
+        store.ingest_session(&meta, &[], &[]).unwrap();
+        let ok = hook_trace(HookOutcome::Ok, None);
+        store
+            .ingest_hook_activity("s1", &meta.source_path, &[(ok.clone(), None)], &[])
+            .unwrap();
+        store
+            .ingest_hook_activity("s1", &meta.source_path, &[(ok, None)], &[])
+            .unwrap();
+
+        assert_eq!(store.hook_traces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hook_triggers_count_tool_calls_prompts_and_sessions_per_project() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        let mut beta = session("b1");
+        beta.project = "beta".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        store.ingest_session(&beta, &[], &[]).unwrap();
+        store
+            .ingest_hook_activity(
+                "a1",
+                &alpha.source_path,
+                &[],
+                &[
+                    (100, "Bash", CallResult::Succeeded),
+                    (200, "Bash", CallResult::Failed),
+                    (300, "Edit", CallResult::Pending),
+                ],
+            )
+            .unwrap();
+        store
+            .ingest_hook_activity(
+                "b1",
+                &beta.source_path,
+                &[],
+                &[(400, "Bash", CallResult::Succeeded)],
+            )
+            .unwrap();
+        store
+            .ingest_prompts("a1", &alpha.source_path, &[(0, 100, "instruct")])
+            .unwrap();
+
+        let alpha_only = store.hook_triggers(Some("alpha")).unwrap();
+        let everywhere = store.hook_triggers(None).unwrap();
+
+        assert_eq!(
+            alpha_only.tool_calls,
+            vec![
+                ToolCalls {
+                    tool: "Bash".to_string(),
+                    succeeded: 1,
+                    failed: 1,
+                    denied: 0,
+                    pending: 0,
+                },
+                ToolCalls {
+                    tool: "Edit".to_string(),
+                    succeeded: 0,
+                    failed: 0,
+                    denied: 0,
+                    pending: 1,
+                },
+            ]
+        );
+        assert_eq!(alpha_only.prompts, 1);
+        assert_eq!(alpha_only.sessions, 1);
+        assert_eq!(everywhere.tool_calls[0].succeeded, 2);
+        assert_eq!(everywhere.sessions, 2);
+    }
+    #[test]
+    fn a_session_whose_hook_activity_was_never_extracted_is_not_a_trigger_session() {
+        let mut store = Store::in_memory().unwrap();
+        // Stored by an analyzer that predates hook extraction, transcript gone.
+        store.ingest_session(&session("old"), &[], &[]).unwrap();
+        let scanned = session("new");
+        store.ingest_session(&scanned, &[], &[]).unwrap();
+        store
+            .ingest_hook_activity("new", &scanned.source_path, &[], &[])
+            .unwrap();
+
+        assert_eq!(store.hook_triggers(None).unwrap().sessions, 1);
     }
 }

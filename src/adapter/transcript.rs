@@ -18,6 +18,7 @@ use crate::core::hook::{CallResult, HookOutcome, HookTrace, Step};
 use crate::core::path::basename;
 use crate::core::prompt::{PromptBehavior, classify_prompt};
 use crate::core::span::{Record, RecordKind, Source};
+use crate::core::thrash::BashOutcome;
 
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
@@ -390,7 +391,7 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
                     };
                     errors.push(ToolError {
                         epoch_ms: ts,
-                        category: denial.unwrap_or_else(|| classify_error(&content)),
+                        category: failure_category(content_value, &content, denial),
                         excerpt: content_value.map(error_excerpt).unwrap_or_default(),
                         tool,
                         target,
@@ -401,6 +402,41 @@ pub fn extract_tool_errors(jsonl: &str) -> Vec<ToolError> {
         }
     }
     errors
+}
+
+/// The friction category of one failed result, most structural source first:
+/// the entry's denial marker, then the harness's sandbox report, then the text.
+/// `json_text` is the content's JSON form, which the text heuristics match on.
+fn failure_category(
+    content: Option<&Value>,
+    json_text: &str,
+    denial: Option<ErrorCategory>,
+) -> ErrorCategory {
+    denial
+        .or_else(|| content.and_then(|c| sandbox_category(&result_text(c))))
+        .unwrap_or_else(|| classify_error(json_text))
+}
+
+/// The category of a refusal the Bash sandbox reported itself: a
+/// `<sandbox_violations>` block the harness appends to the result, one
+/// `deny <operation> <target>` line per refusal. A network operation is
+/// `SandboxNetwork`; any other refused operation is a write the sandbox
+/// guarded. `None` without a block, so the text classifier decides.
+fn sandbox_category(text: &str) -> Option<ErrorCategory> {
+    let (_, rest) = text.split_once("<sandbox_violations>")?;
+    let block = rest.split("</sandbox_violations>").next().unwrap_or(rest);
+    let operations: Vec<&str> = block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("deny "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if operations.iter().any(|op| op.starts_with("network")) {
+        Some(ErrorCategory::SandboxNetwork)
+    } else if operations.is_empty() {
+        None
+    } else {
+        Some(ErrorCategory::SandboxWrite)
+    }
 }
 
 /// Whether a content block is a **failed** `tool_result`: flagged `is_error`, or
@@ -482,16 +518,21 @@ fn clean_truncate(s: &str) -> String {
 /// payload (a bare string, or the joined `text` blocks), whitespace-collapsed and
 /// truncated by Unicode scalar so multi-byte text is never split mid-character.
 fn error_excerpt(content: &Value) -> String {
-    let raw = match content {
+    clean_truncate(&result_text(content))
+}
+
+/// The readable text of a tool-result `content`: a bare string, or the joined
+/// `text` blocks. Line breaks survive, which the sandbox report is read by.
+fn result_text(content: &Value) -> String {
+    match content {
         Value::String(s) => s.clone(),
         Value::Array(items) => items
             .iter()
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
-            .join(" "),
+            .join("\n"),
         other => other.to_string(),
-    };
-    clean_truncate(&raw)
+    }
 }
 
 /// One unit of work Claude performed: a Bash command or a file edit.
@@ -505,6 +546,23 @@ pub struct WorkEvent {
     /// two same-named files apart, which matters for thrash detection
     /// (`core::thrash`) even though it does not for a hotspot ranking.
     pub path: Option<String>,
+    /// What a Bash run did (`bash_cmd` only): the retry-loop and
+    /// unsandboxed-retry detectors read it (`core::thrash`).
+    pub bash: Option<BashRun>,
+}
+
+/// One Bash run as the detectors need it. The command and output are handed on
+/// whole so the core can derive the check key and spot a failure the exit
+/// status hid; neither is persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashRun {
+    pub command: String,
+    /// `None` when the transcript holds no result for the call.
+    pub outcome: Option<BashOutcome>,
+    /// The result's readable text; empty when there is no result.
+    pub output: String,
+    /// Ran with the sandbox disabled (`dangerouslyDisableSandbox`).
+    pub unsandboxed: bool,
 }
 
 /// Extract work events from a transcript: the leading word of each Bash command
@@ -512,6 +570,7 @@ pub struct WorkEvent {
 /// drive the command-mix and file-hotspot views — where effort (and churn)
 /// concentrates.
 pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
+    let outcomes = result_outcomes(jsonl);
     let mut events = Vec::new();
     for line in jsonl.lines() {
         let Ok(raw) = serde_json::from_str::<Raw>(line) else {
@@ -539,18 +598,49 @@ pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
             let input = block.get("input");
             match name {
                 "Bash" => {
-                    if let Some(cmd) = input
+                    let Some(command) = input
                         .and_then(|i| i.get("command"))
                         .and_then(|v| v.as_str())
-                        .and_then(|c| c.split_whitespace().next())
-                    {
-                        events.push(WorkEvent {
-                            epoch_ms: ts,
-                            kind: "bash_cmd",
-                            id: cmd.to_string(),
-                            path: None,
+                    else {
+                        continue;
+                    };
+                    let Some(leading) = command.split_whitespace().next() else {
+                        continue;
+                    };
+                    let backgrounded = input
+                        .and_then(|i| i.get("run_in_background"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true);
+                    // A background run's result only says it started — or, for
+                    // one the harness moved there on timeout, that it is still
+                    // going. Its real end is not in this record.
+                    let result = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|id| outcomes.get(id))
+                        .filter(|_| !backgrounded)
+                        .filter(|(_, text)| {
+                            !text
+                                .lines()
+                                .next()
+                                .is_some_and(|line| line.contains("moved to the background"))
                         });
-                    }
+                    let unsandboxed = input
+                        .and_then(|i| i.get("dangerouslyDisableSandbox"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true);
+                    events.push(WorkEvent {
+                        epoch_ms: ts,
+                        kind: "bash_cmd",
+                        id: leading.to_string(),
+                        path: None,
+                        bash: Some(BashRun {
+                            command: command.to_string(),
+                            outcome: result.map(|(outcome, _)| *outcome),
+                            unsandboxed,
+                            output: result.map(|(_, text)| text.clone()).unwrap_or_default(),
+                        }),
+                    });
                 }
                 "Edit" | "Write" | "NotebookEdit" => {
                     if let Some(path) = input
@@ -562,6 +652,7 @@ pub fn extract_work_events(jsonl: &str) -> Vec<WorkEvent> {
                             kind: "file_edit",
                             id: basename(path).to_string(),
                             path: Some(path.to_string()),
+                            bash: None,
                         });
                     }
                 }
@@ -954,6 +1045,56 @@ fn is_rules_path(path: &str) -> bool {
     path.split(['/', '\\']).any(|segment| segment == "rules")
 }
 
+/// The outcome of every tool call that has a result, by `tool_use_id`, judged
+/// exactly as `extract_tool_errors` judges a failure so a failed Bash run and
+/// its `tool_error` row always agree on the category.
+fn result_outcomes(jsonl: &str) -> HashMap<String, (BashOutcome, String)> {
+    let mut outcomes = HashMap::new();
+    for line in jsonl.lines() {
+        if !line.contains("tool_result") {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
+            continue;
+        };
+        if raw.kind.as_deref() != Some("user") {
+            continue;
+        }
+        let Some(blocks) = raw
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .and_then(|content| content.as_array())
+        else {
+            continue;
+        };
+        let failed = blocks.iter().filter(|b| is_failed_result(b)).count();
+        let denial = raw
+            .denial_kind
+            .as_deref()
+            .and_then(denial_category)
+            .filter(|_| failed == 1);
+        for block in blocks {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let outcome = if is_failed_result(block) {
+                let content = block.get("content");
+                let json_text = content.map(|v| v.to_string()).unwrap_or_default();
+                BashOutcome::Failed(failure_category(content, &json_text, denial))
+            } else {
+                BashOutcome::Ok
+            };
+            let text = block.get("content").map(result_text).unwrap_or_default();
+            outcomes.insert(id.to_string(), (outcome, text));
+        }
+    }
+    outcomes
+}
+
 /// Count the denials an allow rule could have prevented — the friction signal
 /// behind the `permission` surface. A denying entry states its own reason, so
 /// counting is structural wherever that marker is present; a user's own "no" is
@@ -1320,6 +1461,84 @@ mod tests {
         assert_eq!(events[1].id, "cli.rs");
         // The full path still distinguishes them for thrash detection.
         assert_eq!(events[0].path.as_deref(), Some(r"C:\example\repo\cli.rs"));
+    }
+
+    #[test]
+    fn a_bash_work_event_carries_the_command_its_outcome_and_the_sandbox_flag() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"rm /tmp/example/x"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"rm: /tmp/example/x: Operation not permitted"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"rm /tmp/example/x","dangerouslyDisableSandbox":true}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","content":""}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        let runs: Vec<BashRun> = extract_work_events(jsonl)
+            .into_iter()
+            .filter_map(|e| e.bash)
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                BashRun {
+                    command: "rm /tmp/example/x".to_string(),
+                    outcome: Some(BashOutcome::Failed(ErrorCategory::SandboxWrite)),
+                    unsandboxed: false,
+                    output: "rm: /tmp/example/x: Operation not permitted".to_string(),
+                },
+                BashRun {
+                    command: "rm /tmp/example/x".to_string(),
+                    outcome: Some(BashOutcome::Ok),
+                    unsandboxed: true,
+                    output: String::new(),
+                },
+                // The transcript ended before the result: unknown, not a pass.
+                BashRun {
+                    command: "ls".to_string(),
+                    outcome: None,
+                    unsandboxed: false,
+                    output: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_background_run_has_no_outcome_yet() {
+        // The result only says the command started; how it ended is unknown.
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test","run_in_background":true}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: abc123."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:10:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"Command did not finish within its 600s timeout and was moved to the background (ID: def456)."}]}}"#,
+        );
+        let outcomes: Vec<Option<BashOutcome>> = extract_work_events(jsonl)
+            .into_iter()
+            .filter_map(|e| e.bash.map(|run| run.outcome))
+            .collect();
+        assert_eq!(outcomes, vec![None, None]);
+    }
+
+    #[test]
+    fn a_sandbox_violations_block_classifies_a_network_refusal_structurally() {
+        // The command's own output reads like a missing path; the harness's
+        // block says what actually happened.
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"Exit code 1\nerror: No such file\n<sandbox_violations>\ndeny network-outbound example.invalid:443 (not allowed)\n</sandbox_violations>"}]}}"#;
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors[0].category, ErrorCategory::SandboxNetwork);
+    }
+
+    #[test]
+    fn a_sandbox_violations_block_naming_a_file_operation_is_a_sandbox_write() {
+        let jsonl = r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"Exit code 1\n<sandbox_violations>\ndeny file-write-create /tmp/example/y\n</sandbox_violations>"}]}}"#;
+        let errors = extract_tool_errors(jsonl);
+        assert_eq!(errors[0].category, ErrorCategory::SandboxWrite);
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct Findings {
     /// Friction no single project owns (spread across projects) — a
     /// cross-project habit whose fix belongs in global config.
     pub friction_global: Vec<FrictionCat>,
+    /// Unsandboxed retries no single project owns; `None` when there are none.
+    pub unsandboxed_retries: Option<RetryLine>,
     /// `cd` as a percentage of Bash calls, if any Bash calls were seen.
     pub cd_pct: Option<i64>,
     /// Top Bash leading words by frequency.
@@ -62,6 +64,9 @@ pub struct ProjectFindings {
     pub root: String,
     pub friction: Vec<FrictionCat>,
     pub thrash: Vec<ThrashLine>,
+    pub check_loops: Vec<CheckLoopLine>,
+    /// Retries this project owns (strict-majority routing); `None` otherwise.
+    pub unsandboxed_retries: Option<RetryLine>,
     pub unused: Vec<SurfaceRef>,
     pub always_on_heavy: Vec<SurfaceRef>,
 }
@@ -127,6 +132,33 @@ pub struct ThrashLine {
     pub file: String,
     pub edits: u32,
     pub span_secs: i64,
+}
+
+/// One check that kept failing fix round after fix round in one session.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckLoopLine {
+    pub check: String,
+    pub rounds: u32,
+    pub failures: u32,
+    pub resolved: bool,
+}
+
+/// Bash runs retried with the sandbox disabled right after a sandboxed
+/// failure, and how many of those followed a sandbox refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RetryLine {
+    pub total: i64,
+    pub after_sandbox_denial: i64,
+}
+
+impl RetryLine {
+    fn render(self) -> String {
+        format!(
+            "- {} Bash runs retried with the sandbox disabled after a sandboxed failure \
+             ({} after a sandbox refusal)\n",
+            self.total, self.after_sandbox_denial
+        )
+    }
 }
 
 /// The prescribed instructions prepended to every briefing. This is the role
@@ -265,6 +297,11 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
             }
         }
 
+        if let Some(retries) = f.unsandboxed_retries {
+            out.push_str(UNSANDBOXED_HEADING);
+            out.push_str(&retries.render());
+        }
+
         let has_workflow =
             f.cd_pct.is_some() || !f.top_commands.is_empty() || !f.hotspots.is_empty();
         if has_workflow {
@@ -329,6 +366,28 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
                 ));
             }
         }
+        if !p.check_loops.is_empty() {
+            out.push_str(
+                "\n### Checks that kept failing (3+ failed fix rounds after the first failure)\n",
+            );
+            for c in &p.check_loops {
+                out.push_str(&format!(
+                    "- `{}` failed {} fix rounds ({} failed runs), {}\n",
+                    c.check,
+                    c.rounds,
+                    c.failures,
+                    if c.resolved {
+                        "then passed"
+                    } else {
+                        "never resolved"
+                    }
+                ));
+            }
+        }
+        if let Some(retries) = p.unsandboxed_retries {
+            out.push_str(UNSANDBOXED_HEADING);
+            out.push_str(&retries.render());
+        }
         render_config_to_trim(
             &mut out,
             "Project config to trim",
@@ -339,6 +398,10 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
 
     out
 }
+
+const UNSANDBOXED_HEADING: &str = "\n### Unsandboxed retries\n\
+     The usual workaround for a sandbox refusal; the ones after a refusal are what a \
+     sandbox allowlist entry (settings.json `sandbox`) would remove.\n";
 
 fn render_friction_cat(out: &mut String, cat: &FrictionCat, show_spread: bool) {
     let suggestion = ErrorCategory::from_label(&cat.label).suggestion();
@@ -510,6 +573,7 @@ mod tests {
                 by_tool: vec![("Bash".to_string(), 40)],
                 examples: vec!["blocked by enforce-perl.sh".to_string()],
             }],
+            unsandboxed_retries: None,
             cd_pct: Some(53),
             top_commands: vec![("cd".to_string(), 200), ("cargo".to_string(), 80)],
             hotspots: vec![("lib.rs".to_string(), 40)],
@@ -559,6 +623,16 @@ mod tests {
                     edits: 25,
                     span_secs: 460,
                 }],
+                check_loops: vec![CheckLoopLine {
+                    check: "cargo test".to_string(),
+                    rounds: 6,
+                    failures: 7,
+                    resolved: false,
+                }],
+                unsandboxed_retries: Some(RetryLine {
+                    total: 9,
+                    after_sandbox_denial: 4,
+                }),
                 unused: vec![SurfaceRef {
                     kind: "skill".to_string(),
                     id: "deploy".to_string(),
@@ -708,6 +782,18 @@ mod tests {
         assert!(brief.contains("cd is 53% of Bash calls"));
         assert!(brief.contains("cargo: 80"));
         assert!(brief.contains("SKILL.md edited 25x within 7m40s"));
+    }
+
+    #[test]
+    fn briefing_names_a_failing_check_loop_and_the_unsandboxed_retries() {
+        let brief = render_briefing(&findings(), &ScopeFilter::All);
+        assert!(
+            brief.contains("- `cargo test` failed 6 fix rounds (7 failed runs), never resolved")
+        );
+        assert!(brief.contains(
+            "- 9 Bash runs retried with the sandbox disabled after a sandboxed failure \
+             (4 after a sandbox refusal)"
+        ));
     }
 
     #[test]

@@ -38,9 +38,12 @@ use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, on_demand_tokens,
     startup_savings,
 };
-use crate::core::thrash::detect_thrash;
+use crate::core::thrash::{
+    BashOutcome, check_key, check_outcome, count_unsandboxed_retries, detect_check_loops,
+    detect_thrash,
+};
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens, run_model};
-use crate::store::{AgentModelCost, SessionMeta, Store, canonical_path};
+use crate::store::{AgentModelCost, SessionMeta, Store, WorkRow, canonical_path};
 
 #[derive(Parser)]
 #[command(
@@ -607,6 +610,37 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
         }
     }
 
+    // Failing-check loops, like thrash, belong to the session's project.
+    let mut loops_by_project: std::collections::HashMap<String, Vec<optimize_mod::CheckLoopLine>> =
+        std::collections::HashMap::new();
+    for found in detect_check_loops(&store.work_steps()?, MIN_CHECK_ROUNDS) {
+        let lines = loops_by_project.entry(found.project.clone()).or_default();
+        if lines.len() < 5 {
+            lines.push(optimize_mod::CheckLoopLine {
+                check: found.check,
+                rounds: found.rounds,
+                failures: found.failures,
+                resolved: found.resolved,
+            });
+        }
+    }
+
+    // Unsandboxed retries route by concentration, like a friction category.
+    let retries = count_unsandboxed_retries(&store.sandboxed_runs()?);
+    let retry_line = |filter: &ScopeFilter| {
+        let (total, after_sandbox_denial) = retries_in_scope(&retries, filter);
+        (total > 0).then_some(optimize_mod::RetryLine {
+            total,
+            after_sandbox_denial,
+        })
+    };
+    let retries_global = retry_line(&ScopeFilter::Global);
+    let mut retries_by_project: std::collections::HashMap<String, optimize_mod::RetryLine> =
+        retry_owner(&retries)
+            .and_then(|owner| Some((owner, retry_line(&ScopeFilter::Project(None))?)))
+            .into_iter()
+            .collect();
+
     // Config wedges, split by the surface's own scope.
     let scoped = config_wedges(store)?;
 
@@ -622,6 +656,8 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
     let mut project_names: Vec<String> = owned_friction
         .keys()
         .chain(thrash_by_project.keys())
+        .chain(loops_by_project.keys())
+        .chain(retries_by_project.keys())
         .chain(scoped.projects.keys())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
@@ -649,6 +685,8 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
             optimize_mod::ProjectFindings {
                 friction,
                 thrash: thrash_by_project.remove(&project).unwrap_or_default(),
+                check_loops: loops_by_project.remove(&project).unwrap_or_default(),
+                unsandboxed_retries: retries_by_project.remove(&project),
                 unused: wedges.map(|w| w.unused.clone()).unwrap_or_default(),
                 always_on_heavy: wedges
                     .map(|w| w.always_on_heavy.clone())
@@ -665,7 +703,7 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
             (
                 p.total_friction(),
                 p.unused.len() + p.always_on_heavy.len(),
-                p.thrash.len(),
+                p.thrash.len() + p.check_loops.len(),
             )
         };
         weight(b)
@@ -715,6 +753,7 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
             0
         },
         friction_global,
+        unsandboxed_retries: retries_global,
         cd_pct,
         top_commands,
         hotspots,
@@ -887,14 +926,19 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     }
     let mut items: Vec<Item> = Vec::new();
     for p in &visible {
-        if p.total_friction() == 0 {
+        let stuck_on_checks = !p.check_loops.is_empty() || p.unsandboxed_retries.is_some();
+        if p.total_friction() == 0 && !stuck_on_checks {
             continue;
         }
-        let mut lines = vec![format!(
-            "In {}, {} tool calls failed in recurring ways:",
-            style.bold(&display(p)),
-            style.warn(&p.total_friction().to_string())
-        )];
+        let mut lines = vec![if p.total_friction() > 0 {
+            format!(
+                "In {}, {} tool calls failed in recurring ways:",
+                style.bold(&display(p)),
+                style.warn(&p.total_friction().to_string())
+            )
+        } else {
+            format!("In {}, the work kept retrying:", style.bold(&display(p)))
+        }];
         for cat in p.friction.iter().take(3) {
             lines.push(format!(
                 "  {:>4}× {} {}",
@@ -914,12 +958,34 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                 worst.span_secs.div_euclid(60).max(1)
             ));
         }
+        if let Some(worst) = p.check_loops.first() {
+            lines.push(format!(
+                "  …and `{}` kept failing for {} fix rounds without stopping to ask{}.",
+                worst.check,
+                worst.rounds,
+                if worst.resolved { "" } else { " (never fixed)" }
+            ));
+        }
+        if let Some(retries) = p.unsandboxed_retries {
+            lines.push(format!(
+                "  …and {} commands were re-run with the sandbox off after failing in it \
+                 ({} after a sandbox refusal — allow those in the sandbox settings).",
+                retries.total, retries.after_sandbox_denial
+            ));
+        }
         lines.push(format!(
             "  Fix in this project's own CLAUDE.md / .claude — details: {}",
             style.command(&format!("cclens failures --scope project:{}", p.project))
         ));
         items.push(Item {
-            weight: p.total_friction(),
+            // Each failed fix round and each unsandboxed retry is a wasted turn,
+            // the same unit a recurring failure is weighed in.
+            weight: p.total_friction()
+                + p.check_loops
+                    .iter()
+                    .map(|c| i64::from(c.rounds))
+                    .sum::<i64>()
+                + p.unsandboxed_retries.map_or(0, |r| r.total),
             lines,
         });
     }
@@ -941,6 +1007,24 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                     format!(
                         "  No single project owns it, so the fix belongs in ~/.claude — \
                          details: {}",
+                        style.command("cclens failures --scope global")
+                    ),
+                ],
+            });
+        }
+        if let Some(retries) = f.unsandboxed_retries {
+            items.push(Item {
+                weight: retries.total,
+                lines: vec![
+                    format!(
+                        "{} commands failed inside the Bash sandbox and were re-run with it \
+                         turned off — a turn each, and the re-run is unprotected.",
+                        style.warn(&retries.total.to_string())
+                    ),
+                    format!(
+                        "  {} of them followed a sandbox refusal; allowing those hosts/paths \
+                         in ~/.claude/settings.json `sandbox` removes them — details: {}",
+                        retries.after_sandbox_denial,
                         style.command("cclens failures --scope global")
                     ),
                 ],
@@ -1251,6 +1335,7 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
     const MIN_EDITS: u32 = 4;
     let store = open_for_read(db, frozen)?;
     let episodes = detect_thrash(&store.file_edits()?, GAP_SECS, MIN_EDITS);
+    let checks = detect_check_loops(&store.work_steps()?, MIN_CHECK_ROUNDS);
     if format == Format::Json {
         let episodes: Vec<serde_json::Value> = episodes
             .iter()
@@ -1265,12 +1350,101 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "episodes": episodes }));
+        let checks: Vec<serde_json::Value> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "project": c.project,
+                    "session_id": c.session_id,
+                    "check": c.check,
+                    "rounds": c.rounds,
+                    "failures": c.failures,
+                    "resolved": c.resolved,
+                    "span_secs": c.span_secs(),
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({ "episodes": episodes, "checks": checks }));
     }
-    if episodes.is_empty() {
-        println!("no thrash episodes (>= {MIN_EDITS} rapid re-edits) — run analyze first");
+    if episodes.is_empty() && checks.is_empty() {
+        println!(
+            "no thrash episodes (>= {MIN_EDITS} rapid re-edits, or a check failing \
+             >= {MIN_CHECK_ROUNDS} rounds) — run analyze first"
+        );
         return Ok(());
     }
+    if !episodes.is_empty() {
+        stuck_files(&episodes, format, GAP_SECS, MIN_EDITS);
+    }
+    if !checks.is_empty() {
+        if !episodes.is_empty() {
+            println!();
+        }
+        stuck_checks(&checks, format);
+    }
+    Ok(())
+}
+
+/// A check still failing after this many fix rounds is where the user's
+/// "three rounds, then ask" rule says to stop (`docs/specs/events.md`).
+const MIN_CHECK_ROUNDS: u32 = 3;
+
+fn stuck_checks(checks: &[crate::core::thrash::CheckLoop], format: Format) {
+    preamble(
+        format,
+        "Checks that kept failing round after round in one session, with edits in\n\
+         between — Claude kept trying fixes instead of stopping to ask. Worth asking\n\
+         what it was missing (a failing test it could not read? a wrong assumption?).",
+    );
+    let rows: Vec<Vec<String>> = checks
+        .iter()
+        .take(20)
+        .map(|c| {
+            let span = c.span_secs();
+            vec![
+                c.project.clone(),
+                c.check.clone(),
+                c.rounds.to_string(),
+                c.failures.to_string(),
+                if c.resolved { "yes" } else { "no" }.to_string(),
+                format!("{}m{}s", span / 60, span % 60),
+            ]
+        })
+        .collect();
+    render(
+        &[
+            "project",
+            "check",
+            "rounds",
+            "failed runs",
+            "resolved",
+            "within",
+        ],
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Right,
+            Align::Left,
+            Align::Right,
+        ],
+        &rows,
+        format,
+    );
+    note(&format!(
+        "a round is a failing run after an edit, the first failure aside; >= {MIN_CHECK_ROUNDS} \
+         rounds in one session\nis where \"three rounds, then ask\" says to stop.\n\
+         The check is the runner + subcommand (a curated list — a heuristic). `--format json`\n\
+         carries the session id to investigate with."
+    ));
+}
+
+fn stuck_files(
+    episodes: &[crate::core::thrash::ThrashEpisode],
+    format: Format,
+    gap_secs: i64,
+    min_edits: u32,
+) {
     preamble(
         format,
         "Files Claude kept re-editing in rapid bursts — the signature of getting stuck\n\
@@ -1296,12 +1470,52 @@ fn stuck(format: Format, frozen: bool, db: &Path) -> Result<()> {
         format,
     );
     note(&format!(
-        "bursts of >= {MIN_EDITS} edits to one file within {}m by a single session —\n\
+        "bursts of >= {min_edits} edits to one file within {}m by a single session —\n\
          likely where Claude got stuck. `--format json` carries the session id and\n\
          full path to investigate with.",
-        GAP_SECS / 60
+        gap_secs / 60
     ));
-    Ok(())
+}
+
+/// The unsandboxed retries a scope owns, as `(retries, after a sandbox
+/// denial)`. Routed like a friction category (`docs/specs/cli.md`): a strict
+/// majority project owns them all, and with no owner they are global.
+fn retries_in_scope(
+    retries: &[crate::core::thrash::UnsandboxedRetry],
+    filter: &ScopeFilter,
+) -> (i64, i64) {
+    let owner = retry_owner(retries);
+    let included = |project: &str| match filter {
+        ScopeFilter::All => true,
+        ScopeFilter::Global => owner.is_none(),
+        ScopeFilter::Project(None) => owner.as_deref() == Some(project),
+        ScopeFilter::Project(Some(slug)) => slug == project,
+    };
+    retries
+        .iter()
+        .filter(|retry| included(&retry.project))
+        .fold((0, 0), |(all, marked), retry| {
+            (all + 1, marked + i64::from(retry.after_sandbox_denial))
+        })
+}
+
+/// The project holding a strict majority of the unsandboxed retries, if any —
+/// the same ownership rule a friction category follows (`core::scope`).
+fn retry_owner(retries: &[crate::core::thrash::UnsandboxedRetry]) -> Option<String> {
+    const LABEL: &str = "unsandboxed-retry";
+    let mut per_project: std::collections::BTreeMap<&str, i64> = Default::default();
+    for retry in retries {
+        *per_project.entry(retry.project.as_str()).or_default() += 1;
+    }
+    let cells: Vec<(String, String, i64)> = per_project
+        .into_iter()
+        .map(|(project, n)| (project.to_string(), LABEL.to_string(), n))
+        .collect();
+    split_friction(&cells)
+        .per_project
+        .into_iter()
+        .next()
+        .map(|(project, _)| project)
 }
 
 /// What a block cost, when the trace is a block of a known call.
@@ -1639,6 +1853,8 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
             .collect(),
     };
     let total: i64 = counts.iter().map(|row| row.count).sum();
+    let (retries, retries_after_denial) =
+        retries_in_scope(&count_unsandboxed_retries(&store.sandboxed_runs()?), filter);
 
     if format == Format::Json {
         let failures: Vec<serde_json::Value> = counts
@@ -1653,10 +1869,30 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
                 })
             })
             .collect();
-        return emit_json(&serde_json::json!({ "total": total, "failures": failures }));
+        return emit_json(&serde_json::json!({
+            "total": total,
+            "failures": failures,
+            "unsandboxed_retries": {
+                "total": retries,
+                "after_sandbox_denial": retries_after_denial,
+            },
+        }));
     }
+    let print_retries = || {
+        if retries > 0 {
+            println!(
+                "\n{retries} Bash runs were retried with the sandbox disabled right after a \
+                 sandboxed failure;\n{retries_after_denial} of them followed a failure classified \
+                 as a sandbox refusal — those are what an\nallowlist entry in the sandbox settings \
+                 would remove (the rest may have failed for other reasons)."
+            );
+        }
+    };
     if total == 0 {
+        // A check's failure can be read from its output alone, so retries can
+        // exist in a scope that recorded no tool failure.
         println!("no tool failures found for this scope — run `cclens analyze` first?");
+        print_retries();
         return Ok(());
     }
 
@@ -1716,9 +1952,11 @@ fn failures(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Re
     };
     render(&headers, &aligns, &rows, format);
     note(&format!(
-        "{total} tool failures (denials from the transcript's own marker where present; \
-         everything else is a lexical heuristic)"
+        "{total} tool failures (denials from the transcript's own marker where present, \
+         sandbox-network from the\nsandbox's own report; everything else — sandbox-write \
+         included — is a lexical heuristic)"
     ));
+    print_retries();
     Ok(())
 }
 
@@ -2020,9 +2258,32 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
         store.ingest_tool_errors(&meta.id, &meta.source_path, &error_rows)?;
         // `work` owns the strings; the rows borrow them.
         let work = extract_work_events(&text);
-        let work_rows: Vec<(i64, &str, &str, Option<&str>)> = work
+        let checks: Vec<Option<String>> = work
             .iter()
-            .map(|e| (e.epoch_ms, e.kind, e.id.as_str(), e.path.as_deref()))
+            .map(|e| e.bash.as_ref().and_then(|run| check_key(&run.command)))
+            .collect();
+        let work_rows: Vec<WorkRow> = work
+            .iter()
+            .zip(&checks)
+            .map(|(e, check)| match &e.bash {
+                Some(run) => {
+                    let row = WorkRow::bash(
+                        e.epoch_ms,
+                        &e.id,
+                        run.outcome.map(BashOutcome::label),
+                        run.unsandboxed,
+                    );
+                    match check {
+                        Some(key) => row.checked(
+                            key,
+                            check_outcome(&run.command, run.outcome, &run.output)
+                                .map(BashOutcome::label),
+                        ),
+                        None => row,
+                    }
+                }
+                None => WorkRow::file_edit(e.epoch_ms, &e.id, e.path.as_deref()),
+            })
             .collect();
         store.ingest_work_events(&meta.id, &meta.source_path, &work_rows)?;
         // The main thread and every subagent: hooks fire in both. A block's cost

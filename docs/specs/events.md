@@ -23,7 +23,7 @@ identifying the configuration surface it exercises (the join key into
 | `prompt` | — (user input; raw material for skill extraction) | point event; text referenced, not stored |
 | `tool_error` | — (a failed `tool_result`) | point event; friction category in `surface_id`, a short error-text excerpt in `source`, the originating tool name in `model`, the call's target (file_path / command) in `target` |
 | `file_edit` | — (an Edit/Write target) | point event; the file's **basename** in `surface_id`, its **full path** in `target` |
-| `bash_cmd` | — (a Bash invocation) | point event; the command's leading word in `surface_id` |
+| `bash_cmd` | — (a Bash invocation) | point event; the command's leading word in `surface_id`, its **check key** (below) in `target` when it runs a test/build/lint check, the run's outcome in `source` (`ok`, or the friction category it failed with; NULL when no result was seen), what the check itself said in `check_outcome` (same vocabulary; NULL when the run says nothing about the check), `unsandboxed` in `model` when it ran with the sandbox disabled |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — partly heuristic source |
 | `tool_call` | — (any tool call, built-in or MCP, main thread or subagent) | point event; the tool name in `surface_id`, its result (`ok` / `failed` / `denied` — refused before it ran / `pending` — no result recorded yet) in `source`. The trigger a tool-event hook's matcher is counted against (`surfaces.md`) |
@@ -99,6 +99,18 @@ Two kinds carry caveats that downstream reports must honour:
   figure (`config-format.md`), not a measurement; no record reports the tokens
   an injection added.
 
+- **`bash_cmd`** carries three details beyond the leading word, each answering
+  a question the leading word cannot. The **check key** names *which check* a
+  command ran, so two runs of one check compare equal however they were
+  spelled; the **outcome** says whether the run failed and the **check
+  outcome** whether the check did — two facts, because a run the sandbox
+  refused failed while the check it carried never reported, and the retry
+  count needs the first while the loop detector needs the second; the
+  **sandbox flag** says it ran outside the sandbox, so a retry can be told
+  from a first attempt. The full command is not stored — the key is all either
+  detector needs, and the failing command of a broken run is already in its
+  `tool_error` row's `target`.
+
 A `hook` emits no event row of its own — it is counted from the `tool_call`
 (or prompt / session) rows its trigger selects, and its runs live in
 `hook_runs` — and `rule` / `claude_md` emitted none before Claude Code wrote
@@ -152,6 +164,82 @@ the agent detours through unrelated calls before retrying, and under-counts
 when the next same-tool call does something else entirely. It ranks which
 guards the agent keeps tripping over and how much each trip costs; it does not
 bill.
+
+### A check that keeps failing is thrash too
+
+File thrash catches an agent re-editing one file; it misses the same struggle
+seen from the other side — one check (`cargo test`, `just check`) run, failing,
+an edit, run again, failing again. The user's own rule caps that at three fix
+rounds before asking, so a check still failing after three fix attempts — four
+failing runs with edits between them — is the signal (`core::thrash`).
+
+The **check key** is the command normalised to the runner and its subcommand
+(`cargo test`, `just check`, `npm run lint`): each `&&` / `;` / `|` segment has
+its directory changes, environment assignments, redirections and wrappers
+(`timeout`, `env`, `nix develop -c`) stripped — separators inside quotes or
+escaped do not split, so a message that merely mentions a check
+(`jj describe -m "fix; cargo test passes"`) is not read as running it, and a
+heredoc body is data, not commands — and every segment that invokes a
+**known check runner** contributes its key; a compound command keys on all of
+them in order. Flags and targets are dropped (`cargo test -p a` and
+`cargo test --lib` are one check) because a loop that narrows its target while
+still failing is the same loop. The runner list is curated and therefore a
+heuristic: a command not on it never forms a loop, which keeps `rg` exiting 1
+on no match — a non-failure that edits naturally surround — out of the signal.
+An unrecognised runner is an under-report, never a false loop.
+
+An **episode** is grouped per `(session, check key)`, for the same reason file
+thrash groups per session: parallel sessions running one check must not merge
+into one agent looping. In transcript order, a failing run opens an episode —
+it is the problem, not a fix attempt, so it is no round however much was edited
+before it; each later failing run is a **round** when at least one file was edited since
+the previous failing run, and a bare re-run otherwise (counted in `failures`,
+not in `rounds` — re-running unchanged code is not a fix attempt). A passing
+run of that check closes the episode as **resolved**; the end of the session
+closes it **unresolved**. A run whose outcome was never seen is skipped rather
+than read as either.
+
+A check's outcome is not always its exit status. Agents routinely run checks as
+`cargo test 2>&1 | tail -20`, and a pipeline's status is its last command's, so
+the transcript records success while the output shows the runner failing — in
+the observed data about a quarter of piped check runs. Taken at face value those
+runs close every loop they belong to, which hides exactly the episodes this
+signal exists for. So for a check run whose exit was clean, the runner's own
+summary line decides (`core::friction::masked_failure` — `test result: FAILED`,
+a non-zero `N fail`, `error[E…]`, `error TS…`, a failed `just` recipe), and
+that overriding outcome is what `bash_cmd.check_outcome` stores. The converse holds
+too: a recorded failure is the check's only when the check is the command's
+last segment. After `| grep FAILED` or `&& rg …` the status is that command's —
+`grep` exits 1 precisely when a passing run printed nothing to match — so the
+failure is taken from the runner's output alone, and is unknown without it. So
+is a failure the check could not have produced — a missing path, a sandbox
+refusal, a hook block, a stop: `cd /missing && cargo test` ran no tests
+(`ErrorCategory::is_check_failure`). Separators inside a redirection
+(`2>&1`, `&>`) separate nothing, and a comment runs nothing. Likewise only
+directory changes and environment setup may precede the check: after
+`false && cargo test` the status may be `false`'s, with no test run. An or-list
+(`cargo test || true`) decouples the status from the check in both directions,
+so only the runner's output can speak for it, and so does a job sent to the
+background with a lone `&`, whose status the command never waits for. It is a lexical
+heuristic over runner output, asked only of check runs, never of arbitrary
+commands, and a failure it misses errs towards closing a loop, not inventing
+one.
+
+Episodes of at least `MIN_CHECK_ROUNDS` (3) rounds are kept; the threshold is a
+parameter of the detector so tests pin it.
+
+### An unsandboxed retry is the cost of a sandbox refusal
+
+The sandbox's friction does not end at the failure: the agent's usual answer is
+to run the command again with the sandbox disabled, which costs a turn and runs
+the command unprotected. A Bash run is an **unsandboxed retry** when it ran with
+the sandbox disabled and the previous Bash run *in the same session* ran inside
+it and failed (`core::thrash::count_unsandboxed_retries`). The flag is
+structural; the causal link — that the failure prompted the retry — is
+inferred from adjacency, so the count is an upper bound on retries the sandbox
+actually caused. The subset whose preceding failure was itself classified as a
+sandbox denial is reported beside it, and that is the figure an allowlist entry
+would remove.
 
 A **span** is an event with a duration window — currently `skill_invocation`.
 The rest of this spec is mostly about spans, since that is where boundary and

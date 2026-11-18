@@ -143,6 +143,8 @@ becomes an event). The adapter recognises at least:
 | User prompt | `user` **human turns** (not `last-prompt`, which is a single leaf-pointer to the latest prompt — one per region, not per turn) |
 | Tool failure | a `tool_result` block flagged `is_error` or wrapping `<tool_use_error>`. Categorised from the entry's `toolDenialKind` where that marker can be attributed to it (below), else from the text (`core::friction`); a short readable excerpt is kept. Linking the result's `tool_use_id` to the assistant `tool_use` block recovers both the **originating tool** and the call's **target** (its `input.file_path` / `command`) — so a report shows which tool produced each failure and which file/command it hit, even when the error text omits the path (e.g. edit-precondition names no file) |
 | Permission denial | `toolDenialKind` on the entry that carries the denied `tool_result`, else the denial text inside it (`"Permission for this action was denied"`). Structural where the marker is present; a low-confidence heuristic where it is not — see note below |
+| Bash run | `assistant` `tool_use` with `name == "Bash"`: `input.command` (normalised into a check key by the core, never stored whole), `input.dangerouslyDisableSandbox == true` (ran outside the sandbox), and the outcome from the matching `tool_result` (failed as defined for tool failures above, else succeeded; no result seen → unknown, and so is a background run — `input.run_in_background`, or a result whose first line says the harness moved it to the background — whose result only says it started) |
+| Sandbox denial | a `<sandbox_violations>` block inside a failed `tool_result` (harness-written, one `deny <operation> <target>` line per refusal); otherwise the OS's own wording — `Operation not permitted`, `Read-only file system` — see note below |
 | Compaction | `system` `subtype == compact_boundary` |
 | Hook run | see "Hook traces" below |
 | Context load | `attachment` `instructions` (each `files[]` entry — loaded at start) and `nested_memory` (loaded on a file touch); see above. Read from subagent transcripts too, where a rule can fire that the main thread never loads |
@@ -236,6 +238,26 @@ writes one per entry. Were upstream to batch several, a shared marker could not
 say which of them it denied, so it is dropped and the text classifier decides for
 all. Both fallbacks follow the same rule: where the marker cannot be attributed
 with certainty, it does not get to assert anything.
+
+### A sandbox refusal has two voices, and only one is the sandbox's
+
+Claude Code runs Bash under an OS sandbox, and a refused operation reaches the
+transcript in one of two ways. A refused **network** connection is reported by
+the harness itself: the result carries a `<sandbox_violations>` block of
+`deny network-outbound <host>:<port>` lines, a fixed vocabulary the harness
+writes regardless of what the command printed. Everything else the sandbox
+refuses — a write outside the allowed directories, a read-only `.git/worktrees`
+— reaches the command as `EPERM`, and the transcript holds only what the
+command printed: `Operation not permitted`, `Read-only file system`. That
+wording is the OS's, so it is stable, but it is not specific to the sandbox — an
+`EPERM` from macOS privacy controls or a root-owned file reads the same. The
+first is classified as a sandbox denial with confidence; the second is a
+lexical heuristic and labelled as one (`core::friction`).
+
+The unsandboxed **retry** is structural: `dangerouslyDisableSandbox` is an input
+field on the Bash call, so whether a call ran outside the sandbox needs no
+guessing. What is inferred is *why* — a retry is read as caused by the failure
+right before it, which the transcript does not state (`events.md`).
 
 ### Skill invocation has two distinct paths
 

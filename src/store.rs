@@ -17,7 +17,7 @@ use crate::core::hook::{CallResult, HookOutcome, HookTrace, StoredTrace, ToolCal
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::{SpawnModels, SubagentRun};
 use crate::core::surface::{Surface, is_usage_measurable};
-use crate::core::thrash::FileEdit;
+use crate::core::thrash::{BashOutcome, FileEdit, SandboxedRun, StepKind, WorkStep};
 use crate::core::usage::UsageEvent;
 
 /// The `meta` key holding the analysis semantics a store's rows were built with.
@@ -28,7 +28,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "6";
+const ANALYZER_VERSION: &str = "7";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS events (
     sub_tokens           INTEGER NOT NULL DEFAULT 0,
     sub_agent_count      INTEGER NOT NULL DEFAULT 0,
     sub_tokens_estimated INTEGER NOT NULL DEFAULT 0,
-    is_trailing          INTEGER NOT NULL DEFAULT 0
+    is_trailing          INTEGER NOT NULL DEFAULT 0,
+    check_outcome        TEXT
 );
 -- One row per subagent execution: which agent type ran, and what its own output
 -- cost. The session total says how much subagent work cost; this says *whose*.
@@ -222,7 +223,78 @@ SELECT event_id,
        started_epoch
 FROM candidates
 WHERE rn = 1;
+-- The same for bash_cmd events: the check key, outcome and sandbox flag the
+-- retry-loop and unsandboxed-retry detectors read (docs/specs/events.md).
+CREATE VIEW bash_commands AS
+SELECT e.session_id               AS session_id,
+       s.project                  AS project,
+       e.surface_id               AS command,
+       e.target                   AS check_key,
+       e.source                   AS outcome,
+       e.check_outcome            AS check_outcome,
+       e.model IS 'unsandboxed'   AS unsandboxed,
+       e.started_epoch            AS started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+WHERE e.kind = 'bash_cmd';
 ";
+
+/// One work event as stored. The detail columns carry a different fact per
+/// kind (`docs/specs/storage.md`): a file edit's full path in `target`; a Bash
+/// run's check key in `target`, its outcome in `source`, and the sandbox flag
+/// in `model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkRow<'a> {
+    pub epoch_ms: i64,
+    pub kind: &'a str,
+    /// The ranking identity: a command's leading word, or a file's basename.
+    pub id: &'a str,
+    pub target: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub model: Option<&'a str>,
+    /// What a check run said, apart from what the run did (`source`): a run
+    /// the sandbox refused failed, but the check it carried never reported.
+    pub check_outcome: Option<&'a str>,
+}
+
+impl<'a> WorkRow<'a> {
+    pub fn file_edit(epoch_ms: i64, basename: &'a str, path: Option<&'a str>) -> Self {
+        WorkRow {
+            epoch_ms,
+            kind: "file_edit",
+            id: basename,
+            target: path,
+            source: None,
+            model: None,
+            check_outcome: None,
+        }
+    }
+
+    pub fn bash(
+        epoch_ms: i64,
+        leading: &'a str,
+        outcome: Option<&'a str>,
+        unsandboxed: bool,
+    ) -> Self {
+        WorkRow {
+            epoch_ms,
+            kind: "bash_cmd",
+            id: leading,
+            target: None,
+            source: outcome,
+            model: unsandboxed.then_some("unsandboxed"),
+            check_outcome: None,
+        }
+    }
+
+    /// Mark the run as a check: its key and what the check said.
+    pub fn checked(self, key: &'a str, outcome: Option<&'a str>) -> Self {
+        WorkRow {
+            target: Some(key),
+            check_outcome: outcome,
+            ..self
+        }
+    }
+}
 
 /// Stamped into `PRAGMA user_version`. Bumped only for a change `migrate` cannot
 /// reconcile — an existing column removed, retyped, or given a new meaning.
@@ -791,27 +863,36 @@ impl Store {
         Ok(())
     }
 
-    /// Insert work events `(epoch_ms, kind, id)` — Bash leading words and edited
-    /// file basenames — kept out of the catalog join (`surface_kind` NULL).
-    /// Persist work events as `(epoch_ms, kind, id, path)`. A file edit's full
-    /// path goes to `target` — the generic detail column
-    /// (`docs/specs/storage.md`) — while `surface_id` keeps the basename that
-    /// hotspot rankings group on.
+    /// Persist work events — Bash runs and file edits — kept out of the catalog
+    /// join (`surface_kind` NULL), in the order given. That order is the
+    /// transcript's, and it is what `work_steps` reads back: an edit and the
+    /// check runs around it often share one second, so the row id is the only
+    /// thing that says which came first.
     pub fn ingest_work_events(
         &mut self,
         session_id: &str,
         source_path: &str,
-        events: &[(i64, &str, &str, Option<&str>)],
+        events: &[WorkRow<'_>],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (epoch_ms, kind, id, path) in events {
+        for row in events {
             tx.execute(
                 "INSERT INTO events
-                   (session_id, source_path, kind, surface_id, target,
-                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
-                    ctx_start, ctx_peak)
-                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 0, 0, 0, 0, 0)",
-                (session_id, source_path, kind, id, path, epoch_ms / 1000),
+                   (session_id, source_path, kind, surface_id, target, source, model,
+                    check_outcome, started_at, started_epoch, duration_sec, out_tokens,
+                    ctx_growth, ctx_start, ctx_peak)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    row.kind,
+                    row.id,
+                    row.target,
+                    row.source,
+                    row.model,
+                    row.check_outcome,
+                    row.epoch_ms / 1000,
+                ),
             )?;
         }
         tx.commit()?;
@@ -1200,6 +1281,64 @@ impl Store {
             row.stat.observed_sessions = observed_sessions;
         }
         Ok(catalog.into_iter().map(|row| row.stat).collect())
+    }
+
+    /// Every file edit and check run as a `WorkStep`, per session in transcript
+    /// order — the input to check-loop detection (`core::thrash`). A Bash run
+    /// that is not a check, or whose outcome was never seen, is no step.
+    pub fn work_steps(&self) -> Result<Vec<WorkStep>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, e.session_id, e.started_epoch, e.kind, e.target, e.check_outcome
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE (e.kind = 'file_edit')
+                OR (e.kind = 'bash_cmd' AND e.target IS NOT NULL AND e.check_outcome IS NOT NULL)
+             ORDER BY e.session_id, e.id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let kind: String = row.get(3)?;
+                let kind = if kind == "file_edit" {
+                    StepKind::Edit
+                } else {
+                    let outcome: String = row.get(5)?;
+                    StepKind::Check {
+                        key: row.get(4)?,
+                        failed: BashOutcome::from_label(&outcome)
+                            .is_some_and(BashOutcome::is_failure),
+                    }
+                };
+                Ok(WorkStep {
+                    project: row.get(0)?,
+                    session_id: row.get(1)?,
+                    epoch: row.get(2)?,
+                    kind,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every Bash run with its outcome and sandbox flag, per session in
+    /// transcript order — the input to the unsandboxed-retry count.
+    pub fn sandboxed_runs(&self) -> Result<Vec<SandboxedRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.project, e.session_id, e.source, e.model IS 'unsandboxed'
+             FROM events e JOIN sessions s ON e.session_id = s.id
+             WHERE e.kind = 'bash_cmd'
+             ORDER BY e.session_id, e.id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let outcome: Option<String> = row.get(2)?;
+                Ok(SandboxedRun {
+                    project: row.get(0)?,
+                    session_id: row.get(1)?,
+                    outcome: outcome.as_deref().and_then(BashOutcome::from_label),
+                    unsandboxed: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Every file edit as a `FileEdit`, time-ordered — the input to thrash
@@ -2903,7 +3042,13 @@ mod tests {
             .collect();
         assert_eq!(
             views,
-            ["agent_spawns", "context_loads", "stray", "tool_errors"]
+            [
+                "agent_spawns",
+                "bash_commands",
+                "context_loads",
+                "stray",
+                "tool_errors"
+            ]
         );
     }
 
@@ -3387,7 +3532,7 @@ mod tests {
             .ingest_work_events(
                 "a1",
                 &alpha.source_path,
-                &[(1_000, "file_edit", "x.rs", Some("/repo/src/x.rs"))],
+                &[WorkRow::file_edit(1_000, "x.rs", Some("/repo/src/x.rs"))],
             )
             .unwrap();
 
@@ -3414,11 +3559,93 @@ mod tests {
             .ingest_work_events(
                 "a1",
                 &alpha.source_path,
-                &[(1_000, "file_edit", "x.rs", None)],
+                &[WorkRow::file_edit(1_000, "x.rs", None)],
             )
             .unwrap();
 
         assert_eq!(store.file_edits().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn bash_runs_and_edits_read_back_as_work_steps_in_transcript_order() {
+        let mut store = Store::in_memory().unwrap();
+        let mut alpha = session("a1");
+        alpha.project = "alpha".to_string();
+        store.ingest_session(&alpha, &[], &[]).unwrap();
+        // All in one second: only insertion order says the edit came between.
+        store
+            .ingest_work_events(
+                "a1",
+                &alpha.source_path,
+                &[
+                    // Refused by the sandbox: the run failed, the check never said.
+                    WorkRow::bash(1_000, "cargo", Some("sandbox-write"), false)
+                        .checked("cargo test", None),
+                    // Exited clean, but the runner printed a failure.
+                    WorkRow::bash(1_050, "cargo", Some("ok"), true)
+                        .checked("cargo test", Some("test-failure")),
+                    WorkRow::file_edit(1_100, "x.rs", Some("/repo/src/x.rs")),
+                    WorkRow::bash(1_200, "cargo", Some("ok"), false)
+                        .checked("cargo test", Some("ok")),
+                    // Not a check: no step, but still a Bash run.
+                    WorkRow::bash(1_300, "rg", Some("ok"), true),
+                ],
+            )
+            .unwrap();
+
+        let steps: Vec<StepKind> = store
+            .work_steps()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                StepKind::Check {
+                    key: "cargo test".to_string(),
+                    failed: true
+                },
+                StepKind::Edit,
+                StepKind::Check {
+                    key: "cargo test".to_string(),
+                    failed: false
+                },
+            ]
+        );
+        // The retry count reads what the run did, not what the check said.
+        let runs = store.sandboxed_runs().unwrap();
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[0].project, "alpha");
+        assert_eq!(
+            runs[0].outcome,
+            Some(BashOutcome::Failed(
+                crate::core::friction::ErrorCategory::SandboxWrite
+            ))
+        );
+        assert_eq!(runs[1].outcome, Some(BashOutcome::Ok));
+        assert!(runs[1].unsandboxed);
+
+        let (cols, rows) = store
+            .query(
+                "SELECT command, check_key, outcome, check_outcome, unsandboxed FROM bash_commands",
+            )
+            .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                "command",
+                "check_key",
+                "outcome",
+                "check_outcome",
+                "unsandboxed"
+            ]
+        );
+        assert_eq!(
+            rows[0],
+            vec!["cargo", "cargo test", "sandbox-write", "", "0"]
+        );
+        assert_eq!(rows[3], vec!["rg", "", "ok", "", "1"]);
     }
 
     #[test]

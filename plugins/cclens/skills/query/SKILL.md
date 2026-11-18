@@ -43,7 +43,14 @@ sample the data before relying on an encoding:
   `category` is the failure class (`edit-precondition`, `path-not-found`,
   `blocked-by-hook`, …), `excerpt` the actual error text (carries the failing
   path), `target` the file/command when the text omits it, `project` the
-  session's cwd slug.
+  session's cwd slug. `sandbox-network` / `sandbox-write` are refusals by the
+  Bash sandbox.
+- `bash_commands` (view): one row per Bash run —
+  `session_id, project, command, check_key, outcome, check_outcome, unsandboxed, started_epoch`.
+  `command` is the leading word, `check_key` the test/build/lint check it ran
+  (`cargo test`, `just check`; NULL otherwise), `outcome` `ok` or the failure
+  category of the run, `check_outcome` the same for the check itself (a piped
+  `| tail` can hide a failing test behind a clean exit), `unsandboxed` 1 when it ran with the sandbox disabled.
 - `sessions` and `events` hold everything else (skill spans, tokens, models,
   timestamps); `surfaces` is the config catalog, where `startup_tokens` is what a
   surface costs every session and `static_tokens` its whole definition (a skill's

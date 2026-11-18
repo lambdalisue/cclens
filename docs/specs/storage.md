@@ -49,7 +49,7 @@ CREATE TABLE events (
     kind                 TEXT NOT NULL,   -- skill_invocation | session_start | tool_use | tool_call | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
     surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL); for file_edit: the basename hotspots group on (the full path is in target)
-    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); the model the call requested (agent_spawn); the call result ok|failed|denied|pending (tool_call); NULL otherwise
+    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); the model the call requested (agent_spawn); the call result ok|failed|denied|pending (tool_call); ok or the failure category (bash_cmd); NULL otherwise
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
     duration_sec         REAL NOT NULL,
@@ -61,8 +61,9 @@ CREATE TABLE events (
     sub_tokens           INTEGER NOT NULL,
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
-    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error); the calling turn's model (agent_spawn); the writing Claude Code version (context_load)
-    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit); the Agent call's id (agent_spawn), joining subagent_runs
+    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error); the calling turn's model (agent_spawn); the writing Claude Code version (context_load); 'unsandboxed' when the sandbox was disabled (bash_cmd)
+    target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit); the Agent call's id (agent_spawn), joining subagent_runs; the check key (bash_cmd, NULL when not a check)
+    check_outcome        TEXT,            -- what a check run's check said (bash_cmd with a check key): ok, a failure category, or NULL when unknown — apart from source, which is what the run did
     attrs_json           TEXT
 );
 
@@ -165,6 +166,15 @@ SELECT event_id, session_id, project,
 FROM events e JOIN sessions s ON e.session_id = s.id
 LEFT JOIN surfaces f ON f.resolved_path = e.target   -- ranked per load, first row kept
 WHERE e.kind = 'context_load';
+
+-- The same for bash_cmd events: the check key, outcome and sandbox flag the
+-- retry-loop and unsandboxed-retry detectors read (events.md).
+CREATE VIEW bash_commands AS
+SELECT e.session_id, s.project,
+       e.surface_id AS command, e.target AS check_key, e.source AS outcome, e.check_outcome,
+       e.model IS 'unsandboxed' AS unsandboxed, e.started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+WHERE e.kind = 'bash_cmd';
 ```
 
 The `REFERENCES` annotations above record which column joins which table; they
@@ -179,7 +189,7 @@ Because it is plain SQLite holding already-extracted facts, the session-analysis
 slices a consumer might want — the `optimize` agent chasing a root cause, say —
 are a `SELECT` away, which is cheaper and less error-prone than re-parsing the
 raw transcripts. `sql` opens the db **read-only** (`Store::open_readonly`) so an
-ad-hoc query cannot mutate the derived store; views like `tool_errors` keep those
+ad-hoc query cannot mutate the derived store; views like `tool_errors` and `bash_commands` keep those
 queries clean despite the column overloading.
 
 `attrs_json` is the additive escape hatch: a new event kind or surface attribute

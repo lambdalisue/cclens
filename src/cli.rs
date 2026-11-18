@@ -12,6 +12,7 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_hook_surfaces,
     read_mcp_server_surfaces, read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
+use crate::adapter::request_shape::extract_tool_context;
 use crate::adapter::transcript::{
     HookActivity, count_permission_denials, extract_context_loads, extract_hook_activity,
     extract_prompt_pointers, extract_tool_errors, extract_work_events, parse_session,
@@ -42,8 +43,13 @@ use crate::core::thrash::{
     BashOutcome, check_key, check_outcome, count_unsandboxed_retries, detect_check_loops,
     detect_thrash,
 };
+use crate::core::tool_load::{
+    TOOL_LOAD_THRESHOLDS, ToolLoadWedge, ToolLoadWedgeKind, tool_load_wedges,
+};
 use crate::core::usage::{attribute_subagents, extract_usage_events, output_tokens, run_model};
-use crate::store::{AgentModelCost, SessionMeta, Store, WorkRow, canonical_path};
+use crate::store::{
+    AgentModelCost, Decomposition, McpServerCost, SessionMeta, Store, WorkRow, canonical_path,
+};
 
 #[derive(Parser)]
 #[command(
@@ -2064,6 +2070,9 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
     let config = store.always_on_config_tokens()?;
     let residual = floor.map(|floor| (floor - config).max(0));
     let per_project = store.baseline_floor_per_project()?;
+    let decomposition = store.latest_decomposition()?;
+    let mcp_servers = store.measured_mcp_startup()?;
+    let tool_wedges = tool_load_wedges(&store.tool_load_stats()?, TOOL_LOAD_THRESHOLDS);
 
     if format == Format::Json {
         let per_project: Vec<serde_json::Value> = per_project
@@ -2081,6 +2090,9 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
             "config_tokens": config,
             "residual": residual,
             "per_project": per_project,
+            "decomposition": decomposition,
+            "mcp_servers": mcp_servers,
+            "tool_wedges": tool_wedges_json(&tool_wedges),
         }));
     }
     // No session start observed — say so rather than substituting a mid-session
@@ -2142,7 +2154,159 @@ fn overhead(format: Format, frozen: bool, db: &Path) -> Result<()> {
         "each floor is the leanest start across that project's sessions — a project with\n\
          few sessions may not have caught a fresh one, so compare like counts.",
     );
+    print_decomposition(decomposition.as_ref());
+    print_mcp_servers(&mcp_servers, format);
+    print_tool_wedges(&tool_wedges, format);
     Ok(())
+}
+
+/// The residual split into what the latest recorded request shape says it is
+/// made of, beside that session's observed start (`docs/specs/surfaces.md`).
+fn print_decomposition(decomposition: Option<&Decomposition>) {
+    let style = Style::stdout();
+    println!();
+    let Some(d) = decomposition else {
+        println!(
+            "{}",
+            style.dim(
+                "residual breakdown unavailable — no analyzed session recorded its request\n\
+                 shape (Claude Code releases before the shape records). It appears as newer\n\
+                 sessions are analyzed."
+            )
+        );
+        return;
+    };
+    println!(
+        "{}",
+        style.heading(&format!(
+            "Latest session start, broken down from its request shape ({}, {})",
+            d.started_at, d.project
+        ))
+    );
+    let components = [
+        ("system prompt", d.system_tokens),
+        ("built-in tools (eager schemas)", d.builtin_tool_tokens),
+        ("MCP tools (eager schemas)", d.mcp_tool_tokens),
+        ("deferred tool listing", d.deferred_listing_tokens),
+        ("MCP server instructions", d.mcp_instruction_tokens),
+        ("readable config", d.config_tokens),
+    ];
+    for (label, tokens) in components {
+        println!("  {label:<46} {tokens:>8} tokens");
+    }
+    if let Some(observed) = d.observed_ctx {
+        let measured: i64 = components.iter().map(|(_, tokens)| tokens).sum();
+        println!("  {:<46} {:>8} tokens", "observed start", observed);
+        println!(
+            "  {:<46} {:>8} tokens",
+            "remainder (opening prompt, reminders, estimate)",
+            observed - measured
+        );
+    }
+    println!(
+        "{}",
+        style.dim(
+            "  -> estimates (~4 chars/token), counted once per session; listings and\n\
+             \x20    instructions of servers that connect later are included."
+        )
+    );
+}
+
+/// Each MCP server's measured startup cost against how much it was used.
+fn print_mcp_servers(servers: &[McpServerCost], format: Format) {
+    if servers.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        Style::stdout().heading("MCP servers: what each costs at startup vs how often it is used")
+    );
+    let rows: Vec<Vec<String>> = servers
+        .iter()
+        .map(|server| {
+            vec![
+                server.server.clone(),
+                server.startup_tokens.to_string(),
+                server.sessions.to_string(),
+                server.calls.to_string(),
+            ]
+        })
+        .collect();
+    render(
+        &["server", "startup_tokens", "sessions", "calls"],
+        &[Align::Left, Align::Right, Align::Right, Align::Right],
+        &rows,
+        format,
+    );
+    note(
+        "startup_tokens is the latest session's eager schemas + listing lines + instructions;\n\
+         a server with many sessions and few calls is paid for far more than it is used.",
+    );
+}
+
+fn tool_wedge_evidence(wedge: &ToolLoadWedge) -> (String, &'static str) {
+    let stat = &wedge.stat;
+    match wedge.kind {
+        ToolLoadWedgeKind::DeferCandidate => (
+            format!(
+                "eager in {} sessions, called in {} (~{} tok/session)",
+                stat.eager_sessions, stat.eager_sessions_called, stat.eager_tokens
+            ),
+            "defer it: its schema is then paid only when a tool search loads it",
+        ),
+        ToolLoadWedgeKind::EagerCandidate => (
+            format!(
+                "deferred in {} sessions, loaded in {}",
+                stat.deferred_sessions, stat.deferred_sessions_loaded
+            ),
+            "load it eagerly: a tool-search turn is paid in nearly every session",
+        ),
+    }
+}
+
+fn tool_wedges_json(wedges: &[ToolLoadWedge]) -> Vec<serde_json::Value> {
+    wedges
+        .iter()
+        .map(|wedge| {
+            let (_, suggestion) = tool_wedge_evidence(wedge);
+            serde_json::json!({
+                "wedge": wedge.kind.label(),
+                "tool": wedge.stat,
+                "suggestion": suggestion,
+            })
+        })
+        .collect()
+}
+
+/// Tools whose loading mode fights their use (`core::tool_load`).
+fn print_tool_wedges(wedges: &[ToolLoadWedge], format: Format) {
+    if wedges.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        Style::stdout().heading("Tools loaded the wrong way for how they are used")
+    );
+    let rows: Vec<Vec<String>> = wedges
+        .iter()
+        .map(|wedge| {
+            let (evidence, suggestion) = tool_wedge_evidence(wedge);
+            vec![
+                wedge.kind.label().to_string(),
+                wedge.stat.name.clone(),
+                evidence,
+                suggestion.to_string(),
+            ]
+        })
+        .collect();
+    render(
+        &["problem", "tool", "evidence", "suggestion"],
+        &[Align::Left, Align::Left, Align::Left, Align::Left],
+        &rows,
+        format,
+    );
 }
 
 /// Static-token threshold above which an always-on or rarely-used surface counts
@@ -2319,6 +2483,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             &meta.source_path,
             &session_context_loads(&transcript, &text),
         )?;
+        store.ingest_tool_context(&meta.id, &meta.source_path, &extract_tool_context(&text))?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.

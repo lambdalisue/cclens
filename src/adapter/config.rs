@@ -650,7 +650,7 @@ pub fn read_hook_surfaces(settings_files: &[PathBuf], scope: &Scope) -> Vec<Surf
 
 /// Sanitize an MCP server name to the id form Claude Code uses in tool names:
 /// characters outside `[A-Za-z0-9_-]` (notably `:`) become `_`.
-fn sanitize_mcp_server_id(name: &str) -> String {
+pub fn sanitize_mcp_server_id(name: &str) -> String {
     name.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::core::context_load::{
     ContextLoad, LoadHistory, is_observed, recording_floor, version_key,
@@ -18,6 +18,7 @@ use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::{SpawnModels, SubagentRun};
 use crate::core::surface::{Surface, is_usage_measurable};
 use crate::core::thrash::{BashOutcome, FileEdit, SandboxedRun, StepKind, WorkStep};
+use crate::core::tool_load::{ToolContext, ToolLoadStat};
 use crate::core::usage::UsageEvent;
 
 /// The `meta` key holding the analysis semantics a store's rows were built with.
@@ -28,7 +29,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "7";
+const ANALYZER_VERSION: &str = "8";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -127,6 +128,45 @@ CREATE TABLE IF NOT EXISTS hook_runs (
     context_tokens INTEGER NOT NULL DEFAULT 0,
     retry_calls    INTEGER
 );
+-- Request shapes, content-addressed by the transcript's shape hash: weights,
+-- counts and tool names only, never text. A hash names the same shape wherever
+-- it appears, so a re-ingest never deletes these rows.
+CREATE TABLE IF NOT EXISTS request_shapes (
+    hash          TEXT PRIMARY KEY,
+    system_tokens INTEGER NOT NULL,
+    system_blocks INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS request_shape_tools (
+    hash     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    server   TEXT,
+    deferred INTEGER NOT NULL,
+    tokens   INTEGER NOT NULL,
+    PRIMARY KEY (hash, name)
+);
+CREATE TABLE IF NOT EXISTS session_shapes (
+    session_id  TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    hash        TEXT NOT NULL,
+    first_epoch INTEGER NOT NULL,
+    requests    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_tools (
+    session_id     TEXT NOT NULL,
+    source_path    TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    server         TEXT,
+    eager_tokens   INTEGER,
+    listing_tokens INTEGER,
+    loaded         INTEGER NOT NULL,
+    calls          INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_mcp_instructions (
+    session_id  TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    server      TEXT NOT NULL,
+    tokens      INTEGER NOT NULL
+);
 -- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
 -- commands can report freshness and re-run the analysis with the same roots,
 -- plus analyzer_version, which invalidates the ingest fingerprints above.
@@ -152,6 +192,10 @@ CREATE INDEX events_by_surface ON events(surface_kind, surface_id);
 CREATE INDEX subagent_runs_by_agent ON subagent_runs(agent);
 CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
 CREATE INDEX hook_runs_by_source ON hook_runs(source_path);
+CREATE INDEX session_shapes_by_source ON session_shapes(source_path);
+CREATE INDEX session_shapes_by_session ON session_shapes(session_id, first_epoch);
+CREATE INDEX session_tools_by_source ON session_tools(source_path);
+CREATE INDEX session_tools_by_name ON session_tools(name);
 ";
 
 /// Views are pure definitions over the tables, declared apart from them for the
@@ -434,6 +478,37 @@ pub struct AgentModelCost {
     /// `None` when any of the runs was stored before prompt tokens were
     /// measured: a partial sum would pass for the whole.
     pub prompt_tokens: Option<i64>,
+}
+
+/// What one session paid at start besides the conversation, component by
+/// component, measured from its request shape (`docs/specs/surfaces.md`
+/// "Decomposing the residual"). Token figures are estimates on the config
+/// estimator's scale.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct Decomposition {
+    pub session_id: String,
+    pub project: String,
+    pub started_at: String,
+    /// The context the session was observed to start with; `None` when its
+    /// transcript carried no assistant record to read it from.
+    pub observed_ctx: Option<i64>,
+    pub system_tokens: i64,
+    pub builtin_tool_tokens: i64,
+    pub mcp_tool_tokens: i64,
+    pub deferred_listing_tokens: i64,
+    pub mcp_instruction_tokens: i64,
+    /// The readable always-on config for that session's project.
+    pub config_tokens: i64,
+}
+
+/// One MCP server's measured startup cost and how much it was used.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct McpServerCost {
+    pub server: String,
+    pub startup_tokens: i64,
+    /// Sessions whose transcript showed the server's tools or instructions.
+    pub sessions: i64,
+    pub calls: i64,
 }
 
 /// One skill event's cost, with its UTC start, for time bucketing.
@@ -1800,9 +1875,19 @@ impl Store {
     /// else the global row. One event therefore counts on exactly one row
     /// (`docs/specs/surfaces.md`).
     pub fn effective_catalog(&self) -> Result<Vec<CatalogEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.kind, f.id, f.scope, f.project, f.static_tokens,
-                    f.startup_tokens, f.load_mode, COUNT(u.event_id)
+        // An MCP server's startup weight is unknown to config; a measurement from
+        // the request shape stands in for it where one exists.
+        let mut stmt = self.conn.prepare(&format!(
+            "WITH {MEASURED_MCP_CTE}
+             SELECT f.kind, f.id, f.scope, f.project, f.static_tokens,
+                    COALESCE(f.startup_tokens,
+                             CASE WHEN f.kind = 'mcp_server' AND f.scope = 'project' THEN
+                               (SELECT m.startup_tokens FROM measured_mcp_project m
+                                 WHERE m.server = f.id AND m.project = f.project)
+                                  WHEN f.kind = 'mcp_server' THEN
+                               (SELECT m.startup_tokens FROM measured_mcp m WHERE m.server = f.id)
+                             END),
+                    f.load_mode, COUNT(u.event_id)
              FROM surfaces f
              LEFT JOIN (SELECT e.id AS event_id, e.surface_kind, e.surface_id,
                                s.project AS session_project
@@ -1814,8 +1899,8 @@ impl Store {
                       SELECT p.project FROM surfaces p
                       WHERE p.kind = f.kind AND p.id = f.id AND p.scope = 'project')))
              GROUP BY f.kind, f.id, f.scope, f.project
-             ORDER BY f.kind, f.id, f.scope, f.project",
-        )?;
+             ORDER BY f.kind, f.id, f.scope, f.project"
+        ))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(CatalogEntry {
@@ -1865,7 +1950,281 @@ impl Store {
         )?;
         Ok(total)
     }
+
+    /// Replace a session's tool context: which shapes it sent, which tools it
+    /// had and how it used them, and its MCP instructions. Shapes themselves are
+    /// content-addressed and only ever added.
+    pub fn ingest_tool_context(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        context: &ToolContext,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for table in [
+            "session_shapes",
+            "session_tools",
+            "session_mcp_instructions",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE source_path = ?1"),
+                (source_path,),
+            )?;
+        }
+        for shape in &context.shapes {
+            tx.execute(
+                "INSERT OR IGNORE INTO request_shapes (hash, system_tokens, system_blocks)
+                 VALUES (?1, ?2, ?3)",
+                (&shape.hash, shape.system_tokens, shape.system_blocks),
+            )?;
+            for tool in &shape.tools {
+                tx.execute(
+                    "INSERT OR IGNORE INTO request_shape_tools (hash, name, server, deferred, tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (&shape.hash, &tool.name, &tool.server, tool.deferred, tool.tokens),
+                )?;
+            }
+        }
+        for use_ in &context.uses {
+            tx.execute(
+                "INSERT INTO session_shapes (session_id, source_path, hash, first_epoch, requests)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    session_id,
+                    source_path,
+                    &use_.hash,
+                    use_.first_epoch_ms / 1000,
+                    use_.requests,
+                ),
+            )?;
+        }
+        for tool in &context.tools {
+            tx.execute(
+                "INSERT INTO session_tools
+                   (session_id, source_path, name, server, eager_tokens, listing_tokens, loaded, calls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    session_id,
+                    source_path,
+                    &tool.name,
+                    &tool.server,
+                    tool.eager_tokens,
+                    tool.listing_tokens,
+                    tool.loaded,
+                    tool.calls,
+                ),
+            )?;
+        }
+        for (server, tokens) in &context.mcp_instructions {
+            tx.execute(
+                "INSERT INTO session_mcp_instructions (session_id, source_path, server, tokens)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (session_id, source_path, server, tokens),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The always-on components of the **latest** session that recorded its
+    /// request shape — the current setup, where the floor is a minimum over
+    /// history (`docs/specs/surfaces.md` "Decomposing the residual"). `None`
+    /// when no analyzed session recorded one.
+    pub fn latest_decomposition(&self) -> Result<Option<Decomposition>> {
+        let latest = self
+            .conn
+            .query_row(
+                // A session whose startup shape was never recorded has nothing to
+                // decompose; a later shape of it would be read as its start.
+                "SELECT s.id, s.project, s.started_at, startup.hash
+                 FROM sessions s
+                 JOIN (SELECT h.session_id, h.hash,
+                              ROW_NUMBER() OVER (PARTITION BY h.session_id
+                                                 ORDER BY h.first_epoch) AS rank
+                       FROM session_shapes h) startup
+                   ON startup.session_id = s.id AND startup.rank = 1
+                 WHERE EXISTS (SELECT 1 FROM request_shapes r WHERE r.hash = startup.hash)
+                 ORDER BY s.started_at DESC, s.id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, project, started_at, hash)) = latest else {
+            return Ok(None);
+        };
+        let sum = |sql: &str, key: &str| -> Result<i64> {
+            Ok(self.conn.query_row(sql, [key], |row| row.get(0))?)
+        };
+        Ok(Some(Decomposition {
+            observed_ctx: self
+                .conn
+                .query_row(
+                    "SELECT MIN(ctx_start) FROM events
+                     WHERE kind = 'session_start' AND session_id = ?1",
+                    [&session_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+            system_tokens: sum(
+                "SELECT COALESCE(SUM(system_tokens), 0) FROM request_shapes WHERE hash = ?1",
+                &hash,
+            )?,
+            builtin_tool_tokens: sum(
+                "SELECT COALESCE(SUM(tokens), 0) FROM request_shape_tools
+                 WHERE hash = ?1 AND deferred = 0 AND server IS NULL",
+                &hash,
+            )?,
+            mcp_tool_tokens: sum(
+                "SELECT COALESCE(SUM(tokens), 0) FROM request_shape_tools
+                 WHERE hash = ?1 AND deferred = 0 AND server IS NOT NULL",
+                &hash,
+            )?,
+            deferred_listing_tokens: sum(
+                "SELECT COALESCE(SUM(listing_tokens), 0) FROM session_tools WHERE session_id = ?1",
+                &session_id,
+            )?,
+            mcp_instruction_tokens: sum(
+                "SELECT COALESCE(SUM(tokens), 0) FROM session_mcp_instructions WHERE session_id = ?1",
+                &session_id,
+            )?,
+            config_tokens: self.always_on_config_tokens_for(&project)?,
+            session_id,
+            project,
+            started_at,
+        }))
+    }
+
+    /// Every tool across the sessions that had it, for the eager↔deferred
+    /// wedges (`core::tool_load`).
+    pub fn tool_load_stats(&self) -> Result<Vec<ToolLoadStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name, MAX(t.server),
+                    SUM(t.eager_tokens IS NOT NULL),
+                    SUM(t.eager_tokens IS NOT NULL AND t.calls > 0),
+                    SUM(t.listing_tokens IS NOT NULL),
+                    SUM(t.listing_tokens IS NOT NULL AND t.loaded),
+                    SUM(t.calls),
+                    COALESCE((SELECT l.eager_tokens FROM session_tools l
+                               JOIN sessions s ON s.id = l.session_id
+                              WHERE l.name = t.name AND l.eager_tokens IS NOT NULL
+                              ORDER BY s.started_at DESC, s.id DESC LIMIT 1), 0),
+                    COALESCE((SELECT l.listing_tokens IS NOT NULL FROM session_tools l
+                               JOIN sessions s ON s.id = l.session_id
+                              WHERE l.name = t.name
+                                AND (l.eager_tokens IS NOT NULL OR l.listing_tokens IS NOT NULL)
+                              ORDER BY s.started_at DESC, s.id DESC LIMIT 1), 0)
+             FROM session_tools t
+             GROUP BY t.name
+             ORDER BY t.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ToolLoadStat {
+                    name: row.get(0)?,
+                    server: row.get(1)?,
+                    eager_sessions: row.get(2)?,
+                    eager_sessions_called: row.get(3)?,
+                    deferred_sessions: row.get(4)?,
+                    deferred_sessions_loaded: row.get(5)?,
+                    calls: row.get(6)?,
+                    eager_tokens: row.get(7)?,
+                    currently_deferred: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Each MCP server's startup cost measured from the latest session that saw
+    /// it — eager definitions, listing lines, and instructions — with how many
+    /// sessions saw it and how often its tools were called
+    /// (`docs/specs/config-format.md` "The MCP tool-schema hard case").
+    pub fn measured_mcp_startup(&self) -> Result<Vec<McpServerCost>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "WITH {MEASURED_MCP_CTE}
+             SELECT server, startup_tokens, sessions, calls FROM measured_mcp
+             ORDER BY startup_tokens DESC, server"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(McpServerCost {
+                    server: row.get(0)?,
+                    startup_tokens: row.get(1)?,
+                    sessions: row.get(2)?,
+                    calls: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
+
+/// Defines `measured_mcp(server, startup_tokens, sessions, calls)`: each MCP
+/// server's startup cost in the latest session that carried any of its tools
+/// or its instructions — and `measured_mcp_project`, the same per project, which
+/// a project-scoped catalog row reads so one project's server is never priced
+/// by another's. Only sessions whose startup shape was recorded measure
+/// anything: without it the eager schemas are unknown, not zero. Shared by the per-server report and the effective
+/// catalog, so both read one measurement.
+const MEASURED_MCP_CTE: &str = "
+    shaped_sessions AS (
+        SELECT h.session_id FROM session_shapes h
+        WHERE h.first_epoch = (SELECT MIN(f.first_epoch) FROM session_shapes f
+                                WHERE f.session_id = h.session_id)
+          AND EXISTS (SELECT 1 FROM request_shapes r WHERE r.hash = h.hash)),
+    mcp_tools AS (
+        SELECT session_id, server,
+               SUM(COALESCE(eager_tokens, 0) + COALESCE(listing_tokens, 0)) AS tokens
+        FROM session_tools
+        WHERE server IS NOT NULL AND (eager_tokens IS NOT NULL OR listing_tokens IS NOT NULL)
+          AND session_id IN (SELECT session_id FROM shaped_sessions)
+        GROUP BY session_id, server),
+    mcp_instructions AS (
+        SELECT session_id, server, SUM(tokens) AS tokens
+        FROM session_mcp_instructions
+        WHERE session_id IN (SELECT session_id FROM shaped_sessions)
+        GROUP BY session_id, server),
+    mcp_seen AS (
+        SELECT session_id, server FROM mcp_tools
+        UNION SELECT session_id, server FROM mcp_instructions),
+    mcp_latest AS (
+        SELECT m.server, m.session_id,
+               ROW_NUMBER() OVER (PARTITION BY m.server
+                                  ORDER BY s.started_at DESC, s.id DESC) AS rank
+        FROM mcp_seen m JOIN sessions s ON s.id = m.session_id),
+    measured_mcp AS (
+        SELECT l.server,
+               COALESCE((SELECT t.tokens FROM mcp_tools t
+                          WHERE t.server = l.server AND t.session_id = l.session_id), 0)
+             + COALESCE((SELECT i.tokens FROM mcp_instructions i
+                          WHERE i.server = l.server AND i.session_id = l.session_id), 0)
+               AS startup_tokens,
+               (SELECT COUNT(*) FROM mcp_seen m WHERE m.server = l.server) AS sessions,
+               COALESCE((SELECT SUM(c.calls) FROM session_tools c WHERE c.server = l.server), 0)
+               AS calls
+        FROM mcp_latest l WHERE l.rank = 1),
+    mcp_latest_project AS (
+        SELECT m.server, s.project, m.session_id,
+               ROW_NUMBER() OVER (PARTITION BY m.server, s.project
+                                  ORDER BY s.started_at DESC, s.id DESC) AS rank
+        FROM mcp_seen m JOIN sessions s ON s.id = m.session_id),
+    measured_mcp_project AS (
+        SELECT l.server, l.project,
+               COALESCE((SELECT t.tokens FROM mcp_tools t
+                          WHERE t.server = l.server AND t.session_id = l.session_id), 0)
+             + COALESCE((SELECT i.tokens FROM mcp_instructions i
+                          WHERE i.server = l.server AND i.session_id = l.session_id), 0)
+               AS startup_tokens
+        FROM mcp_latest_project l WHERE l.rank = 1)
+";
 
 /// Bring an existing store onto the current schema **in place**. The store
 /// outlives the transcripts it was built from, so an upgrade may not resolve
@@ -2112,6 +2471,7 @@ mod tests {
     use super::*;
     use crate::core::context_load::{FileClass, LoadTrigger};
     use crate::core::surface::{LoadMode, Scope};
+    use crate::core::tool_load::{SessionTool, ShapeTool, ShapeUse, WeighedShape};
 
     /// Permissions are the reason this test and the next one work on a real
     /// temp directory instead of `Store::in_memory`: the default store path
@@ -4273,6 +4633,364 @@ mod tests {
         assert_eq!(
             rows,
             vec![("alias".to_string(), 5, 5), ("rust".to_string(), 0, 0)]
+        );
+    }
+
+    fn shape_tool(name: &str, deferred: bool, tokens: u64) -> ShapeTool {
+        ShapeTool {
+            name: name.into(),
+            server: crate::core::usage::mcp_server_of(name),
+            deferred,
+            tokens,
+        }
+    }
+
+    fn session_tool(
+        name: &str,
+        eager: Option<u64>,
+        listing: Option<u64>,
+        loaded: bool,
+        calls: u64,
+    ) -> SessionTool {
+        SessionTool {
+            name: name.into(),
+            server: crate::core::usage::mcp_server_of(name),
+            eager_tokens: eager,
+            listing_tokens: listing,
+            loaded,
+            calls,
+        }
+    }
+
+    /// A session whose startup shape is `hash`: a 40-token system prompt, one
+    /// built-in and one MCP tool eager, plus a stub that is not counted.
+    fn tool_context(hash: &str, epoch_ms: i64, tools: Vec<SessionTool>) -> ToolContext {
+        ToolContext {
+            shapes: vec![WeighedShape {
+                hash: hash.into(),
+                system_tokens: 40,
+                system_blocks: 2,
+                tools: vec![
+                    shape_tool("Bash", false, 300),
+                    shape_tool("mcp__srv__q", false, 50),
+                    shape_tool("DeferredToolPlaceholder", true, 9),
+                ],
+            }],
+            uses: vec![ShapeUse {
+                hash: hash.into(),
+                first_epoch_ms: epoch_ms,
+                requests: 3,
+            }],
+            tools,
+            mcp_instructions: vec![("srv".into(), 7)],
+        }
+    }
+
+    fn ingest_with_context(
+        store: &mut Store,
+        id: &str,
+        epoch_ms: i64,
+        ctx: u64,
+        context: &ToolContext,
+    ) {
+        let mut meta = session(id);
+        meta.start = Some(SessionStart {
+            timestamp_ms: epoch_ms,
+            ctx,
+        });
+        store.ingest_session(&meta, &[], &[]).unwrap();
+        store
+            .ingest_tool_context(&meta.id, &meta.source_path, context)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_latest_session_start_is_decomposed_from_its_shape() {
+        let mut store = Store::in_memory().unwrap();
+        let tools = vec![
+            session_tool("Bash", Some(300), None, false, 2),
+            session_tool("mcp__srv__q", Some(50), None, false, 0),
+            session_tool("mcp__srv__late", None, Some(4), true, 1),
+            session_tool("WebSearch", None, Some(3), false, 0),
+        ];
+        ingest_with_context(
+            &mut store,
+            "old",
+            1_000,
+            999,
+            &tool_context("h_old", 1_000, vec![]),
+        );
+        ingest_with_context(
+            &mut store,
+            "new",
+            2_000,
+            900,
+            &tool_context("h_new", 2_000, tools),
+        );
+
+        let decomposition = store.latest_decomposition().unwrap().unwrap();
+        assert_eq!(
+            decomposition,
+            Decomposition {
+                session_id: "new".into(),
+                project: "demo".into(),
+                started_at: epoch_ms_to_rfc3339(2_000),
+                observed_ctx: Some(900),
+                system_tokens: 40,
+                builtin_tool_tokens: 300,
+                mcp_tool_tokens: 50,
+                deferred_listing_tokens: 7,
+                mcp_instruction_tokens: 7,
+                config_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn no_recorded_shape_means_no_decomposition() {
+        let mut store = Store::in_memory().unwrap();
+        store.ingest_session(&session("s"), &[], &[]).unwrap();
+        assert_eq!(store.latest_decomposition().unwrap(), None);
+    }
+
+    #[test]
+    fn re_ingesting_a_session_replaces_its_tool_context() {
+        let mut store = Store::in_memory().unwrap();
+        let context = tool_context(
+            "h",
+            1_000,
+            vec![session_tool("Bash", Some(300), None, false, 1)],
+        );
+        ingest_with_context(&mut store, "s", 1_000, 900, &context);
+        ingest_with_context(&mut store, "s", 1_000, 900, &context);
+        let stats = store.tool_load_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].eager_sessions, 1);
+        assert_eq!(stats[0].calls, 1);
+    }
+
+    #[test]
+    fn tool_load_stats_count_sessions_by_mode_and_use() {
+        let mut store = Store::in_memory().unwrap();
+        let first = vec![
+            session_tool("mcp__srv__q", Some(50), None, false, 3),
+            session_tool("mcp__srv__late", None, Some(4), true, 1),
+        ];
+        let second = vec![
+            session_tool("mcp__srv__q", Some(60), None, false, 0),
+            session_tool("mcp__srv__late", None, Some(4), false, 0),
+        ];
+        ingest_with_context(
+            &mut store,
+            "a",
+            1_000,
+            900,
+            &tool_context("h", 1_000, first),
+        );
+        ingest_with_context(
+            &mut store,
+            "b",
+            2_000,
+            900,
+            &tool_context("h", 2_000, second),
+        );
+
+        let stats = store.tool_load_stats().unwrap();
+        assert_eq!(
+            stats,
+            vec![
+                ToolLoadStat {
+                    name: "mcp__srv__late".into(),
+                    server: Some("srv".into()),
+                    eager_sessions: 0,
+                    eager_sessions_called: 0,
+                    deferred_sessions: 2,
+                    deferred_sessions_loaded: 1,
+                    calls: 1,
+                    eager_tokens: 0,
+                    currently_deferred: true,
+                },
+                ToolLoadStat {
+                    name: "mcp__srv__q".into(),
+                    server: Some("srv".into()),
+                    eager_sessions: 2,
+                    eager_sessions_called: 1,
+                    deferred_sessions: 0,
+                    deferred_sessions_loaded: 0,
+                    calls: 3,
+                    eager_tokens: 60,
+                    currently_deferred: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_mcp_server_startup_cost_is_measured_from_its_latest_session() {
+        let mut store = Store::in_memory().unwrap();
+        let old = vec![session_tool("mcp__srv__q", Some(500), None, false, 2)];
+        let new = vec![
+            session_tool("mcp__srv__q", Some(50), None, false, 1),
+            session_tool("mcp__srv__late", None, Some(4), false, 0),
+        ];
+        ingest_with_context(
+            &mut store,
+            "old",
+            1_000,
+            900,
+            &tool_context("h", 1_000, old),
+        );
+        ingest_with_context(
+            &mut store,
+            "new",
+            2_000,
+            900,
+            &tool_context("h", 2_000, new),
+        );
+
+        assert_eq!(
+            store.measured_mcp_startup().unwrap(),
+            vec![McpServerCost {
+                server: "srv".into(),
+                startup_tokens: 50 + 4 + 7,
+                sessions: 2,
+                calls: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_measured_mcp_startup_cost_fills_the_catalogs_unknown() {
+        let mut store = Store::in_memory().unwrap();
+        let tools = vec![session_tool("mcp__srv__q", Some(50), None, false, 1)];
+        ingest_with_context(
+            &mut store,
+            "s",
+            1_000,
+            900,
+            &tool_context("h", 1_000, tools),
+        );
+        let unmeasured = |id: &str| Surface {
+            kind: "mcp_server".into(),
+            id: id.into(),
+            scope: Scope::Global,
+            config_path: "/tmp/mcp.json".into(),
+            static_tokens: None,
+            startup_tokens: None,
+            load_mode: LoadMode::ToolSchema,
+            attrs: Vec::new(),
+        };
+        store
+            .replace_surfaces(&[unmeasured("srv"), unmeasured("never_seen")])
+            .unwrap();
+
+        let startup: Vec<(String, Option<i64>)> = store
+            .effective_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id, entry.startup_tokens))
+            .collect();
+        assert_eq!(
+            startup,
+            vec![("never_seen".into(), None), ("srv".into(), Some(57))]
+        );
+    }
+    #[test]
+    fn a_session_whose_startup_shape_was_never_recorded_is_not_decomposed() {
+        let mut store = Store::in_memory().unwrap();
+        let mut context = tool_context("h", 2_000, vec![]);
+        context.uses.insert(
+            0,
+            ShapeUse {
+                hash: "h_missing".into(),
+                first_epoch_ms: 1_000,
+                requests: 1,
+            },
+        );
+        ingest_with_context(&mut store, "s", 1_000, 900, &context);
+        assert_eq!(store.latest_decomposition().unwrap(), None);
+    }
+
+    #[test]
+    fn a_project_mcp_server_takes_only_its_own_projects_measurement() {
+        let mut store = Store::in_memory().unwrap();
+        for (id, project, tokens, epoch_ms) in
+            [("a", "proj-a", 100, 1_000), ("b", "proj-b", 9_000, 2_000)]
+        {
+            let mut meta = session(id);
+            meta.project = project.into();
+            store.ingest_session(&meta, &[], &[]).unwrap();
+            let mut context = tool_context(
+                "h",
+                epoch_ms,
+                vec![session_tool("mcp__srv__q", Some(tokens), None, false, 0)],
+            );
+            context.mcp_instructions.clear();
+            store
+                .ingest_tool_context(&meta.id, &meta.source_path, &context)
+                .unwrap();
+        }
+        let surface = |project: &str| Surface {
+            kind: "mcp_server".into(),
+            id: "srv".into(),
+            scope: Scope::Project(project.into()),
+            config_path: "/tmp/.mcp.json".into(),
+            static_tokens: None,
+            startup_tokens: None,
+            load_mode: LoadMode::ToolSchema,
+            attrs: Vec::new(),
+        };
+        store
+            .replace_surfaces(&[surface("proj-a"), surface("proj-b"), surface("proj-c")])
+            .unwrap();
+
+        let startup: Vec<(String, Option<i64>)> = store
+            .effective_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.project, entry.startup_tokens))
+            .collect();
+        assert_eq!(
+            startup,
+            vec![
+                ("proj-a".into(), Some(100)),
+                ("proj-b".into(), Some(9_000)),
+                ("proj-c".into(), None),
+            ]
+        );
+    }
+    #[test]
+    fn a_session_without_its_startup_shape_does_not_measure_an_mcp_server() {
+        let mut store = Store::in_memory().unwrap();
+        let tools = vec![session_tool("mcp__srv__q", Some(50), None, false, 0)];
+        ingest_with_context(
+            &mut store,
+            "old",
+            1_000,
+            900,
+            &tool_context("h", 1_000, tools),
+        );
+        // Newer, but its startup shape was never recorded: its instructions alone
+        // would pass for the server's whole startup cost.
+        let mut partial = tool_context("h", 3_000, vec![]);
+        partial.uses.insert(
+            0,
+            ShapeUse {
+                hash: "h_missing".into(),
+                first_epoch_ms: 2_000,
+                requests: 1,
+            },
+        );
+        ingest_with_context(&mut store, "new", 2_000, 900, &partial);
+
+        assert_eq!(
+            store.measured_mcp_startup().unwrap(),
+            vec![McpServerCost {
+                server: "srv".into(),
+                startup_tokens: 57,
+                sessions: 1,
+                calls: 0,
+            }]
         );
     }
 }

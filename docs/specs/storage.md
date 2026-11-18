@@ -115,6 +115,57 @@ CREATE TABLE hook_runs (
 
 CREATE INDEX hook_runs_by_source ON hook_runs(source_path);
 
+-- Request shapes, content-addressed by the transcript's own shape hash: the
+-- token weights of what a main-loop request carries besides the conversation
+-- (session-format.md "The request shape"). Weights, counts and tool names only
+-- — never the text. A hash is the same shape wherever it appears, so these rows
+-- are inserted once and never deleted by a re-ingest.
+CREATE TABLE request_shapes (
+    hash          TEXT PRIMARY KEY,
+    system_tokens INTEGER NOT NULL,   -- the system prompt's blocks, summed
+    system_blocks INTEGER NOT NULL
+);
+CREATE TABLE request_shape_tools (
+    hash     TEXT NOT NULL,           -- request_shapes.hash
+    name     TEXT NOT NULL,           -- the tool's name
+    server   TEXT,                    -- MCP server id (as in surfaces.id); NULL for a built-in tool
+    deferred INTEGER NOT NULL,        -- 1 when sent as a defer-loading stub (not in context until loaded)
+    tokens   INTEGER NOT NULL,        -- weight of the whole definition
+    PRIMARY KEY (hash, name)
+);
+
+-- Which main-loop shapes a session sent, when each first appeared, and how many
+-- requests used it. The earliest row is the session's startup shape; a later
+-- row is a shape change (a tool loaded, a server connected).
+CREATE TABLE session_shapes (
+    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    source_path   TEXT NOT NULL,      -- ingest delete key
+    hash          TEXT NOT NULL,      -- request_shapes.hash
+    first_epoch   INTEGER NOT NULL,   -- UTC unix seconds
+    requests      INTEGER NOT NULL
+);
+CREATE INDEX session_shapes_by_session ON session_shapes(session_id, first_epoch);
+
+-- One row per tool a session had, eager or deferred, or merely called.
+CREATE TABLE session_tools (
+    session_id     TEXT NOT NULL REFERENCES sessions(id),
+    source_path    TEXT NOT NULL,     -- ingest delete key
+    name           TEXT NOT NULL,
+    server         TEXT,              -- MCP server id; NULL for a built-in tool
+    eager_tokens   INTEGER,           -- definition weight when eager in the startup shape; NULL otherwise
+    listing_tokens INTEGER,           -- its deferred-listing line's weight when deferred; NULL otherwise
+    loaded         INTEGER NOT NULL,  -- 1 when a ToolSearch load named it
+    calls          INTEGER NOT NULL   -- tool_use blocks naming it
+);
+
+-- Each MCP server's instructions block, weighed once per session.
+CREATE TABLE session_mcp_instructions (
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    source_path TEXT NOT NULL,        -- ingest delete key
+    server      TEXT NOT NULL,        -- MCP server id (the display name sanitized as tool names are)
+    tokens      INTEGER NOT NULL
+);
+
 -- Incremental-ingest fingerprints.
 CREATE TABLE ingested_files (
     path  TEXT PRIMARY KEY,

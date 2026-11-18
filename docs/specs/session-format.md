@@ -308,6 +308,45 @@ times more often than the main transcript alone suggested.
 > so every field is read as optional and an absent sidecar degrades to the
 > `promptId` join with an unknown agent type — never to a guessed one.
 
+## The request shape — what every request carries besides the conversation
+
+Newer releases record the **request shape**: the system prompt and the tool
+definitions sent with each API request. It is the only place the transcript
+shows the always-on cost that is not in the user's files, and it is read by
+`adapter::request_shape` (`extract_tool_context`). Every field below is optional;
+a transcript without them yields no shape and the decomposition degrades to the
+residual-only report (`surfaces.md`).
+
+| Record | Fields the adapter reads | Use |
+| --- | --- | --- |
+| `api-request-shape` | `shapeHash`, `shape.system[].text`, `shape.tools[]` (`name`, `defer_loading`; the whole definition is weighed) | One record per distinct shape; the hash is content-addressed, so the same shape across sessions has one hash. |
+| `api-request` | `shapeHash`, `querySource`, `timestamp` | One per request; names the shape it was sent with and which loop sent it. |
+| `attachment` `deferred_tools_delta` | `addedNames[]`, `addedLines[]` | The deferred-tool listing: one line per tool that is announced by name only, loadable through `ToolSearch`. Re-sent after a compaction. |
+| `attachment` `mcp_instructions_delta` | `addedNames[]`, `addedBlocks[]` | Each MCP server's own instructions text, keyed by its display name. |
+| `attachment` `deferred_tools_record` | `entries[].name` | The tools one `ToolSearch` call loaded (an empty `entries` loaded nothing). Re-recorded after a compaction, so loads are counted per session, not per record. |
+
+**`querySource` names the loop.** Observed values: `repl_main_thread` (the
+interactive main loop), `sdk` (a main loop driven through the SDK), and
+`agent:builtin:<type>` / `agent:custom:<type>` / bare `agent:custom` (subagents,
+which only appear in subagent transcripts, alongside an `agentId`). Only
+main-loop requests (`repl_main_thread`, `sdk`) contribute shapes: a subagent's
+shape is the agent's own prompt and tool set, not what a session pays at start,
+and any other source (a side query such as a title or summary call) is not part
+of the session's context at all. A shape hash is in practice used by one source
+only, so the filter costs nothing in coverage.
+
+**Eager vs deferred is per tool, in the shape itself.** A tool without
+`defer_loading` is sent in full on every request — its whole definition is
+always-on. A tool with `defer_loading: true` is sent as a stub the model cannot
+see until `ToolSearch` loads it; it appears in later shapes once loaded (a shape
+change, hence a new hash), and the session's first main-loop shape normally
+carries only the `DeferredToolPlaceholder` stub. What the model sees of a deferred
+tool before loading is its line in the deferred listing.
+
+Privacy: the shape contains the full system prompt, and the listings carry tool
+descriptions and MCP server instructions. The adapter reduces them to token
+weights, tool names, and hashes at parse time; no text leaves the adapter.
+
 ## Subagents do not invoke skills
 
 Empirically, subagent transcripts contain no `Skill` `tool_use` and no

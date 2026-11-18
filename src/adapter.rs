@@ -4,5 +4,6 @@
 //! `docs/specs/architecture.md` and `.claude/rules/format-isolation.md`.
 
 pub mod config;
+pub mod prompt_cache;
 pub mod request_shape;
 pub mod transcript;

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::core::cache::{BreakCause, CacheObservation, CacheRow};
 use crate::core::context_load::{
     ContextLoad, LoadHistory, is_observed, recording_floor, version_key,
 };
@@ -29,7 +30,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "8";
+const ANALYZER_VERSION: &str = "9";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -92,6 +93,33 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     prompt_tokens     INTEGER,
     started_at        TEXT NOT NULL,
     started_epoch     INTEGER NOT NULL
+);
+-- One row per main-thread API request: the prompt split into cache read,
+-- cache write by lifetime, and uncached input; on a request that broke the
+-- cache, the cause and the surfaces it implicates (a JSON array of kind:id).
+-- `source_path` is the ingest delete key, as for events.
+CREATE TABLE IF NOT EXISTS cache_requests (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    source_path     TEXT NOT NULL,
+    started_epoch   INTEGER NOT NULL,
+    model           TEXT NOT NULL,
+    uncached        INTEGER NOT NULL DEFAULT 0,
+    cache_read      INTEGER NOT NULL DEFAULT 0,
+    cache_write_5m  INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h  INTEGER NOT NULL DEFAULT 0,
+    gap_sec         REAL,
+    ttl_sec         INTEGER NOT NULL DEFAULT 300,
+    break_cause     TEXT,
+    rebuilt_tokens  INTEGER NOT NULL DEFAULT 0,
+    break_surfaces  TEXT
+);
+-- The session cost Claude Code itself reported. A session absent here has no
+-- reported cost: unknown, not free.
+CREATE TABLE IF NOT EXISTS session_costs (
+    session_id     TEXT PRIMARY KEY,
+    source_path    TEXT NOT NULL,
+    total_cost_usd REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS surfaces (
     kind          TEXT NOT NULL,
@@ -196,6 +224,7 @@ CREATE INDEX session_shapes_by_source ON session_shapes(source_path);
 CREATE INDEX session_shapes_by_session ON session_shapes(session_id, first_epoch);
 CREATE INDEX session_tools_by_source ON session_tools(source_path);
 CREATE INDEX session_tools_by_name ON session_tools(name);
+CREATE INDEX cache_requests_by_source ON cache_requests(source_path);
 ";
 
 /// Views are pure definitions over the tables, declared apart from them for the
@@ -353,11 +382,13 @@ const SCHEMA_VERSION: i64 = 2;
 /// Tables holding analysis history. Claude Code prunes transcripts on its own
 /// retention schedule, after which these rows are the only surviving record of
 /// those sessions — so a shape change adds columns in place, never rebuilds.
-const MIGRATED_TABLES: [&str; 6] = [
+const MIGRATED_TABLES: [&str; 8] = [
     "sessions",
     "events",
     "subagent_runs",
     "hook_runs",
+    "cache_requests",
+    "session_costs",
     "ingested_files",
     "meta",
 ];
@@ -898,6 +929,117 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace a session's prompt-cache requests and its reported cost. The
+    /// whole sequence is replaced, never appended: a break is defined against
+    /// the request before it, so a grown session is re-measured from its start.
+    pub fn ingest_prompt_cache(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        observations: &[CacheObservation],
+        reported_cost_usd: Option<f64>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM cache_requests WHERE source_path = ?1",
+            (source_path,),
+        )?;
+        tx.execute(
+            "DELETE FROM session_costs WHERE source_path = ?1",
+            (source_path,),
+        )?;
+        for obs in observations {
+            let request = &obs.request;
+            let (cause, rebuilt, surfaces) = match &obs.cache_break {
+                Some(b) => (
+                    Some(b.cause.label()),
+                    b.rebuilt_tokens as i64,
+                    (!b.surfaces.is_empty())
+                        .then(|| serde_json::to_string(&b.surfaces))
+                        .transpose()?,
+                ),
+                None => (None, 0, None),
+            };
+            tx.execute(
+                "INSERT INTO cache_requests
+                   (session_id, source_path, started_epoch, model, uncached, cache_read,
+                    cache_write_5m, cache_write_1h, gap_sec, ttl_sec, break_cause,
+                    rebuilt_tokens, break_surfaces)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    session_id,
+                    source_path,
+                    request.sent_epoch_ms / 1000,
+                    &request.model,
+                    request.uncached as i64,
+                    request.cache_read as i64,
+                    request.cache_write_5m as i64,
+                    request.cache_write_1h as i64,
+                    obs.gap_ms.map(|ms| ms as f64 / 1000.0),
+                    obs.ttl.millis() / 1000,
+                    cause,
+                    rebuilt,
+                    surfaces,
+                ],
+            )?;
+        }
+        if let Some(cost) = reported_cost_usd {
+            tx.execute(
+                "INSERT OR REPLACE INTO session_costs (session_id, source_path, total_cost_usd)
+                 VALUES (?1, ?2, ?3)",
+                (session_id, source_path, cost),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored prompt-cache request with its session's project, in time
+    /// order.
+    pub fn cache_rows(&self) -> Result<Vec<CacheRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.session_id, s.project, c.started_epoch, c.uncached, c.cache_read,
+                    c.cache_write_5m, c.cache_write_1h, c.break_cause, c.rebuilt_tokens,
+                    c.break_surfaces
+             FROM cache_requests c JOIN sessions s ON c.session_id = s.id
+             ORDER BY c.started_epoch, c.id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let cause: Option<String> = row.get(7)?;
+                let surfaces: Option<String> = row.get(9)?;
+                Ok(CacheRow {
+                    session_id: row.get(0)?,
+                    project: row.get(1)?,
+                    started_epoch: row.get(2)?,
+                    uncached: row.get(3)?,
+                    cache_read: row.get(4)?,
+                    cache_write_5m: row.get(5)?,
+                    cache_write_1h: row.get(6)?,
+                    // A label this build does not know still marks a break.
+                    break_cause: cause
+                        .map(|label| BreakCause::from_label(&label).unwrap_or(BreakCause::Unknown)),
+                    rebuilt_tokens: row.get(8)?,
+                    surfaces: surfaces
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `(sum, sessions)` of the cost Claude Code reported, over the sessions
+    /// that reported one.
+    pub fn reported_cost(&self) -> Result<(f64, i64)> {
+        let totals = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_cost_usd), 0.0), COUNT(*) FROM session_costs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(totals)
     }
 
     /// Insert tool-failure events for a session: `(epoch_ms, category, excerpt,
@@ -2469,6 +2611,7 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::cache::{CacheBreak, CacheRequest, CacheTtl};
     use crate::core::context_load::{FileClass, LoadTrigger};
     use crate::core::surface::{LoadMode, Scope};
     use crate::core::tool_load::{SessionTool, ShapeTool, ShapeUse, WeighedShape};
@@ -2549,6 +2692,104 @@ mod tests {
             sub_agent_count: 0,
             start: None,
         }
+    }
+
+    fn cache_observation(
+        at_ms: i64,
+        read: u64,
+        cache_break: Option<CacheBreak>,
+    ) -> CacheObservation {
+        CacheObservation {
+            request: CacheRequest {
+                sent_epoch_ms: at_ms,
+                model: "model-a".into(),
+                uncached: 2,
+                cache_read: read,
+                cache_write_5m: 1,
+                cache_write_1h: 7,
+                requested_ttl: None,
+                shape: None,
+            },
+            gap_ms: None,
+            ttl: CacheTtl::OneHour,
+            cache_break,
+        }
+    }
+
+    #[test]
+    fn cache_requests_round_trip_with_their_break_and_session_project() {
+        let mut store = Store::in_memory().unwrap();
+        let meta = session("s1");
+        store.ingest_session(&meta, &[], &[]).unwrap();
+        let tools_break = CacheBreak {
+            cause: BreakCause::ToolsChanged,
+            rebuilt_tokens: 900,
+            surfaces: vec!["mcp_server:late".into(), "tool:Monitor".into()],
+        };
+        store
+            .ingest_prompt_cache(
+                &meta.id,
+                &meta.source_path,
+                &[
+                    cache_observation(1_700_000_000_000, 0, None),
+                    cache_observation(1_700_000_060_000, 5, Some(tools_break)),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let rows = store.cache_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].break_cause, None);
+        assert_eq!(
+            rows[1],
+            CacheRow {
+                session_id: "s1".into(),
+                project: "demo".into(),
+                started_epoch: 1_700_000_060,
+                uncached: 2,
+                cache_read: 5,
+                cache_write_5m: 1,
+                cache_write_1h: 7,
+                break_cause: Some(BreakCause::ToolsChanged),
+                rebuilt_tokens: 900,
+                surfaces: vec!["mcp_server:late".into(), "tool:Monitor".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn re_ingesting_prompt_cache_replaces_the_sessions_rows_and_cost() {
+        let mut store = Store::in_memory().unwrap();
+        let meta = session("s1");
+        store.ingest_session(&meta, &[], &[]).unwrap();
+        let first = [cache_observation(1_700_000_000_000, 0, None)];
+        store
+            .ingest_prompt_cache(&meta.id, &meta.source_path, &first, Some(1.0))
+            .unwrap();
+        let grown = [
+            cache_observation(1_700_000_000_000, 0, None),
+            cache_observation(1_700_000_001_000, 8, None),
+        ];
+        store
+            .ingest_prompt_cache(&meta.id, &meta.source_path, &grown, Some(2.5))
+            .unwrap();
+
+        assert_eq!(store.cache_rows().unwrap().len(), 2);
+        assert_eq!(store.reported_cost().unwrap(), (2.5, 1));
+    }
+
+    #[test]
+    fn a_session_without_a_reported_cost_is_not_counted_as_free() {
+        let mut store = Store::in_memory().unwrap();
+        for (id, cost) in [("s1", Some(3.0)), ("s2", None)] {
+            let meta = session(id);
+            store.ingest_session(&meta, &[], &[]).unwrap();
+            store
+                .ingest_prompt_cache(&meta.id, &meta.source_path, &[], cost)
+                .unwrap();
+        }
+        assert_eq!(store.reported_cost().unwrap(), (3.0, 1));
     }
 
     fn agent_spawn(surface_id: &str, tool_use_id: &str) -> UsageEvent {

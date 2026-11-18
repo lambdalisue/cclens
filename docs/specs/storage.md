@@ -4,6 +4,7 @@ The store is the SQLite database `analyze` writes and every consumer reads
 (`architecture.md`). It holds the tables that mirror the catalog×usage model —
 a shared `sessions` dimension, the `surfaces` catalog, the `events` spine, and
 `subagent_runs` for work that happened in its own transcript — plus
+`cache_requests` and `session_costs` for what the API traffic cost, and
 `ingested_files` for incremental rebuilds. This spec defines the schema and the
 ingest contract; the *meaning* of the columns lives in the specs that own them
 (`events.md`, `surfaces.md`, `config-format.md`).
@@ -164,6 +165,36 @@ CREATE TABLE session_mcp_instructions (
     source_path TEXT NOT NULL,        -- ingest delete key
     server      TEXT NOT NULL,        -- MCP server id (the display name sanitized as tool names are)
     tokens      INTEGER NOT NULL
+);
+
+-- One row per main-thread API request: how its prompt split between cache
+-- read, cache write and uncached input, and — on a request that broke the
+-- cache — why, and which surfaces the break implicates (events.md).
+CREATE TABLE cache_requests (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    source_path     TEXT NOT NULL,   -- ingest delete key
+    started_epoch   INTEGER NOT NULL,-- UTC unix seconds the request was sent
+    model           TEXT NOT NULL,
+    uncached        INTEGER NOT NULL,
+    cache_read      INTEGER NOT NULL,
+    cache_write_5m  INTEGER NOT NULL,
+    cache_write_1h  INTEGER NOT NULL,
+    gap_sec         REAL,            -- since the previous request; NULL on the first
+    ttl_sec         INTEGER NOT NULL,-- the cache lifetime the gap is judged against
+    break_cause     TEXT,            -- idle_expired | model_switch | ttl_changed | compaction | tools_changed | system_changed | shape_changed | unknown; NULL when the cache held
+    rebuilt_tokens  INTEGER NOT NULL,-- previously cached tokens this request had to write again (0 unless a break)
+    break_surfaces  TEXT             -- JSON array of "kind:id" the break implicates; NULL when none
+);
+
+CREATE INDEX cache_requests_by_source ON cache_requests(source_path);
+
+-- The session cost Claude Code itself reported (session-format.md: cost-state).
+-- A session absent here has no reported cost — unknown, not free.
+CREATE TABLE session_costs (
+    session_id     TEXT PRIMARY KEY REFERENCES sessions(id),
+    source_path    TEXT NOT NULL,
+    total_cost_usd REAL NOT NULL
 );
 
 -- Incremental-ingest fingerprints.
@@ -362,7 +393,8 @@ delete-and-lose-history instruction.
 
 Drift is reconciled per object by what that object costs to lose:
 
-- `sessions`, `events`, `hook_runs`, `ingested_files`, `meta` hold history, so a missing
+- `sessions`, `events`, `subagent_runs`, `hook_runs`, `cache_requests`,
+  `session_costs`, `ingested_files`, `meta` hold history, so a missing
   column is appended with `ALTER TABLE ADD COLUMN`. Existing rows take the
   column's default, which the "report the gap, never substitute" contract below
   already covers. A column that is already present is **compared, not skipped** —
@@ -427,6 +459,9 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
   equals this file, then re-extract from the whole file and insert. This is why
   `events.source_path` exists. Replacing avoids duplicate rows when a still-open
   session is analyzed twice (the second pass simply supersedes the first).
+  `cache_requests` and `session_costs` replace on the same key, so a session
+  that grew is re-measured from its first request — a break is only defined
+  against the request before it, so the sequence is rebuilt whole.
   `subagent_runs` replaces on the same key — the parent transcript's path, not
   the subagent's — so one session's runs are rebuilt as a set, and a run whose
   own transcript vanished does not survive as an orphan. The subagent files

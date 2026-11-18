@@ -76,6 +76,15 @@ rest; unknown types are skipped.
     is **not monotonic**: at the context limit Claude Code compacts and the next
     request's prompt size drops sharply (observed ~1,000,000 → ~49,000). The
     context metric is defined to survive this (`events.md`).
+  - `cache_creation` — an object splitting the cache write by lifetime:
+    `ephemeral_5m_input_tokens`, `ephemeral_1h_input_tokens`. Older lines lack
+    it; the whole write then counts as five-minute, the API's default lifetime.
+    Prompt cache metrics read the three prompt parts separately rather than
+    their sum (`events.md`, `adapter::prompt_cache`).
+- `requestRef` — the id of the `api-request` record (below) this response
+  answers; the join to the request's shape and send time.
+- `promptCacheRequested` — the cache lifetime the request asked for (`5m`,
+  `1h`). Optional; absent, the lifetime is inferred from the write split.
 - `message.content[]` — blocks; the adapter inspects `tool_use` blocks for skill
   invocations, subagent spawns, and tool usage (below).
 
@@ -128,6 +137,23 @@ Both records are recent: the earliest seen are from Claude Code 2.1.299
 (`instructions`) and 2.1.302 (`nested_memory`). A transcript written before
 them carries no load evidence at all, which is not the same as a rule never
 loading — `surfaces.md` gates the never-loaded wedge on it.
+
+### Request records — what was sent, and what it cost
+
+Recent versions write top-level records describing the API traffic itself.
+All of them are optional; a transcript without them still yields every metric
+except the ones that need them.
+
+| `type` | Fields read | Use |
+| --- | --- | --- |
+| `api-request` | `id`, `timestamp`, `shapeHash` | One per main-thread request. `id` is what an `assistant` line's `requestRef` names; `timestamp` is when the request was sent, which is the instant the cache lifetime is measured from; `shapeHash` identifies the request shape. |
+| `api-request-shape` | `shapeHash`, `shape.tools[]` (name and whole definition), `shape.system[].text` | Written when a session first sends a shape. Each tool by name and definition, and each system block, is what a cache break is diffed on (`events.md`); definitions and text are digested, compared and dropped, never stored. |
+| `cost-state` | `totalCostUSD` | The session's accumulated cost as Claude Code itself priced it. The last record in the file is the session total. Written only by some sessions; absent means unknown, never zero. cclens carries no price table: prices vary by model and date, and this figure is upstream's own. |
+
+Observed on `2.1.2xx`: nearly every `api-request` was answered by an
+`assistant` line naming it (the rest were requests that failed or were
+cancelled), and every shape id a session switched to had its
+`api-request-shape` in the same file.
 
 ## Usage signals the adapter extracts
 

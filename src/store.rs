@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::core::context_load::{
+    ContextLoad, LoadHistory, is_observed, recording_floor, version_key,
+};
 use crate::core::hook::{CallResult, HookOutcome, HookTrace, StoredTrace, ToolCalls, Triggers};
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::{SpawnModels, SubagentRun};
@@ -25,7 +28,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "5";
+const ANALYZER_VERSION: &str = "6";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -94,6 +97,9 @@ CREATE TABLE IF NOT EXISTS surfaces (
     scope         TEXT NOT NULL,
     project       TEXT NOT NULL DEFAULT '',
     config_path   TEXT,
+    -- config_path with symlinks resolved; NULL when it cannot be. Transcripts
+    -- record a loaded file by its real path, so context_load events join here.
+    resolved_path TEXT,
     static_tokens INTEGER,
     startup_tokens INTEGER,
     load_mode     TEXT NOT NULL,
@@ -177,6 +183,45 @@ SELECT e.session_id, s.project, e.surface_id AS agent,
 FROM events e JOIN sessions s ON e.session_id = s.id
 LEFT JOIN subagent_runs r ON r.source_path = e.source_path AND r.tool_use_id = e.target
 WHERE e.kind = 'agent_spawn';
+
+-- Every config-file load, resolved against the catalog by canonical path. One
+-- file can sit under several catalog rows (a home-directory session scans
+-- ~/.claude as a project; a worktree session can scan the main checkout), so
+-- each load is attributed to exactly one: the row of the loading session's own
+-- project, else the global row, else the first. An unmatched load (a file since
+-- deleted, or one in a root no longer catalogued) keeps NULL surface columns
+-- rather than being dropped.
+CREATE VIEW context_loads AS
+WITH candidates AS (
+    SELECT e.id AS event_id, e.session_id, s.project, e.target, e.surface_id AS file_class,
+           e.source AS load_trigger, e.model AS cc_version, e.started_epoch,
+           f.kind, f.id AS surface_id, f.scope, f.project AS surface_project,
+           f.load_mode, f.static_tokens,
+           ROW_NUMBER() OVER (
+               PARTITION BY e.id
+               ORDER BY (f.scope = 'project' AND f.project = s.project) DESC,
+                        (f.scope = 'global') DESC, f.kind, f.project, f.id
+           ) AS rn
+    FROM events e JOIN sessions s ON e.session_id = s.id
+    LEFT JOIN surfaces f ON f.resolved_path = e.target
+    WHERE e.kind = 'context_load'
+)
+SELECT event_id,
+       session_id,
+       project,
+       target          AS path,
+       file_class,
+       load_trigger,
+       cc_version,
+       kind            AS surface_kind,
+       surface_id,
+       scope           AS surface_scope,
+       surface_project,
+       load_mode,
+       static_tokens,
+       started_epoch
+FROM candidates
+WHERE rn = 1;
 ";
 
 /// Stamped into `PRAGMA user_version`. Bumped only for a change `migrate` cannot
@@ -265,6 +310,36 @@ pub struct CatalogEntry {
     /// and for a hook only once its trigger has been counted
     /// (`docs/specs/surfaces.md`). Zero uses of an unmeasurable row means nothing.
     pub measurable: bool,
+}
+
+/// One catalogued rule or `CLAUDE.md` row with its load history.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct RuleLoadStat {
+    pub kind: String,
+    pub id: String,
+    pub scope: String,
+    pub project: String,
+    pub load_mode: String,
+    pub static_tokens: Option<u64>,
+    pub loads: u64,
+    /// Distinct observed sessions in its reach it loaded in — the numerator of
+    /// `observed_sessions`, so the share stays within one population. Loads and
+    /// their cost count every session.
+    pub sessions: u64,
+    /// UTC unix seconds of the latest load; `None` when it never loaded.
+    pub last_loaded_epoch: Option<i64>,
+    /// Sessions in its reach that could have recorded a load.
+    pub observed_sessions: u64,
+}
+
+impl RuleLoadStat {
+    pub fn history(&self) -> LoadHistory {
+        LoadHistory {
+            loads: self.loads,
+            sessions: self.sessions,
+            observed_sessions: self.observed_sessions,
+        }
+    }
 }
 
 /// What one agent type cost: how many times it ran and the output tokens those
@@ -892,6 +967,241 @@ impl Store {
         })
     }
 
+    /// Persist a session's config-file loads as `context_load` events: the
+    /// path in `target` (the join key into `surfaces.resolved_path`), the file
+    /// class in `surface_id`, the trigger in `source`, the writing Claude Code
+    /// version in `model`. `surface_kind` stays
+    /// NULL — which surface a path is gets decided at read time, against the
+    /// current catalog (`docs/specs/events.md`).
+    pub fn ingest_context_loads(
+        &mut self,
+        session_id: &str,
+        source_path: &str,
+        loads: &[ContextLoad],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for load in loads {
+            tx.execute(
+                "INSERT INTO events
+                   (session_id, source_path, kind, surface_id, source, target, model,
+                    started_at, started_epoch, duration_sec, out_tokens, ctx_growth,
+                    ctx_start, ctx_peak)
+                 VALUES (?1, ?2, 'context_load', ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, 0)",
+                (
+                    session_id,
+                    source_path,
+                    load.class.label(),
+                    load.trigger.label(),
+                    &load.path,
+                    &load.version,
+                    epoch_ms_to_rfc3339(load.epoch_ms),
+                    load.epoch_ms.div_euclid(1000),
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load history of every catalogued rule and `CLAUDE.md` row
+    /// (`docs/specs/surfaces.md` "Rule loads"). Loads join by resolved path and
+    /// are attributed to one row each (the `context_loads` view). The observed
+    /// sessions are the gate, judged per Claude Code version rather than per
+    /// timestamp: a session counts when the newest version that wrote its loads
+    /// is at or above the oldest version seen writing an on-demand load
+    /// (`core::context_load::recording_floor`), so a transcript from an install
+    /// that cannot record loads contributes nothing rather than a zero. A row's
+    /// reach follows the attribution rule, so its numerator and denominator are
+    /// one population: a project row reaches its own project's sessions, a
+    /// global row every session whose project has no row of its own for the
+    /// same file.
+    pub fn rule_load_stats(&self) -> Result<Vec<RuleLoadStat>> {
+        // Each session's newest load version, and whether it loaded on demand.
+        let mut session_versions: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+        let mut on_demand_versions: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, project, cc_version, load_trigger FROM context_loads",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let session: String = row.get(0)?;
+                let project: String = row.get(1)?;
+                let version: Option<String> = row.get(2)?;
+                let trigger: Option<String> = row.get(3)?;
+                if trigger.as_deref() == Some("on_demand")
+                    && let Some(version) = &version
+                {
+                    on_demand_versions.push(version.clone());
+                }
+                let entry = session_versions
+                    .entry(session)
+                    .or_insert_with(|| (project, None));
+                let newer = match (&entry.1, &version) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(held), Some(seen)) => version_key(seen) > version_key(held),
+                };
+                if newer {
+                    entry.1 = version;
+                }
+            }
+        }
+        let floor = recording_floor(on_demand_versions.iter().map(String::as_str));
+        let observed: BTreeMap<&str, &str> = session_versions
+            .iter()
+            .filter(|(_, (_, version))| is_observed(version.as_deref(), floor.as_deref()))
+            .map(|(session, (project, _))| (session.as_str(), project.as_str()))
+            .collect();
+
+        struct Row {
+            stat: RuleLoadStat,
+            resolved_path: Option<String>,
+        }
+        let mut catalog: Vec<Row> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT kind, id, scope, project, load_mode, static_tokens, resolved_path
+                 FROM surfaces WHERE kind IN ('rule', 'claude_md')
+                 ORDER BY kind DESC, scope, project, id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok(Row {
+                    stat: RuleLoadStat {
+                        kind: row.get(0)?,
+                        id: row.get(1)?,
+                        scope: row.get(2)?,
+                        project: row.get(3)?,
+                        load_mode: row.get(4)?,
+                        static_tokens: row.get::<_, Option<i64>>(5)?.map(|n| n.max(0) as u64),
+                        loads: 0,
+                        sessions: 0,
+                        last_loaded_epoch: None,
+                        observed_sessions: 0,
+                    },
+                    resolved_path: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        // Projects that own a row for a file: their sessions are that row's,
+        // not the global row's.
+        let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &catalog {
+            if row.stat.scope == "project"
+                && let Some(path) = &row.resolved_path
+            {
+                owners
+                    .entry(path.clone())
+                    .or_default()
+                    .push(row.stat.project.clone());
+            }
+        }
+        let in_reach = |scope: &str, own: &str, path: Option<&String>, session_project: &str| {
+            if scope == "project" {
+                return own == session_project;
+            }
+            path.and_then(|path| owners.get(path))
+                .is_none_or(|owned| !owned.iter().any(|p| p == session_project))
+        };
+
+        // Two rows of one scope naming one file (a symlinked alias) take loads
+        // on the first only, as the view orders them; the others could never
+        // load, so they are left unmeasured rather than flagged as never firing.
+        let mut attribution_target: BTreeMap<(&str, &str, &str), (&str, &str)> = BTreeMap::new();
+        for row in &catalog {
+            if let Some(path) = &row.resolved_path {
+                let candidate = (row.stat.kind.as_str(), row.stat.id.as_str());
+                attribution_target
+                    .entry((&row.stat.scope, &row.stat.project, path))
+                    .and_modify(|target| *target = (*target).min(candidate))
+                    .or_insert(candidate);
+            }
+        }
+        let aliases: std::collections::BTreeSet<(String, String, String, String)> = catalog
+            .iter()
+            .filter(|row| {
+                row.resolved_path.as_deref().is_some_and(|path| {
+                    attribution_target.get(&(
+                        row.stat.scope.as_str(),
+                        row.stat.project.as_str(),
+                        path,
+                    )) != Some(&(row.stat.kind.as_str(), row.stat.id.as_str()))
+                })
+            })
+            .map(|row| {
+                (
+                    row.stat.kind.clone(),
+                    row.stat.id.clone(),
+                    row.stat.scope.clone(),
+                    row.stat.project.clone(),
+                )
+            })
+            .collect();
+        drop(attribution_target);
+
+        // (kind, id, scope, project) → that row's (session, loads, latest load).
+        type RowKey = (String, String, String, String);
+        let mut attributed: BTreeMap<RowKey, Vec<(String, u64, i64)>> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT surface_kind, surface_id, surface_scope, surface_project, session_id,
+                        COUNT(*), MAX(started_epoch)
+                 FROM context_loads WHERE surface_kind IS NOT NULL
+                 GROUP BY surface_kind, surface_id, surface_scope, surface_project, session_id",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                attributed
+                    .entry((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    .or_default()
+                    .push((
+                        row.get(4)?,
+                        row.get::<_, i64>(5)?.max(0) as u64,
+                        row.get(6)?,
+                    ));
+            }
+        }
+
+        for row in &mut catalog {
+            let key = (
+                row.stat.kind.clone(),
+                row.stat.id.clone(),
+                row.stat.scope.clone(),
+                row.stat.project.clone(),
+            );
+            let reaches = |session_project: &str| {
+                in_reach(
+                    &row.stat.scope,
+                    &row.stat.project,
+                    row.resolved_path.as_ref(),
+                    session_project,
+                )
+            };
+            let (mut loads, mut sessions, mut last_loaded) = (0, 0, None);
+            for (session, count, last) in attributed.get(&key).into_iter().flatten() {
+                loads += count;
+                last_loaded = last_loaded.max(Some(*last));
+                if observed
+                    .get(session.as_str())
+                    .is_some_and(|project| reaches(project))
+                {
+                    sessions += 1;
+                }
+            }
+            let observed_sessions = if aliases.contains(&key) {
+                0
+            } else {
+                observed.values().filter(|p| reaches(p)).count() as u64
+            };
+            row.stat.loads = loads;
+            row.stat.sessions = sessions;
+            row.stat.last_loaded_epoch = last_loaded;
+            row.stat.observed_sessions = observed_sessions;
+        }
+        Ok(catalog.into_iter().map(|row| row.stat).collect())
+    }
+
     /// Every file edit as a `FileEdit`, time-ordered — the input to thrash
     /// detection, which needs the session and full path to tell one agent's
     /// retries apart from parallel work on a same-named file (`core::thrash`).
@@ -1324,15 +1634,16 @@ impl Store {
         for surface in surfaces {
             tx.execute(
                 "INSERT OR REPLACE INTO surfaces
-                   (kind, id, scope, project, config_path, static_tokens,
-                    startup_tokens, load_mode, attrs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (kind, id, scope, project, config_path, resolved_path,
+                    static_tokens, startup_tokens, load_mode, attrs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 (
                     &surface.kind,
                     &surface.id,
                     surface.scope.label(),
                     surface.scope.project(),
                     &surface.config_path,
+                    canonical_path(&surface.config_path),
                     surface.static_tokens,
                     surface.startup_tokens,
                     surface.load_mode.label(),
@@ -1606,6 +1917,15 @@ fn source_label(source: Source) -> &'static str {
     }
 }
 
+/// A path with every symlink resolved, or `None` when it cannot be (the file
+/// is gone). Both join sides go through this, so a config reached through a
+/// link matches the real path a transcript records (`docs/specs/config-format.md`).
+pub fn canonical_path(path: &str) -> Option<String> {
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|resolved| resolved.display().to_string())
+}
+
 fn epoch_ms_to_rfc3339(epoch_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(epoch_ms)
         .map(|dt| dt.to_rfc3339())
@@ -1651,6 +1971,7 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::context_load::{FileClass, LoadTrigger};
     use crate::core::surface::{LoadMode, Scope};
 
     /// Permissions are the reason this test and the next one work on a real
@@ -2580,7 +2901,10 @@ mod tests {
             .unwrap()
             .into_keys()
             .collect();
-        assert_eq!(views, ["agent_spawns", "stray", "tool_errors"]);
+        assert_eq!(
+            views,
+            ["agent_spawns", "context_loads", "stray", "tool_errors"]
+        );
     }
 
     #[test]
@@ -3355,5 +3679,373 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.hook_triggers(None).unwrap().sessions, 1);
+    }
+    /// A scratch config tree with one real rule file reached through a
+    /// symlinked rules directory — the layout a dotfiles-managed `~/.claude`
+    /// has, and the reason the catalog joins on the resolved path.
+    struct LinkedRules {
+        dir: std::path::PathBuf,
+    }
+
+    impl LinkedRules {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("cclens-rules-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("dotfiles/rules")).unwrap();
+            std::fs::write(dir.join("dotfiles/rules/rust.md"), "x").unwrap();
+            std::fs::write(dir.join("dotfiles/rules/ts.md"), "x").unwrap();
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(dir.join("dotfiles/rules"), dir.join("config/rules"))
+                .unwrap();
+            LinkedRules { dir }
+        }
+
+        /// Where the catalog finds a rule: under the (symlinked) config root.
+        fn config_path(&self, name: &str) -> String {
+            self.dir
+                .join("config/rules")
+                .join(name)
+                .display()
+                .to_string()
+        }
+
+        /// Where a transcript records it: the real file.
+        fn real_path(&self, name: &str) -> String {
+            std::fs::canonicalize(self.dir.join("dotfiles/rules").join(name))
+                .unwrap()
+                .display()
+                .to_string()
+        }
+    }
+
+    impl Drop for LinkedRules {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn rule(id: &str, config_path: String, load_mode: LoadMode) -> Surface {
+        Surface {
+            kind: "rule".to_string(),
+            id: id.to_string(),
+            scope: Scope::Global,
+            config_path,
+            static_tokens: Some(100),
+            startup_tokens: Some(0),
+            load_mode,
+            attrs: Vec::new(),
+        }
+    }
+
+    fn load(epoch_ms: i64, path: &str, trigger: LoadTrigger) -> ContextLoad {
+        load_v(epoch_ms, path, trigger, "2.1.400")
+    }
+
+    fn load_v(epoch_ms: i64, path: &str, trigger: LoadTrigger, version: &str) -> ContextLoad {
+        ContextLoad {
+            epoch_ms,
+            path: path.to_string(),
+            class: FileClass::Rule,
+            trigger,
+            version: Some(version.to_string()),
+        }
+    }
+
+    fn ingest_loads(store: &mut Store, id: &str, loads: &[ContextLoad]) {
+        let meta = session(id);
+        store.ingest_session(&meta, &[], &[]).unwrap();
+        store
+            .ingest_context_loads(&meta.id, &meta.source_path, loads)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_load_recorded_under_the_real_path_joins_a_rule_catalogued_through_a_symlink() {
+        let tree = LinkedRules::new("join");
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[rule(
+                "rust",
+                tree.config_path("rust.md"),
+                LoadMode::PathConditional,
+            )])
+            .unwrap();
+        let rust = tree.real_path("rust.md");
+        ingest_loads(
+            &mut store,
+            "s1",
+            &[
+                load(1_000, &rust, LoadTrigger::OnDemand),
+                load(5_000, &rust, LoadTrigger::OnDemand),
+            ],
+        );
+
+        let stats = store.rule_load_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            (
+                stats[0].loads,
+                stats[0].sessions,
+                stats[0].last_loaded_epoch
+            ),
+            (2, 1, Some(5))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_conditional_rule_counts_only_sessions_that_could_have_recorded_a_load() {
+        // s0 predates load records (none at all); s1 is an older install that
+        // records only startup loads — written *after* the newer sessions, so a
+        // timestamp gate would let it in; s2 and s3 are fully recording
+        // sessions. Only s2 and s3 are observed.
+        let tree = LinkedRules::new("observed");
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[rule(
+                "ts",
+                tree.config_path("ts.md"),
+                LoadMode::PathConditional,
+            )])
+            .unwrap();
+        let (rust, other) = (tree.real_path("rust.md"), "/tmp/example/CLAUDE.md");
+        ingest_loads(&mut store, "s0", &[]);
+        ingest_loads(
+            &mut store,
+            "s1",
+            &[load_v(40_000, other, LoadTrigger::Startup, "2.1.299")],
+        );
+        ingest_loads(
+            &mut store,
+            "s2",
+            &[
+                load(20_000, other, LoadTrigger::Startup),
+                load(25_000, &rust, LoadTrigger::OnDemand),
+            ],
+        );
+        ingest_loads(
+            &mut store,
+            "s3",
+            &[load(30_000, other, LoadTrigger::Startup)],
+        );
+
+        let stats = store.rule_load_stats().unwrap();
+        assert_eq!((stats[0].loads, stats[0].observed_sessions), (0, 2));
+    }
+
+    #[test]
+    fn a_store_with_no_on_demand_load_observes_no_session() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[rule(
+                "ts",
+                "/tmp/example/missing/ts.md".to_string(),
+                LoadMode::PathConditional,
+            )])
+            .unwrap();
+        ingest_loads(
+            &mut store,
+            "s1",
+            &[load(1_000, "/tmp/example/CLAUDE.md", LoadTrigger::Startup)],
+        );
+
+        assert_eq!(store.rule_load_stats().unwrap()[0].observed_sessions, 0);
+    }
+
+    #[test]
+    fn a_project_rule_is_observed_only_by_its_own_projects_sessions() {
+        let mut store = Store::in_memory().unwrap();
+        let mut project_rule = rule(
+            "local",
+            "/tmp/example/missing/local.md".to_string(),
+            LoadMode::PathConditional,
+        );
+        project_rule.scope = Scope::Project("alpha".to_string());
+        store.replace_surfaces(&[project_rule]).unwrap();
+        for (id, project) in [("a1", "alpha"), ("b1", "beta"), ("b2", "beta")] {
+            let mut meta = session(id);
+            meta.project = project.to_string();
+            store.ingest_session(&meta, &[], &[]).unwrap();
+            store
+                .ingest_context_loads(
+                    &meta.id,
+                    &meta.source_path,
+                    &[load(1_000, "/tmp/example/other.md", LoadTrigger::OnDemand)],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.rule_load_stats().unwrap()[0].observed_sessions, 1);
+    }
+
+    #[test]
+    fn re_ingesting_a_session_replaces_its_context_loads() {
+        let mut store = Store::in_memory().unwrap();
+        let loads = [load(1_000, "/tmp/example/a.md", LoadTrigger::OnDemand)];
+        ingest_loads(&mut store, "s1", &loads);
+        ingest_loads(&mut store, "s1", &loads);
+
+        let (_, rows) = store.query("SELECT COUNT(*) FROM context_loads").unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_file_catalogued_under_two_rows_counts_each_load_once() {
+        // The same rule file is catalogued globally and as project alpha's (a
+        // session rooted where the global config lives). Alpha's load lands on
+        // alpha's row, beta's on the global row — never on both.
+        let tree = LinkedRules::new("dup");
+        let mut store = Store::in_memory().unwrap();
+        let global = rule(
+            "rust",
+            tree.config_path("rust.md"),
+            LoadMode::PathConditional,
+        );
+        let mut local = global.clone();
+        local.scope = Scope::Project("alpha".to_string());
+        store.replace_surfaces(&[global, local]).unwrap();
+        let rust = tree.real_path("rust.md");
+        for (id, project) in [("a1", "alpha"), ("b1", "beta")] {
+            let mut meta = session(id);
+            meta.project = project.to_string();
+            store.ingest_session(&meta, &[], &[]).unwrap();
+            store
+                .ingest_context_loads(
+                    &meta.id,
+                    &meta.source_path,
+                    &[load(1_000, &rust, LoadTrigger::OnDemand)],
+                )
+                .unwrap();
+        }
+
+        let loads: Vec<(String, u64)> = store
+            .rule_load_stats()
+            .unwrap()
+            .into_iter()
+            .map(|s| (format!("{}:{}", s.scope, s.project), s.loads))
+            .collect();
+        assert_eq!(
+            loads,
+            vec![("global:".to_string(), 1), ("project:alpha".to_string(), 1)]
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn loaded_sessions_count_only_observed_ones_while_loads_count_all() {
+        // An always-on rule loads in s1, written by a version that records no
+        // on-demand loads, and in s2. Both loads were paid; only s2 is observed, so the
+        // share is 1 of 1, never 2 of 1.
+        let tree = LinkedRules::new("share");
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[rule("ts", tree.config_path("ts.md"), LoadMode::StartupFull)])
+            .unwrap();
+        let (ts, rust) = (tree.real_path("ts.md"), tree.real_path("rust.md"));
+        ingest_loads(
+            &mut store,
+            "s1",
+            &[load_v(10_000, &ts, LoadTrigger::Startup, "2.1.299")],
+        );
+        ingest_loads(
+            &mut store,
+            "s2",
+            &[
+                load(20_000, &ts, LoadTrigger::Startup),
+                load(25_000, &rust, LoadTrigger::OnDemand),
+            ],
+        );
+
+        let stat = &store.rule_load_stats().unwrap()[0];
+        assert_eq!(
+            (stat.loads, stat.sessions, stat.observed_sessions),
+            (2, 1, 1)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_global_row_does_not_count_sessions_of_a_project_owning_the_same_file() {
+        // The file is catalogued globally and as alpha's. Alpha's sessions load
+        // it onto alpha's row, so they are alpha's population too: the global
+        // row's share is over beta alone.
+        let tree = LinkedRules::new("reach");
+        let mut store = Store::in_memory().unwrap();
+        let global = rule(
+            "rust",
+            tree.config_path("rust.md"),
+            LoadMode::PathConditional,
+        );
+        let mut local = global.clone();
+        local.scope = Scope::Project("alpha".to_string());
+        store.replace_surfaces(&[global, local]).unwrap();
+        let rust = tree.real_path("rust.md");
+        for (id, project) in [("a1", "alpha"), ("a2", "alpha"), ("b1", "beta")] {
+            let mut meta = session(id);
+            meta.project = project.to_string();
+            store.ingest_session(&meta, &[], &[]).unwrap();
+            store
+                .ingest_context_loads(
+                    &meta.id,
+                    &meta.source_path,
+                    &[load(1_000, &rust, LoadTrigger::OnDemand)],
+                )
+                .unwrap();
+        }
+
+        let shares: Vec<(String, u64, u64)> = store
+            .rule_load_stats()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.scope, s.sessions, s.observed_sessions))
+            .collect();
+        assert_eq!(
+            shares,
+            vec![("global".to_string(), 1, 1), ("project".to_string(), 2, 2)]
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_alias_of_a_rule_is_unmeasured_not_never_firing() {
+        // `alias.md` links to `rust.md` in the same rules dir: both rows name
+        // one file, loads land on one of them, and the other must not read as
+        // a rule that never fires.
+        let tree = LinkedRules::new("alias");
+        std::os::unix::fs::symlink(
+            tree.dir.join("dotfiles/rules/rust.md"),
+            tree.dir.join("dotfiles/rules/alias.md"),
+        )
+        .unwrap();
+        let mut store = Store::in_memory().unwrap();
+        store
+            .replace_surfaces(&[
+                rule(
+                    "rust",
+                    tree.config_path("rust.md"),
+                    LoadMode::PathConditional,
+                ),
+                rule(
+                    "alias",
+                    tree.config_path("alias.md"),
+                    LoadMode::PathConditional,
+                ),
+            ])
+            .unwrap();
+        let rust = tree.real_path("rust.md");
+        for id in ["s1", "s2", "s3", "s4", "s5"] {
+            ingest_loads(&mut store, id, &[load(1_000, &rust, LoadTrigger::OnDemand)]);
+        }
+
+        let rows: Vec<(String, u64, u64)> = store
+            .rule_load_stats()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s.loads, s.observed_sessions))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("alias".to_string(), 5, 5), ("rust".to_string(), 0, 0)]
+        );
     }
 }

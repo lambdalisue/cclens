@@ -98,6 +98,37 @@ rest; unknown types are skipped.
 | `local_command` | A slash command run locally (carries its own `<command-name>`). |
 | `away_summary`, `compact_boundary`, `scheduled_task_fire`, … | Other lifecycle markers; read as needed. |
 
+### `attachment` — context Claude Code injected
+
+`attachment` records carry `attachment.type` and describe text Claude Code put
+into the context on its own. Two of them say **which config file was loaded, and
+when**, which is the only transcript evidence a rule or `CLAUDE.md` was ever in
+play (`events.md` `context_load`):
+
+| `attachment.type` | When it is written | What it names |
+| --- | --- | --- |
+| `instructions` | At session start (again after a compaction or resume re-injects it), before the first response — in a subagent transcript too | `files[]`, one entry per always-on file: `path`, and `type` (`User` — `~/.claude/CLAUDE.md` and unconditional user rules; `Project` — the project's `CLAUDE.md` / `AGENTS.md` and unconditional project rules; `AutoMem` — the auto-memory `MEMORY.md`) |
+| `nested_memory` | Mid-session, right after the `tool_result` of the call that touched a matching file — observed after `Read`, `Edit`, `Write` and `Bash` alike — in a subagent transcript too | `path` (also `content.path`), and `content.{type, isRule, globs[]}`: a rule whose `paths:` frontmatter matched (`globs` non-empty; `isRule` true, or absent in older versions), or a subdirectory's `CLAUDE.md` (no globs, no `isRule`) |
+
+Observed against a real tree, the split is clean: every `paths:`-conditional
+rule appears **only** in `nested_memory`, and every unconditional rule **only**
+in `instructions`. A conditional rule is therefore never "loaded at start"; its
+`nested_memory` records are its whole firing history, and one session can load
+it more than once (after a compaction drops it). The adapter takes the path,
+the timestamp, the record's `version` (which decides whether the session could
+have recorded an on-demand load at all — `surfaces.md`), and the file class; the injected text (`content.content`,
+`rawContent`) is never read.
+
+`path` is already **symlink-resolved** by Claude Code: a rule reached through a
+symlinked `~/.claude/rules` is recorded under its real location (a dotfiles
+checkout, say), not under the config root. The join to the catalog therefore
+compares canonical paths on both sides (`config-format.md`).
+
+Both records are recent: the earliest seen are from Claude Code 2.1.299
+(`instructions`) and 2.1.302 (`nested_memory`). A transcript written before
+them carries no load evidence at all, which is not the same as a rule never
+loading — `surfaces.md` gates the never-loaded wedge on it.
+
 ## Usage signals the adapter extracts
 
 The transcript yields **events** of several kinds (see `events.md` for how each
@@ -114,6 +145,7 @@ becomes an event). The adapter recognises at least:
 | Permission denial | `toolDenialKind` on the entry that carries the denied `tool_result`, else the denial text inside it (`"Permission for this action was denied"`). Structural where the marker is present; a low-confidence heuristic where it is not — see note below |
 | Compaction | `system` `subtype == compact_boundary` |
 | Hook run | see "Hook traces" below |
+| Context load | `attachment` `instructions` (each `files[]` entry — loaded at start) and `nested_memory` (loaded on a file touch); see above. Read from subagent transcripts too, where a rule can fire that the main thread never loads |
 
 These map to configuration surfaces (`surfaces.md`): a `Skill` invocation to a
 `skill` surface, an MCP `tool_use` to an `mcp_tool`/`mcp_server` surface, and so
@@ -128,10 +160,10 @@ skills, a prompt containing the literal tags) must not be mis-read as an
 invocation. The adapter matches on record structure and field position.
 
 **Not every surface emits a usage signal.** `rule` and `claude_md` have no
-discrete invocation in the transcript — they are injected context, not events.
-They appear in the catalog (`config-format.md`) but acquire no events;
-`surfaces.md` classifies surface kinds as usage-measurable vs catalog-only so the
-join does not mistake "no event possible" for "unused". A `hook` leaves traces
+discrete invocation — they are injected context — and before the attachment
+records above existed they left no trace at all. Their load is now the signal,
+but only in transcripts new enough to carry it. `surfaces.md` classifies surface
+kinds so the join does not mistake "no event possible" for "unused". A `hook` leaves traces
 only when it does something visible (below), which is why its uses are counted
 from its trigger instead. The permission-denial signal above is the one partly
 heuristic signal, and is flagged as lower-confidence wherever it is used.

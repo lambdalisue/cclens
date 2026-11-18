@@ -231,6 +231,17 @@ Each surface has a stable `(kind, id)` — e.g. `(skill, git-commit)`,
 id from both sides: the `skill` surface id from the directory/`name`, and the
 matching event id from the invoked skill name in the transcript.
 
+Rules and `CLAUDE.md` files are also identified by **where they are**, because
+their usage signal (`context_load`, `events.md`) names a loaded file, and Claude
+Code records it with symlinks resolved. The catalog records each surface's
+`config_path` as found under the config root and, beside it, its
+`resolved_path` — the same file canonicalized. The two differ exactly when the
+config is symlinked (a `~/.claude/rules` link into a dotfiles checkout, or a
+`$CLAUDE_CONFIG_DIR` reached through a link), which is when a string match on
+`config_path` would silently miss every load. A path that cannot be
+canonicalized (gone since it was read) keeps no resolved path, and joins
+nothing rather than a guess.
+
 A surface can exist at both global and project scope under one `(kind, id)`. The
 catalog stores both rows (keyed with `scope`), but the join resolves to the
 **effective surface** — project shadows global, mirroring Claude Code's own

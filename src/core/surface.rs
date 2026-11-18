@@ -125,6 +125,12 @@ pub enum Wedge {
     AlwaysOnHeavy,
     /// Costly but rarely used — trim or make on-demand.
     CostlyRare,
+    /// A path-conditional rule that never loaded across enough observed
+    /// sessions — its glob matches nothing the work touches.
+    NeverFires,
+    /// A path-conditional rule loaded in nearly every observed session — its
+    /// condition buys nothing.
+    AlwaysLoaded,
 }
 
 impl Wedge {
@@ -133,6 +139,8 @@ impl Wedge {
             Wedge::Unused => "UNUSED",
             Wedge::AlwaysOnHeavy => "ALWAYS-ON HEAVY",
             Wedge::CostlyRare => "COSTLY+RARE",
+            Wedge::NeverFires => "NEVER FIRES",
+            Wedge::AlwaysLoaded => "ALWAYS LOADED",
         }
     }
 
@@ -141,6 +149,8 @@ impl Wedge {
             Wedge::Unused => "delete / disable",
             Wedge::AlwaysOnHeavy => "slim, or make path-conditional / on-demand",
             Wedge::CostlyRare => "trim, or make on-demand",
+            Wedge::NeverFires => "narrow the paths: globs, or delete",
+            Wedge::AlwaysLoaded => "drop paths: to load once at start, or narrow the globs",
         }
     }
 
@@ -150,6 +160,8 @@ impl Wedge {
             Wedge::AlwaysOnHeavy => 0,
             Wedge::Unused => 1,
             Wedge::CostlyRare => 2,
+            Wedge::NeverFires => 3,
+            Wedge::AlwaysLoaded => 4,
         }
     }
 }

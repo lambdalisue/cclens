@@ -32,6 +32,7 @@ CREATE TABLE surfaces (
     scope         TEXT NOT NULL,    -- global | project
     project       TEXT NOT NULL,    -- owning project's normalized slug; '' for global rows
     config_path   TEXT,
+    resolved_path TEXT,             -- config_path with symlinks resolved (NULL if it cannot be); context_load events join on it
     static_tokens INTEGER,          -- token weight of the whole definition (a skill's body = its invocation cost); NULL if unknown (e.g. mcp_tool)
     startup_tokens INTEGER,         -- weight of the slice loaded into every session (description for a skill/agent); NULL if unknown
     load_mode     TEXT NOT NULL,    -- startup_full | startup_description | path_conditional | on_demand | tool_schema
@@ -60,7 +61,7 @@ CREATE TABLE events (
     sub_tokens           INTEGER NOT NULL,
     sub_agent_count      INTEGER NOT NULL,
     sub_tokens_estimated INTEGER NOT NULL,
-    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error); the calling turn's model (agent_spawn)
+    model                TEXT,            -- representative model (skill_invocation); the originating tool name (tool_error); the calling turn's model (agent_spawn); the writing Claude Code version (context_load)
     target               TEXT,            -- the failed call's subject: file_path edited / command run (tool_error); the edited file's full path (file_edit); the Agent call's id (agent_spawn), joining subagent_runs
     attrs_json           TEXT
 );
@@ -150,6 +151,20 @@ SELECT e.session_id, s.project, e.surface_id AS agent,
 FROM events e JOIN sessions s ON e.session_id = s.id
 LEFT JOIN subagent_runs r ON r.source_path = e.source_path AND r.tool_use_id = e.target
 WHERE e.kind = 'agent_spawn';
+
+-- Every config-file load, resolved against the catalog by canonical path
+-- (events.md context_load), one row per load. A file under several catalog
+-- rows is attributed to one: the loading session's own project row, else the
+-- global row. An unmatched load (a file since deleted, or one in a root no
+-- longer catalogued) keeps NULL surface columns rather than being dropped.
+CREATE VIEW context_loads AS
+SELECT event_id, session_id, project,
+       path, file_class, load_trigger, cc_version,  -- events.target / surface_id / source / model
+       surface_kind, surface_id, surface_scope, surface_project,
+       load_mode, static_tokens, started_epoch
+FROM events e JOIN sessions s ON e.session_id = s.id
+LEFT JOIN surfaces f ON f.resolved_path = e.target   -- ranked per load, first row kept
+WHERE e.kind = 'context_load';
 ```
 
 The `REFERENCES` annotations above record which column joins which table; they
@@ -230,6 +245,16 @@ The adapter guarantees it: a project whose `.claude` is the global config root
 (a session run from `$HOME`) contributes no project rows for that directory
 (`config-format.md` "Where config lives"), so its events resolve to the global
 rows like any other project's.
+
+`context_load` events are the exception: they name a **file**, not a
+`(kind, id)`, so they join on `surfaces.resolved_path` and need no shadowing —
+a path is one file. When the same file is catalogued under several rows — a
+worktree session can scan the main checkout, and a symlinked alias names one
+file twice — each load goes to the loading
+session's own project row, else the global row, so it is still counted once.
+The resolution happens at read time, against the catalog that is rebuilt on
+every analyze, so an incrementally skipped transcript's loads still land on
+today's catalog rows.
 
 ## Timestamps are stored in UTC
 

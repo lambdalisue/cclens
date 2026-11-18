@@ -27,6 +27,7 @@ identifying the configuration surface it exercises (the join key into
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — partly heuristic source |
 | `tool_call` | — (any tool call, built-in or MCP, main thread or subagent) | point event; the tool name in `surface_id`, its result (`ok` / `failed` / `denied` — refused before it ran / `pending` — no result recorded yet) in `source`. The trigger a tool-event hook's matcher is counted against (`surfaces.md`) |
+| `context_load` | `rule` / `claude_md`, joined by path (below) | point event; the loaded file's **canonical path** in `target`, the file class (`rule` / `claude_md` / `memory`) in `surface_id`, when it loaded (`startup` / `on_demand`) in `source`, the Claude Code version that wrote the record in `model` |
 
 Hook activity is recorded beside the spine, in `hook_runs` (below and
 `storage.md`), not as `events` rows.
@@ -74,9 +75,35 @@ Two kinds carry caveats that downstream reports must honour:
   session. A split under-reports a real burst; a merge invents one that never
   happened, and the merge is what makes the report untrustworthy.
 
-Surfaces that emit no event at all — `rule`, `claude_md` — never produce rows
-here. That is expected, not missing data; `surfaces.md` classifies them as
-catalog-only so their absence of events is never read as disuse.
+- **`context_load`** is one config file entering the context: every file a
+  session starts with, and every `paths:`-conditional rule or subdirectory
+  `CLAUDE.md` loaded later because a matching file was touched
+  (`session-format.md`). Its identity is the **path**, not a `(kind, id)`: the
+  transcript names a file, and only the catalog knows which surface that file
+  is. So `surface_kind` stays NULL and the join resolves `target` against the
+  catalog's canonical path at read time (`storage.md` `context_loads` view) —
+  a rule that is renamed, moved between scopes or deleted keeps its load
+  history under the path it had, instead of an id frozen at ingest that the
+  catalog may no longer contain. Loads read from a subagent's transcript are
+  the parent session's events: the rule fired inside that session's work, and
+  some rules only ever fire inside a subagent. A file loaded inside the session's
+  worktree checkout is recorded as the same file in the parent checkout, the
+  way the session itself is folded onto the parent project (`storage.md`
+  "Project normalization"): the catalog is scanned at the parent's root, so an
+  unfolded path would miss it while the session still counted as observed,
+  and the rule would read as never firing. A file loaded again in the same
+  session (after a compaction) is a second event, because its tokens are paid
+  again.
+
+  What a load costs is the file's static weight, once per load — the catalog
+  figure (`config-format.md`), not a measurement; no record reports the tokens
+  an injection added.
+
+A `hook` emits no event row of its own — it is counted from the `tool_call`
+(or prompt / session) rows its trigger selects, and its runs live in
+`hook_runs` — and `rule` / `claude_md` emitted none before Claude Code wrote
+load records. That is expected, not missing data; `surfaces.md` classifies them
+so an absence of events is never read as disuse.
 
 ## Hook runs
 

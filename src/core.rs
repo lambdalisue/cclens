@@ -3,6 +3,7 @@
 
 pub mod bucket;
 pub mod friction;
+pub mod hook;
 pub mod metrics;
 pub mod optimize;
 pub mod path;

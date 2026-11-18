@@ -21,6 +21,7 @@ CREATE TABLE sessions (
     started_at      TEXT NOT NULL,      -- RFC3339 UTC
     sub_tokens      INTEGER NOT NULL,   -- the session's exact subagent output total (events.md)
     sub_agent_count INTEGER NOT NULL,   -- subagent runs the session spawned, nested included
+    hook_scanned    INTEGER NOT NULL,   -- 1 once hook activity (hook_runs, tool_call) was extracted; hook triggers count only these sessions
     version         TEXT                -- Claude Code version, when present
 );
 
@@ -44,10 +45,10 @@ CREATE TABLE events (
     session_id           TEXT NOT NULL REFERENCES sessions(id),
     source_path          TEXT NOT NULL,   -- file this event came from (ingest delete key)
     source_line          INTEGER,         -- 0-based line index in source_path; recovers the raw record (prompt text for goal-3 clustering) without storing it
-    kind                 TEXT NOT NULL,   -- skill_invocation | session_start | tool_use | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
+    kind                 TEXT NOT NULL,   -- skill_invocation | session_start | tool_use | tool_call | agent_spawn | prompt | tool_error | compaction | permission_prompt | …
     surface_kind         TEXT,            -- join key into surfaces (NULL for surfaceless kinds)
     surface_id           TEXT,            -- for tool_error: the friction category (no surface join, surface_kind NULL); for file_edit: the basename hotspots group on (the full path is in target)
-    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); the model the call requested (agent_spawn); NULL otherwise
+    source               TEXT,            -- kind-specific detail string: slash|tool (skill path); behavior class (prompt); a short error-text excerpt (tool_error); the model the call requested (agent_spawn); the call result ok|failed|denied|pending (tool_call); NULL otherwise
     started_at           TEXT NOT NULL,   -- RFC3339 UTC
     started_epoch        INTEGER NOT NULL,-- UTC unix seconds (bucketing)
     duration_sec         REAL NOT NULL,
@@ -91,6 +92,26 @@ CREATE TABLE subagent_runs (
 
 CREATE INDEX subagent_runs_by_agent  ON subagent_runs(agent);
 CREATE INDEX subagent_runs_by_source ON subagent_runs(source_path);
+
+-- One row per hook trace (events.md "Hook runs"). Not a fire count: a hook
+-- that passes silently leaves no row, so uses come from the trigger instead.
+CREATE TABLE hook_runs (
+    id             INTEGER PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES sessions(id),
+    source_path    TEXT NOT NULL,   -- ingest delete key
+    started_at     TEXT NOT NULL,   -- RFC3339 UTC
+    started_epoch  INTEGER NOT NULL,
+    event          TEXT NOT NULL,   -- PreToolUse | PostToolUse | UserPromptSubmit | SessionStart | Stop | …
+    subject        TEXT,            -- what the matcher was tested against (tool name, session source); NULL when none
+    command        TEXT,            -- the hook command as recorded; NULL when Claude Code wrote an anonymous placeholder
+    outcome        TEXT NOT NULL,   -- blocked | error | ok | context
+    exit_code      INTEGER,
+    duration_ms    INTEGER,         -- NULL when the trace measured none
+    context_tokens INTEGER NOT NULL DEFAULT 0,  -- injected text, weighed like config text
+    retry_calls    INTEGER          -- blocked only: tool calls until the same tool passed; NULL when unresolved (events.md)
+);
+
+CREATE INDEX hook_runs_by_source ON hook_runs(source_path);
 
 -- Incremental-ingest fingerprints.
 CREATE TABLE ingested_files (
@@ -255,7 +276,7 @@ delete-and-lose-history instruction.
 
 Drift is reconciled per object by what that object costs to lose:
 
-- `sessions`, `events`, `ingested_files`, `meta` hold history, so a missing
+- `sessions`, `events`, `hook_runs`, `ingested_files`, `meta` hold history, so a missing
   column is appended with `ALTER TABLE ADD COLUMN`. Existing rows take the
   column's default, which the "report the gap, never substitute" contract below
   already covers. A column that is already present is **compared, not skipped** —
@@ -333,6 +354,7 @@ Transcripts are append-only and **active sessions keep growing**, so re-running
   is unique **within** a session, and nothing guarantees it across sessions
   (a resumed or copied transcript can carry one over), so an unscoped join would
   pick an arbitrary row and sum another session's runs on top.
+  `hook_runs` replaces on the same key too.
 - `surfaces` is rebuilt wholesale on each run from current config — the catalog
   is a snapshot of *now*, not an accumulation. (Usage is historical; catalog is
   current — `surfaces.md`.)
@@ -398,3 +420,11 @@ and its cost was measured there. Putting it in `events` with `surface_kind =
 'agent'` would double-count every spawn in the catalog×usage join, which counts
 rows per surface. The spine keeps the main thread's spawn; the run keeps the
 cost; `events.target` joins them.
+
+`hook_runs` sits beside it for the opposite reason: a hook trace is not a use.
+Its uses are the triggers its matcher selects (`tool_call` events and the like,
+`surfaces.md`), and a trace in `events` under `surface_kind = 'hook'` would be
+counted as one by the very join that must not count it. Traces also carry no
+catalog id — which catalogued hook a trace belongs to depends on the matchers
+installed *now* — so they are resolved in the core at read time rather than
+keyed at ingest, where the next config change would leave them stale.

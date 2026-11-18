@@ -87,6 +87,25 @@ winning.
 
 `settings.json` carries two surface kinds at once: `permissions` (allow/deny) and
 `hooks` (matcher → command); the adapter splits one file into several surfaces.
+
+Hooks are read from `~/.claude/settings.json` and, per project, from
+`.claude/settings.json` and `.claude/settings.local.json` (`read_hook_surfaces`).
+The shape is `hooks.<Event>[].{matcher, hooks[].{type, command}}`; every entry
+of `hooks[]` is one surface, so two commands under one matcher are two hooks.
+Its id is `<Event>[<matcher>] <command>` (`core::hook::HookDef::id`) — an
+absent matcher is written `*`, and an entry with no `command` (a `prompt` or
+`http` hook) is named by its type and what it runs, `(prompt) <prompt text>` —
+whitespace-collapsed, and past 80 characters cut and suffixed with a hash of the
+whole text — so two of them in one place stay two surfaces. The hash need not
+survive a release: ids are rebuilt from config on every analyze and nothing
+stored is keyed by them. Event, matcher and command together are the
+identity because each alone repeats: one script is commonly wired to several
+events, and one matcher to several scripts. The same hook declared in both a
+project's shared and local settings is one surface. A hook injects no text of
+its own at startup, so its static cost is unknown and its startup cost zero, and
+its load mode is `on_demand` (paid when it fires — `events.md` "Hook runs").
+Hooks a plugin or a `--settings` wrapper adds are not read; they surface as
+orphaned usage when they leave traces (`surfaces.md`).
 MCP servers are **not** in `settings.json` — they live in a separate `mcp.json`
 (verified: `~/.claude/settings.json` has no `mcpServers` key; `~/.claude/mcp.json`
 holds them). If a future Claude Code version also accepts inline `mcpServers` in

@@ -26,6 +26,10 @@ identifying the configuration surface it exercises (the join key into
 | `bash_cmd` | — (a Bash invocation) | point event; the command's leading word in `surface_id` |
 | `compaction` | — (a `compact_boundary`) | point marker, used by the context metric |
 | `permission_prompt` | `permission` | point event (friction signal) — partly heuristic source |
+| `tool_call` | — (any tool call, built-in or MCP, main thread or subagent) | point event; the tool name in `surface_id`, its result (`ok` / `failed` / `denied` — refused before it ran / `pending` — no result recorded yet) in `source`. The trigger a tool-event hook's matcher is counted against (`surfaces.md`) |
+
+Hook activity is recorded beside the spine, in `hook_runs` (below and
+`storage.md`), not as `events` rows.
 
 New kinds are added additively as the adapter learns to recognise new signals
 (`session-format.md`); the schema's loose `kind` / `surface_*` columns
@@ -70,9 +74,57 @@ Two kinds carry caveats that downstream reports must honour:
   session. A split under-reports a real burst; a merge invents one that never
   happened, and the merge is what makes the report untrustworthy.
 
-Surfaces that emit no event at all — `rule`, `hook`, `claude_md` — never produce
-rows here. That is expected, not missing data; `surfaces.md` classifies them as
+Surfaces that emit no event at all — `rule`, `claude_md` — never produce rows
+here. That is expected, not missing data; `surfaces.md` classifies them as
 catalog-only so their absence of events is never read as disuse.
+
+## Hook runs
+
+A **hook run** is one trace Claude Code left of a hook doing something: a block,
+a failure, a recorded success, or context it injected (`session-format.md`). It
+carries the hook's event, the value its matcher was tested against (`subject` —
+the tool name for a tool event), the command when recorded, an **outcome**
+(`blocked` / `error` / `ok` / `context`), and whatever the trace measured: exit
+code, `duration_ms`, and `context_tokens` (the injected text weighed like config
+text, `config-format.md`).
+
+Runs are **not** a fire count — a silent pass leaves none — so they never stand
+in for uses; the trigger does (`surfaces.md`). Per hook the core rolls them up
+(`core::hook::rollup`):
+
+| Metric | Definition |
+| --- | --- |
+| `triggers` | Occurrences its matcher selects in the window — the uses figure; unknown for an event with no countable trigger |
+| `blocks` / block rate | `blocked` runs, and blocks over triggers (no rate without a known trigger) |
+| `errors` | `error` runs — the hook itself failed (non-blocking) |
+| duration total / p50 / p95 | Over runs that recorded `duration_ms`. Only failures, recorded successes and stop-hook summaries carry one, so this is the wall-clock tax of the runs that were *seen*, labelled with how many measured |
+| context tokens | Sum of `context_tokens`, with the injection count |
+
+**Always-on context.** A `UserPromptSubmit` or `SessionStart` hook that injects
+context does so on every prompt or every session — the same kind of cost as an
+always-on rule, only paid per turn. Its rollup reports the mean tokens per
+injection and the share of triggers that injected, so a hook adding a few
+hundred tokens to every prompt is read as the standing tax it is.
+
+### What a block costs
+
+A blocked call is not the end of the work: the agent rewrites it and tries
+again. Its cost is measured per block as **retry calls** — the tool calls issued
+after the block was seen (a call sent alongside the blocked one, in the same
+response, was already on its way and is no retry) up to and including the first later call of the *same tool* that
+succeeded (`core::hook::retry_calls`), within the transcript — main thread or
+subagent — the block happened in. The search gives up at the next human turn
+(the user took over, or the intent changed), at the end of the transcript, and
+at a same-tool call with no result yet (a session analyzed mid-call), which
+would otherwise pass for a success; such a block is **unresolved** and carries
+no figure rather than a guess.
+
+This is a heuristic, labelled so: "the same tool succeeded" stands in for "the
+same intent passed", which the transcript cannot express. It over-counts when
+the agent detours through unrelated calls before retrying, and under-counts
+when the next same-tool call does something else entirely. It ranks which
+guards the agent keeps tripping over and how much each trip costs; it does not
+bill.
 
 A **span** is an event with a duration window — currently `skill_invocation`.
 The rest of this spec is mostly about spans, since that is where boundary and

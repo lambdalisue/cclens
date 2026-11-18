@@ -1712,6 +1712,7 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
                 Path::new(&root),
                 &project,
                 home_dir().map(Path::new),
+                Some(&config_dir),
             ));
         }
     }

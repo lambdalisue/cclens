@@ -204,6 +204,12 @@ row so reports can route a finding to the config layer that owns the fix
 (`cli.md` `--scope`). `surfaces.md` and `config-format.md` describe the same
 contract.
 
+Shadowing presumes a project row is a *different file* from the global one.
+The adapter guarantees it: a project whose `.claude` is the global config root
+(a session run from `$HOME`) contributes no project rows for that directory
+(`config-format.md` "Where config lives"), so its events resolve to the global
+rows like any other project's.
+
 ## Timestamps are stored in UTC
 
 `started_at` / `started_epoch` are UTC; the transcript gives UTC and the store

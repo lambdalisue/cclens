@@ -1095,6 +1095,28 @@ fn result_outcomes(jsonl: &str) -> HashMap<String, (BashOutcome, String)> {
     outcomes
 }
 
+/// Count the main-thread tool calls — every assistant `tool_use` block, whatever
+/// the tool. This is the exposure the friction rate is measured against: the
+/// failures come from the same thread, and a session's length in calls varies
+/// far more than its count (`core::effect`).
+pub fn count_tool_calls(jsonl: &str) -> u64 {
+    jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Raw>(line).ok())
+        .filter(|raw| raw.kind.as_deref() == Some("assistant"))
+        .filter_map(|raw| {
+            let blocks = raw.message?.content?;
+            Some(
+                blocks
+                    .as_array()?
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+                    .count() as u64,
+            )
+        })
+        .sum()
+}
+
 /// Count the denials an allow rule could have prevented — the friction signal
 /// behind the `permission` surface. A denying entry states its own reason, so
 /// counting is structural wherever that marker is present; a user's own "no" is
@@ -2206,5 +2228,19 @@ mod tests {
             "type": "nested_memory", "path": "/tmp/example/rules/go.md"}})
         .to_string();
         assert!(extract_context_loads(&line).is_empty());
+    }
+
+    #[test]
+    fn counts_every_tool_call_once_whatever_the_tool() {
+        // One response split across two records, each holding its own block,
+        // plus a user record whose tool_result must not count as a call.
+        let jsonl = [
+            r#"{"type":"assistant","message":{"id":"msg_a","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_a","content":[{"type":"text","text":"x"},{"type":"tool_use","id":"t2","name":"mcp__x__y","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"not json"#,
+        ]
+        .join("\n");
+        assert_eq!(count_tool_calls(&jsonl), 2);
     }
 }

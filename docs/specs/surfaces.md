@@ -361,6 +361,95 @@ heavily last quarter but never this month is a different signal from one never
 used at all. The catalog is current (read now); usage is historical — the report
 states the window so "unused" is never mistaken for "never installed".
 
+### Before / after a config change
+
+Many rules are written in answer to a recurring failure. Whether one worked is a
+question the friction spine can answer, as long as the surface carries **when it
+last changed**: compare the rate of each friction category (`core::friction`) in
+the sessions before that date with the sessions after it. This is the only
+usage-like signal a catalog-only surface (a rule, a `CLAUDE.md`) can get — it has
+no invocation events, but its *effect on failures* is observable. Implemented in
+`core::effect`; shown by the `effect` view (`cli.md`).
+
+**The boundary is the surface's last change**, not its introduction: the
+question is whether the text now installed improved on what came before it, and
+a rule reworked last week was not in force in its current form before then. Both
+dates are carried, so a later cosmetic edit that moved the boundary stays
+visible. Where the dates come from is adapter I/O (`config-format.md`
+"Change dates"); the core receives `(surface, changed, introduced, provenance,
+targets, always-on)` and the per-session samples, and reads no clock — `now` is
+injected.
+
+**The unit is a session, assigned whole by its start time.** Config is read at
+session start, so a session that began before the change ran without it even if
+it lasted past the boundary; splitting it by event time would credit the rule
+with failures it never saw. A project-scoped surface is compared over its own
+project's sessions; a global one over all sessions.
+
+**Only an always-on surface can be flagged.** A `paths:` rule reaches only the
+sessions that touched its files, and a skill only those that invoked it; the
+sessions it never reached sit in both windows and pull its rate toward the
+background, so "it did not help" is not something the data shows. Such a
+surface still gets its rates and verdict, labelled as diluted, but never a
+flag. Restricting it to the sessions that actually loaded it needs per-session
+load evidence (rule-load and skill-invocation events), which is the refinement
+this leaves open.
+
+**The windows are equal and adjacent**: `[b − L, b)` and `[b, b + L)`, where `L`
+is the requested window (default 28 days) shortened to what both sides can
+actually supply — no later than now, no earlier than the first stored session.
+Unequal windows would turn a change in how much the user worked into a change in
+the rate. A change made today therefore has an after-window of hours, and says so.
+
+**Two rates, with their counts.** Each category reports its raw counts beside
+`per session` and `per 100 tool calls` (main-thread calls, the same thread the
+failures are read from — `storage.md`). Sessions vary in length by orders of
+magnitude, so the per-call rate is the one the verdict uses whenever every
+session in both windows has a recorded call count; a store holding sessions
+analysed before counts were recorded falls back to per session, and the report
+names the basis used.
+
+**The verdict is deliberately weak.** Given `k = before + after` failures and the
+two windows' exposures, an unchanged rate would split `k` binomially in
+proportion to exposure; the one-sided exact p-value of seeing *this few* after
+the change is what separates "lower" from "lower by chance":
+
+| Verdict | Condition |
+| --- | --- |
+| `too-few` | either window has fewer than the minimum sessions (a tuning constant), or its sessions are known to have made no tool calls — nothing was attempted that could fail |
+| `no-signal` | the category occurred in neither window |
+| `improved` | the after rate is lower and `p < 0.05` |
+| `unclear` | the after rate is lower, but not significantly |
+| `no-improvement` | the after rate is not lower |
+
+`no-improvement` on a category the surface **declares it targets** is flagged as
+a candidate to replace the prose rule with a deterministic hook — a rule that did
+not change the behaviour it was written for is costing context for nothing, and
+a hook enforces what prose only asks for. The exception is `blocked-by-hook`:
+those failures *are* a hook's blocks, so enforcement already exists and "replace
+it with a hook" would be circular — there the flag says instead that the hook
+blocks the behaviour but the rule is not preventing the attempts (steer from the
+hook's own message, or drop the rule). A rise there can also mean the hook was
+tightened in the same change, which is exactly the observed case of a sed/awk
+rule reworked together with its hook. Neither flag fires on an undeclared
+category: without a declaration every category is shown around the date and the
+reader judges which one the rule was about.
+
+**Mapping a surface to its category is declared, not guessed.** A keyword
+heuristic over rule text would misattribute (a rule about `sed` mentions "hook"
+because a hook enforces it), and the misattribution would land as a confident
+verdict. So a surface states its targets in its own frontmatter
+(`config-format.md`); without them the report shows every actionable category
+that occurred in either window and flags nothing.
+
+**What it does not claim.** Before/after is not causation. Other things change on
+the same dates — the model, the Claude Code version, the kind of work, and other
+config edits made in the same commit. The report carries what it can measure of
+that: the session count of each window (a volume shift), and the other surfaces
+whose change date falls inside the compared span, named, because a commit that
+changed three rules at once cannot attribute its effect to any one of them.
+Model and version shifts are not measured and the report says so.
+
 ## What the core computes vs. what it leaves open
 
 The core computes the join and the wedge classifications above from thresholds

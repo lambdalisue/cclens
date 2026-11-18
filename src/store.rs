@@ -14,10 +14,11 @@ use crate::core::cache::{BreakCause, CacheObservation, CacheRow};
 use crate::core::context_load::{
     ContextLoad, LoadHistory, is_observed, recording_floor, version_key,
 };
+use crate::core::effect::{ConfigChange, DateSource, SessionSample};
 use crate::core::hook::{CallResult, HookOutcome, HookTrace, StoredTrace, ToolCalls, Triggers};
 use crate::core::span::{SessionStart, Source, Span};
 use crate::core::subagent::{SpawnModels, SubagentRun};
-use crate::core::surface::{Surface, is_usage_measurable};
+use crate::core::surface::{Scope, Surface, is_usage_measurable};
 use crate::core::thrash::{BashOutcome, FileEdit, SandboxedRun, StepKind, WorkStep};
 use crate::core::tool_load::{ToolContext, ToolLoadStat};
 use crate::core::usage::UsageEvent;
@@ -30,7 +31,7 @@ const ANALYZER_META_KEY: &str = "analyzer_version";
 /// only way rows behind the incremental-ingest skip get rebuilt. It is not the
 /// crate version: a release that changes no analysis should not force everyone
 /// through a full re-analyze.
-const ANALYZER_VERSION: &str = "9";
+const ANALYZER_VERSION: &str = "10";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- 1 once this session's hook activity (hook_runs, tool_call events) was
     -- extracted; a session stored earlier holds none and must not count as
     -- one where no hook fired.
-    hook_scanned    INTEGER NOT NULL DEFAULT 0
+    hook_scanned    INTEGER NOT NULL DEFAULT 0,
+    tool_calls      INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY,
@@ -194,6 +196,20 @@ CREATE TABLE IF NOT EXISTS session_mcp_instructions (
     source_path TEXT NOT NULL,
     server      TEXT NOT NULL,
     tokens      INTEGER NOT NULL
+);
+-- When each file-backed surface last changed and the friction it declares it
+-- targets: the boundary of the before/after comparison (core::effect).
+CREATE TABLE IF NOT EXISTS surface_changes (
+    kind             TEXT NOT NULL,
+    id               TEXT NOT NULL,
+    scope            TEXT NOT NULL,
+    project          TEXT NOT NULL DEFAULT '',
+    changed_epoch    INTEGER NOT NULL,
+    introduced_epoch INTEGER NOT NULL,
+    date_source      TEXT NOT NULL,
+    targets          TEXT NOT NULL DEFAULT '',
+    always_on        INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (kind, id, scope, project)
 );
 -- Analyze-run metadata (analyzed_at, projects_dir, config_dir) so read
 -- commands can report freshness and re-run the analysis with the same roots,
@@ -395,7 +411,7 @@ const MIGRATED_TABLES: [&str; 8] = [
 
 /// Tables regenerated wholesale from live config on every analyze
 /// (`replace_surfaces`), so a shape change costs nothing to drop and recreate.
-const REBUILT_TABLES: [&str; 1] = ["surfaces"];
+const REBUILT_TABLES: [&str; 2] = ["surfaces", "surface_changes"];
 
 /// Identity and provenance of one analyzed session.
 pub struct SessionMeta {
@@ -2009,6 +2025,128 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Replace the change dates wholesale, like the catalog they describe —
+    /// both are read from live config on every analyze.
+    pub fn replace_surface_changes(&mut self, changes: &[ConfigChange]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM surface_changes", ())?;
+        for change in changes {
+            tx.execute(
+                "INSERT OR REPLACE INTO surface_changes
+                   (kind, id, scope, project, changed_epoch, introduced_epoch,
+                    date_source, targets, always_on)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (
+                    &change.kind,
+                    &change.id,
+                    change.scope.label(),
+                    change.scope.project(),
+                    change.changed_epoch,
+                    change.introduced_epoch,
+                    change.date_source.label(),
+                    change.targets.join(","),
+                    change.always_on,
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every recorded surface change, in catalog order.
+    pub fn surface_changes(&self) -> Result<Vec<ConfigChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, id, scope, project, changed_epoch, introduced_epoch,
+                    date_source, targets, always_on
+             FROM surface_changes ORDER BY kind, id, scope, project",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let scope: String = row.get(2)?;
+                let project: String = row.get(3)?;
+                let source: String = row.get(6)?;
+                let targets: String = row.get(7)?;
+                Ok(ConfigChange {
+                    kind: row.get(0)?,
+                    id: row.get(1)?,
+                    scope: if scope == "project" {
+                        Scope::Project(project)
+                    } else {
+                        Scope::Global
+                    },
+                    changed_epoch: row.get(4)?,
+                    introduced_epoch: row.get(5)?,
+                    date_source: DateSource::from_label(&source),
+                    targets: targets
+                        .split(',')
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    always_on: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record how many main-thread tool calls a session made. Call after
+    /// `ingest_session`, whose row replacement resets it to unknown.
+    pub fn set_session_tool_calls(&mut self, session_id: &str, tool_calls: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET tool_calls = ?2 WHERE id = ?1",
+            (session_id, tool_calls as i64),
+        )?;
+        Ok(())
+    }
+
+    /// Every session with a known start, as the before/after comparison sees
+    /// it: project, start, tool calls, and failures per category.
+    pub fn session_samples(&self) -> Result<Vec<SessionSample>> {
+        let mut samples: BTreeMap<String, SessionSample> = BTreeMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project, CAST(strftime('%s', started_at) AS INTEGER), tool_calls
+             FROM sessions WHERE strftime('%s', started_at) IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, project, start_epoch, tool_calls) = row?;
+            samples.insert(
+                id,
+                SessionSample {
+                    project,
+                    start_epoch,
+                    tool_calls: tool_calls.map(|n| n as u64),
+                    errors: BTreeMap::new(),
+                },
+            );
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, surface_id, COUNT(*) FROM events
+             WHERE kind = 'tool_error' GROUP BY session_id, surface_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (session_id, category, count) = row?;
+            if let Some(sample) = samples.get_mut(&session_id) {
+                sample.errors.insert(category, count as u64);
+            }
+        }
+        Ok(samples.into_values().collect())
     }
 
     /// The whole catalog — every `(kind, id, scope, project)` row — with each
@@ -5233,5 +5371,77 @@ mod tests {
                 calls: 0,
             }]
         );
+    }
+
+    fn started(id: &str, epoch_secs: i64) -> SessionMeta {
+        SessionMeta {
+            start: Some(SessionStart {
+                timestamp_ms: epoch_secs * 1000,
+                ctx: 1,
+            }),
+            ..session(id)
+        }
+    }
+
+    #[test]
+    fn a_session_sample_carries_its_start_calls_and_failures_per_category() {
+        let mut store = Store::in_memory().unwrap();
+        let s1 = started("s1", 1_700_000_000);
+        store.ingest_session(&s1, &[], &[]).unwrap();
+        store.set_session_tool_calls("s1", 40).unwrap();
+        store
+            .ingest_tool_errors(
+                "s1",
+                &s1.source_path,
+                &[
+                    (1, "timeout", "", "Bash", ""),
+                    (2, "timeout", "", "Bash", ""),
+                    (3, "path-not-found", "", "Read", ""),
+                ],
+            )
+            .unwrap();
+        let samples = store.session_samples().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].start_epoch, 1_700_000_000);
+        assert_eq!(samples[0].tool_calls, Some(40));
+        assert_eq!(samples[0].errors.get("timeout"), Some(&2));
+        assert_eq!(samples[0].errors.get("path-not-found"), Some(&1));
+    }
+
+    #[test]
+    fn a_session_whose_calls_were_never_counted_has_no_count_not_zero() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .ingest_session(&started("s1", 1_700_000_000), &[], &[])
+            .unwrap();
+        assert_eq!(store.session_samples().unwrap()[0].tool_calls, None);
+    }
+
+    #[test]
+    fn a_session_with_no_known_start_is_not_sampled() {
+        let mut store = Store::in_memory().unwrap();
+        store.ingest_session(&session("s1"), &[], &[]).unwrap();
+        assert!(store.session_samples().unwrap().is_empty());
+    }
+
+    #[test]
+    fn surface_changes_round_trip_and_are_replaced_wholesale() {
+        let mut store = Store::in_memory().unwrap();
+        let change = ConfigChange {
+            kind: "rule".to_string(),
+            id: "tools/example".to_string(),
+            scope: Scope::Project("demo".to_string()),
+            changed_epoch: 2000,
+            introduced_epoch: 1000,
+            date_source: DateSource::Uncommitted,
+            targets: vec!["timeout".to_string(), "path-not-found".to_string()],
+            always_on: false,
+        };
+        store
+            .replace_surface_changes(std::slice::from_ref(&change))
+            .unwrap();
+        assert_eq!(store.surface_changes().unwrap(), vec![change]);
+        store.replace_surface_changes(&[]).unwrap();
+        assert!(store.surface_changes().unwrap().is_empty());
     }
 }

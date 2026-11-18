@@ -49,7 +49,11 @@
         # with it, so the dependency layer above stays cached across releases.
         version = nix-github-release.lib.version { inherit self; };
         cclens = craneLib.buildPackage (nix-github-release.lib.stampCargo { inherit pkgs version; }
-          (commonArgs // { inherit cargoArtifacts; }));
+          (commonArgs // {
+            inherit cargoArtifacts;
+            # The change-date tests build throwaway git repositories.
+            nativeCheckInputs = [ pkgs.git ];
+          }));
       in
       {
         # `nix build` / `nix run github:lambdalisue/cclens -- summary`; pin a

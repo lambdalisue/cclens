@@ -224,6 +224,51 @@ older transcript tree, or a server that never connected — stays unknown.
   2.1.296+) and `experimental.cacheTtl` (its prompt-cache lifetime; 2.1.248+).
   Each is read as a plain scalar and kept verbatim; an absent key is simply not
   recorded, so an older definition carries no attributes rather than defaults.
+- any markdown surface: `cclens-targets:` — the friction categories
+  (`core::friction` labels, e.g. `edit-precondition`) the surface was written to
+  reduce, as an inline `[a, b]` list, a block list, or a single scalar. This key
+  is cclens's own, not Claude Code's; it is namespaced so it can never collide
+  with a key Claude Code later gives meaning to. It turns the before/after
+  comparison from "every category around the date" into a verdict on the
+  declared ones (`surfaces.md` "Before / after a config change").
+
+### Change dates
+
+The before/after comparison needs when each compared surface (skill, rule,
+`CLAUDE.md`) last changed. An `mcp_server` has no date of its own: its
+`mcp.json` is shared by every server in it, so its date would belong to all of
+them at once. An `agent` is dated by nothing either, for a different reason:
+it acts in its own subagent transcript, and the failures the comparison reads
+are the main thread's — a rate that could neither credit nor blame it.
+
+The file's **mtime is not that date**. Config under `~/.claude` is routinely a
+symlink chain into a dotfiles checkout (often through a Nix store, whose files
+carry epoch-1 mtimes), and a checkout, rebase, or copy rewrites mtimes without
+changing content — observed on a real tree, a rule's mtime trailed its commit by
+two days. So the adapter canonicalizes the path first, then asks git:
+
+1. `git log --follow -p -- <file>` in the file's real directory. The newest
+   commit's author time is the **last change**, the oldest commit's the
+   **introduction** (`--follow` keeps a rename from reading as a new file).
+   Author time, because that is when the user wrote the text in place;
+   committer time moves on every rebase. The commits are taken in history
+   order, not by the largest and smallest time: a cherry-pick keeps its
+   original author time, so the latest commit can carry an earlier time than
+   one before it.
+2. A commit whose diff only adds, edits or removes the `cclens-targets:`
+   declaration — the key, its list items, and the frontmatter fences and blank
+   lines around it — is **not** a change. The declaration is metadata about the
+   rule, and counting it would make declaring a rule erase its own
+   before-window: the boundary would jump to the day the user wrote the key.
+3. When the file has uncommitted modifications beyond the declaration
+   (`git diff HEAD`, filtered the same way), the installed text is newer than
+   any commit, so the last change is the mtime and the provenance says
+   `uncommitted`.
+4. Outside a repository, or untracked, both dates fall back to the mtime, with
+   provenance `mtime` so a report can flag the weaker evidence.
+
+This is the only place cclens runs a subprocess during `analyze`; it lives in
+the adapter (`adapter::history`) and the core sees plain epochs.
 
 Parsing is defensive: unknown frontmatter keys are ignored, missing optional
 keys tolerated. A surface the adapter cannot fully parse is still catalogued

@@ -522,9 +522,97 @@ that total (`subagent_runs`) is exact for the same reason wherever it exists.
 The two are recorded separately, so the split can cover only part of the total
 in a store that outlived the transcripts behind it; see the runs section above.
 
+## Prompt cache
+
+Every request re-sends the whole prompt, and what it costs depends on how much
+of that prompt the API could **read** from its cache rather than **write** into
+it again or take **uncached**. A context-size figure cannot see this: a session
+whose cache keeps breaking pays for the same tokens over and over at the write
+rate while its prompt size looks unremarkable. So the cache is measured on its
+own, per **main-thread API request** (`core::cache`).
+
+A request is one API response, not one transcript line: the adapter keeps the
+first line of each response id and drops the repeats (the "one message, several
+records" rule above — every line of a response carries the same cache figures,
+so a later line adds nothing). Locally generated turns are not requests and are
+dropped. Subagent transcripts are not read here: each subagent builds its own
+cache from its own prompt, so mixing its requests into the main thread's
+sequence would make every spawn look like a break.
+
+Each request carries `cache_read`, `cache_write_5m`, `cache_write_1h` and
+`uncached` tokens, the cache lifetime it asked for, and the identity of its
+request shape (the tool definitions and system blocks it was sent with).
+
+| Metric | Definition |
+| --- | --- |
+| hit rate | `cache_read / (cache_read + cache_write + uncached)` summed over the requests in scope — a share of prompt tokens, not of requests, because one break of a large prompt matters more than many small hits. |
+| 1h write share | `cache_write_1h / cache_write`. A 1-hour write costs more than a 5-minute one, so a high share is only worth it when idle gaps actually exceed five minutes. |
+| rebuilt tokens | For a **break** (below): the tokens the previous request had cached that this one had to write again — `min(prev(cache_read + cache_write) − cache_read, cache_write)`. This is the cost of the break, separate from the new tokens the turn would have written anyway. The cap matters after a compaction: the prompt shrank, so most of the old prefix was dropped rather than re-paid, and counting all of it would rank compaction by tokens nobody wrote. |
+| re-cached after idle | Rebuilt tokens of breaks whose cause is `idle_expired`. |
+
+### When the cache broke
+
+A request **breaks** the cache when it reads less than `MIN_REUSE` (a tuning
+constant, half) of what the previous request had cached. Real sessions are
+sharply bimodal — a request reuses all of the previous prefix or almost none of
+it — so the threshold only has to separate the two modes, and a request that
+trims a little (thinking cleared from history) is not a break. The first request
+of a session has nothing to compare against and is never a break; its writes
+are the session's cold start.
+
+A break is given the **one** most likely cause, checked in this order, because
+several can coincide and the first one alone would have broken the cache:
+
+1. `idle_expired` — the gap since the previous request exceeds that request's
+   cache lifetime (the one it asked for; else the one it wrote with; else, for
+   a pure hit that shows neither, the last lifetime seen in the session; else
+   five minutes). A pure hit inherits rather than defaulting, or every hit would
+   look like a switch to five minutes and the next write like a switch back. Nothing else needs explaining: an expired cache is
+   gone whatever else changed.
+2. `model_switch` — the model differs from the previous request's; caches are
+   per model.
+3. `ttl_changed` — the request's cache lifetime differs from the previous
+   request's. Observed: a session's early requests written with the 5-minute
+   lifetime, then a switch to 1-hour that read nothing back. This is the
+   likeliest explanation the transcript offers, not a documented rule, which is
+   why it ranks below the two causes that certainly discard the cache.
+4. `compaction` — a compaction happened between the two requests and rewrote
+   the history.
+5. `tools_changed` — the request shape changed and its tool list differs.
+6. `system_changed` — the request shape changed and only the system blocks
+   differ.
+7. `shape_changed` — the shape id changed but the shapes themselves were not
+   recorded, so what changed is unknown.
+8. `unknown` — none of the above was observed.
+
+Idle comes first even when a compaction coincides, because upstream compacts an
+idle session on purpose once its cache has expired: the compaction is the
+consequence, the idle gap the cause.
+
+### Which surfaces break it
+
+The per-session cause is what `/cost` already shows; the cross-session question
+is *which configuration keeps breaking the cache*. A `tools_changed` break names
+the tools added, removed or redefined (same name, different definition) between
+the two shapes, each mapped to a surface: an
+MCP tool to its `mcp_server`, any other tool to `tool` (a built-in or deferred
+tool loaded mid-session). An MCP server that connects late, or a deferred tool
+loaded on demand, changes the tool list and therefore the cached prefix; ranking
+those surfaces across sessions is what turns a per-session miss into a config
+fix. A break with several changed surfaces credits its rebuilt tokens to each, so
+per-surface figures rank surfaces and are not summed.
+
+Shape changes are attributed only on breaks. Most shape changes in real data do
+not break the cache (a deferred tool can be appended after the cached prefix),
+so counting every change would blame surfaces for costs they did not cause.
+Announcements that a tool or an MCP server's instructions became available are
+not a cause on their own either: they are appended as messages, after the
+cached prefix, and when they do bring a new tool definition into the request the
+shape diff above sees it.
+
 ## Determinism
 
-The core takes the session's records plus tuning constants (`IDLE_GAP`) and
+The core takes the session's records plus tuning constants (`IDLE_GAP`, `MIN_REUSE`) and
 returns events with no hidden inputs — no clock reads, no randomness. Identical
 records in always produce identical events out, so every rule above is pinned by
 a fixture test.

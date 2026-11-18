@@ -156,6 +156,8 @@ cclens failures --scope project:<slug>  # one project's failures (fix lands in i
 cclens prompts                # how you steer the session (steer/correct/question/instruct)
 cclens stuck                 # files Claude got stuck re-editing in rapid bursts
 cclens hooks                 # per hook: matched calls, blocks, run time, injected context, cost per block
+cclens cache                  # prompt-cache hit rate, why it broke, which MCP servers/tools broke it
+cclens cache --by week        # …per session | project | time bucket (JST)
 ```
 
 ### `sql` — query the store directly
@@ -196,6 +198,11 @@ derived store.
   half split per agent type (which agents actually spent it, nested spawns
   included), and the always-on context floor reconciled against your readable
   config (the residual is system + tools + MCP you cannot trim from files).
+- **Whether the prompt cache holds** — hit rate, the tokens re-written after the
+  cache broke, the likely cause of each break (idle past the cache lifetime, a
+  changed tool list, compaction, …), and which MCP servers or tools keep
+  breaking it across sessions (`cache`). Money appears only as Claude Code
+  itself reported it.
 - **How you prompt** — the steer / correct / question / instruct mix.
 
 ## Notes

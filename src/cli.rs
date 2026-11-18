@@ -12,6 +12,7 @@ use crate::adapter::config::{
     claude_config_dir, read_agent_surfaces, read_claude_md_surfaces, read_hook_surfaces,
     read_mcp_server_surfaces, read_project_surfaces, read_rule_surfaces, read_skill_surfaces,
 };
+use crate::adapter::prompt_cache::extract_prompt_cache;
 use crate::adapter::request_shape::extract_tool_context;
 use crate::adapter::transcript::{
     HookActivity, count_permission_denials, extract_context_loads, extract_hook_activity,
@@ -20,6 +21,7 @@ use crate::adapter::transcript::{
     subagent_prompt_id, subagent_sidecar_path, subagents_dir,
 };
 use crate::core::bucket::{Bucket, JST_OFFSET_SECS, bucket_label};
+use crate::core::cache::{DEFAULT_MIN_REUSE, observe_cache};
 use crate::core::context_load::{
     ContextLoad, LoadTuning, LoadVerdict, load_verdict, load_wedge, tokens_paid,
 };
@@ -50,6 +52,8 @@ use crate::core::usage::{attribute_subagents, extract_usage_events, output_token
 use crate::store::{
     AgentModelCost, Decomposition, McpServerCost, SessionMeta, Store, WorkRow, canonical_path,
 };
+
+mod cache_view;
 
 #[derive(Parser)]
 #[command(
@@ -214,6 +218,23 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// How well the prompt cache held: hit rate, the tokens re-written after the
+    /// cache broke, why it broke, and which MCP servers or tools keep breaking it.
+    Cache {
+        /// Rows of the main table: session | project | year | month | week | day |
+        /// hour (JST). Default: project.
+        #[arg(long)]
+        by: Option<String>,
+        /// Output format: table | markdown | json.
+        #[arg(long)]
+        format: Option<String>,
+        /// Read the store as-is; skip the automatic refresh.
+        #[arg(long)]
+        frozen: bool,
+        /// Store path (default: $XDG_STATE_HOME/cclens/cclens.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Files Claude kept re-editing in rapid bursts — where it got stuck
     /// retrying instead of making progress.
     Stuck {
@@ -357,6 +378,17 @@ pub fn run() -> Result<()> {
             db,
         } => hooks(
             &parse_scope(scope.as_deref())?,
+            parse_format(format.as_deref())?,
+            frozen,
+            &resolve_db(db)?,
+        ),
+        Command::Cache {
+            by,
+            format,
+            frozen,
+            db,
+        } => cache_view::cache(
+            by.as_deref(),
             parse_format(format.as_deref())?,
             frozen,
             &resolve_db(db)?,
@@ -875,6 +907,7 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     }
     let store = open_for_read(db, frozen)?;
     let f = collect_findings(&store)?;
+    let cache = cache_view::CacheSummary::read(&store)?;
 
     if format == Format::Json {
         // The routed findings, filtered the same way the text form is: the
@@ -892,6 +925,7 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
         return emit_json(&serde_json::json!({
             "global": global,
             "projects": projects,
+            "prompt_cache": filter.includes_global().then(|| cache.json()),
         }));
     }
 
@@ -929,6 +963,9 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
     struct Item {
         weight: i64,
         lines: Vec<String>,
+        /// Where the rest of this kind of problem is listed, for the note that
+        /// names what the truncation below dropped.
+        more: &'static str,
     }
     let mut items: Vec<Item> = Vec::new();
     for p in &visible {
@@ -993,6 +1030,7 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                     .sum::<i64>()
                 + p.unsandboxed_retries.map_or(0, |r| r.total),
             lines,
+            more: "cclens failures --scope project",
         });
     }
     if filter.includes_global() {
@@ -1016,6 +1054,29 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                         style.command("cclens failures --scope global")
                     ),
                 ],
+                more: "cclens failures --scope global",
+            });
+        }
+        // Weighed by the tokens it re-wrote, not by its break count: one break
+        // re-pays a whole prompt, so a count would rank it like a single failed
+        // tool call and let it fall off the list.
+        for surface in cache.recurring_surfaces() {
+            items.push(Item {
+                weight: surface.rebuilt_tokens,
+                lines: vec![
+                    format!(
+                        "{} changed the tool list mid-session and broke the prompt cache in {} \
+                         sessions ({} re-written tokens)",
+                        style.bold(&surface.surface),
+                        style.warn(&surface.sessions.to_string()),
+                        fmt_tokens(surface.rebuilt_tokens)
+                    ),
+                    format!(
+                        "  Make it available from the session's start — details: {}",
+                        style.command("cclens cache")
+                    ),
+                ],
+                more: "cclens cache",
             });
         }
         if let Some(retries) = f.unsandboxed_retries {
@@ -1034,12 +1095,12 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                         style.command("cclens failures --scope global")
                     ),
                 ],
+                more: "cclens failures --scope global",
             });
         }
     }
     items.sort_by_key(|item| std::cmp::Reverse(item.weight));
-    let dropped_items = items.len().saturating_sub(4);
-    items.truncate(4);
+    let dropped: Vec<Item> = items.split_off(items.len().min(4));
     if filter.includes_global() {
         if let Some(cd_pct) = f.cd_pct.filter(|pct| *pct >= 25) {
             items.push(Item {
@@ -1049,6 +1110,7 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                      convention in your global CLAUDE.md would cut the churn.",
                     style.warn(&format!("{cd_pct}%"))
                 )],
+                more: "",
             });
         }
         if let (Some(steer), Some(correct)) = (f.steer_pct, f.correct_pct)
@@ -1061,6 +1123,7 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
                      clearer upfront specs could cut. Details: {}",
                     style.command("cclens prompts")
                 )],
+                more: "",
             });
         }
     }
@@ -1077,11 +1140,19 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
         }
     }
     // Never truncate silently (reporting honesty, cli.md).
-    if dropped_items > 0 {
+    if !dropped.is_empty() {
+        let mut more: Vec<&str> = dropped.iter().map(|item| item.more).collect();
+        more.sort_unstable();
+        more.dedup();
         println!(
             "  {}",
             style.dim(&format!(
-                "… and {dropped_items} smaller recurring problem(s) — see `cclens failures --scope project`"
+                "… and {} smaller recurring problem(s) — see {}",
+                dropped.len(),
+                more.iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         );
     }
@@ -1111,6 +1182,9 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
             fmt_tokens(f.sub_tokens),
             f.sub_agents
         );
+        for line in cache.doctor_lines(&style) {
+            println!("  {line}");
+        }
         warn_missing_agent_split(&f.agent_split);
         for line in doctor_agent_lines(&f, &style.command("cclens usage")) {
             if line.starts_with('…') {
@@ -2484,6 +2558,13 @@ fn run_analyze(projects: Option<PathBuf>, db: &Path) -> Result<AnalyzeStats> {
             &session_context_loads(&transcript, &text),
         )?;
         store.ingest_tool_context(&meta.id, &meta.source_path, &extract_tool_context(&text))?;
+        let prompt_cache = extract_prompt_cache(&text);
+        store.ingest_prompt_cache(
+            &meta.id,
+            &meta.source_path,
+            &observe_cache(&prompt_cache.trace, DEFAULT_MIN_REUSE),
+            prompt_cache.reported_cost_usd,
+        )?;
         if let Some((mtime, _)) = fingerprint {
             // Record the size actually consumed, so a tail appended after the
             // read shows a mismatch next run instead of being skipped forever.
